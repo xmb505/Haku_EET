@@ -324,37 +324,57 @@ class ActionExecutor:
 
     async def _execute_initialize(self) -> None:
         """
-        初始化子状态机：朝 init_direction 全速启动
+        初始化子状态机：朝方向跑触对应 1 限位，减速等完美平层定位基站
 
         流程:
-            1. 高速 + 方向 + 电机启动（全速朝 1 楼基地方向跑）
-            2. 触到底端站 1 限位 → 切低速 + 三级减速刹车（不停车，靠惯性带）
-            3. 等 level_up & level_down 同时为 1（完美卡到 1 楼层点位）→ 停车 + READY
+            1. 高速 + 方向 + 电机启动
+            2. 触到端站 1 限位 → 切低速 + 三级减速刹车（不停车，靠惯性带）
+            3. 等 level_up & level_down 同时为 1（完美平层）→ 停车 + READY
             4. 触到 2 限位（坠机限位） → 紧急停止 + 故障
 
-        关键：千万不能触到 2 限位（坠机扣分）
+        方向传感器映射：
+            up   → 向上跑到 top_limit_1 → 基站 top_base_floor
+            down → 向下跑到 bottom_limit_1 → 基站 bottom_base_floor
+
+        如果对应的 1 限位已经触发（电梯已在端站），直接走等完美平层。
         """
-        if self.init_direction == 'down':
-            # 从 10 楼顶部往下初始化（少见）
-            await self._set_outputs({
-                'up_contactor': 0,
-                'down_contactor': 1,
-                'high_speed_contactor': 1,    # 全速下行
-                'low_speed_contactor': 0,
-                'motor_start': 1,
-            })
-            self.waiting_sensor = ('top_limit_1', 1)
-            self.car.direction = Direction.DOWN
-        else:  # 'up' —— 默认场景：电梯在 1 楼基站段，要上到 1 楼
-            await self._set_outputs({
-                'up_contactor': 1,
-                'down_contactor': 0,
-                'high_speed_contactor': 1,    # 全速上行
-                'low_speed_contactor': 0,
-                'motor_start': 1,
-            })
-            self.waiting_sensor = ('bottom_limit_1', 1)
-            self.car.direction = Direction.UP
+        direction = self.init_direction
+        if direction == 'up':
+            iverb_addr = self.mapper.db_to_i(self.mapper.addr_input('top_limit_1', self.car_id))
+            running = self.io.get_input(iverb_addr) == 0  # 还没触发才需要跑
+            if running:
+                await self._set_outputs({
+                    'up_contactor': 1, 'down_contactor': 0,
+                    'high_speed_contactor': 1, 'low_speed_contactor': 0,
+                    'motor_start': 1,
+                })
+                self.waiting_sensor = ('top_limit_1', 1)
+                self.car.direction = Direction.UP
+            else:
+                # 已经在顶站，直接等完美平层
+                self._init_waiting_perfect_level = True
+                self.waiting_sensor = None
+                self.car.direction = Direction.UP
+                if self.debug:
+                    print(f'[exec] init up: top_limit_1 已触发，直接等完美平层')
+        else:  # down
+            ibot_addr = self.mapper.db_to_i(self.mapper.addr_input('bottom_limit_1', self.car_id))
+            running = self.io.get_input(ibot_addr) == 0
+            if running:
+                await self._set_outputs({
+                    'up_contactor': 0, 'down_contactor': 1,
+                    'high_speed_contactor': 1, 'low_speed_contactor': 0,
+                    'motor_start': 1,
+                })
+                self.waiting_sensor = ('bottom_limit_1', 1)
+                self.car.direction = Direction.DOWN
+            else:
+                # 已经在底站，直接等完美平层
+                self._init_waiting_perfect_level = True
+                self.waiting_sensor = None
+                self.car.direction = Direction.DOWN
+                if self.debug:
+                    print(f'[exec] init down: bottom_limit_1 已触发，直接等完美平层')
 
     async def _start_move_up(self) -> None:
         """上行启动：高速 + 上 + 电机（之后靠 _on_level_reached 多级减速）"""

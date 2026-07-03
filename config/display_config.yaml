@@ -33,6 +33,8 @@ glyphs:
   '8': [a, b, c, d, e, f, g]
   '9': [a, b, c, d, f, g]
   'A': [a, b, c, e, f, g]   # 备用：10 楼想显示 A 时把下面 floor_display.10 改 'A'
+  'E': [a, d, e, f, g]      # 下基站显示 E（Extended）
+  'F': [a, e, f, g]         # 上基站显示 F（Floor top）
   up: [a, b, e, f]          # ↑ 上行箭头
   down: [d, e, f, g]        # ↓ 下行箭头
   fault: [a, d, e, f]       # 故障特殊码
@@ -51,3 +53,5 @@ floor_display:
   8: '8'
   9: '9'
   10: '0'
+  11: 'F'           # 上基站（11 = Floor top 缩写）
+  -1: 'E'           # 下基站（-1 = 扩展负楼层）

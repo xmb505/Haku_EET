@@ -58,8 +58,8 @@ async def test_initialize_down_triggers_bottom_limit(setup):
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 1
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
 
-    # 触发 1 限位 → 全刹车减速（仍不下行）
-    await executor.on_io_event(i_to_event(mapper, 'top_limit_1', 1))
+    # 触发 bottom_limit_1（下行方向等底限位）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
     await asyncio.sleep(0.02)
     assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
     assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
@@ -258,22 +258,23 @@ async def test_action_done_callback(setup):
 
 
 @pytest.mark.asyncio
-async def test_initialize_up_triggers_bottom_limit(setup):
-    """默认 up 方向：全速上行 → 触 1 限位 → 减速 → 完美平层 → READY（基站=10）"""
+async def test_initialize_up_triggers_top_limit(setup):
+    """up 方向：全速上行 → 触 top_limit_1 → 减速 → 完美平层 → READY（基站=10）"""
     car, io, mapper, display, executor = setup
-    # 默认 init_direction = 'up'
+    executor.init_direction = 'up'
+    executor.top_base_floor = 10
+    executor.bottom_base_floor = 1
     queue = ActionQueue()
 
     task = asyncio.create_task(executor.run_loop(queue))
     await queue.put(Action(ActionKind.INITIALIZE))
     await asyncio.sleep(0.02)
 
-    # 全速上行
+    # 全速上行等 top_limit_1
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
     assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
 
-    # 触发 bottom_limit_1 → 全力刹车减速（不停车）
-    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await executor.on_io_event(i_to_event(mapper, 'top_limit_1', 1))
     await asyncio.sleep(0.02)
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
     assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
@@ -286,7 +287,7 @@ async def test_initialize_up_triggers_bottom_limit(setup):
     await asyncio.sleep(0.02)
 
     assert car.state == CarState.READY
-    assert car.position == 10  # up 方向基站为 10 楼
+    assert car.position == 10  # up 方向基站=10
 
     task.cancel()
     try:

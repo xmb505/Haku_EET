@@ -58,12 +58,12 @@ async def test_initialize_end_to_end(app: App):
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
 
-    # 1. 触发 top_limit_1（下行方向使用 top）
-    await app.executor.on_io_event(i_event(app.mapper, 'top_limit_1', 1))
+    # 1. 触发 bottom_limit_1（下行方向等底限位）
+    await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
     await asyncio.sleep(0.05)
 
     # 还没完成：等完美平层
-    assert app.car.state == CarState.UNKNOWN  # 仍在等
+    assert app.car.state == CarState.UNKNOWN
 
     # 2. 触发 level_up & level_down（完美平层） → 完成 INITIALIZE
     await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
@@ -100,8 +100,8 @@ async def test_call_internal_triggers_move(app: App):
     app.executor.bottom_base_floor = 1
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
-    # 完成 INITIALIZE（down 方向用 top_limit）
-    await app.executor.on_io_event(i_event(app.mapper, 'top_limit_1', 1))
+    # 完成 INITIALIZE（down 方向等 bottom_limit）
+    await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_down', 1))
     await asyncio.sleep(0.05)
@@ -130,7 +130,7 @@ async def test_move_to_5_floor_open_door(app: App):
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
     # 完成 INITIALIZE（down 方向）
-    await app.executor.on_io_event(i_event(app.mapper, 'top_limit_1', 1))
+    await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_down', 1))
     await asyncio.sleep(0.05)
