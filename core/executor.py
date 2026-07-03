@@ -133,6 +133,11 @@ class ActionExecutor:
             })
             self._init_waiting_perfect_level = True
             self.waiting_sensor = None
+            # 立即检查当前平层信号是否已经就绪（电梯可能已在站）
+            if await self._check_perfect_level_direct():
+                if self.debug:
+                    print(f'[exec] INITIALIZE 完美平层已就绪（当前 IO 读取）')
+                return
             if self.debug:
                 print(f'[exec] INITIALIZE 触到 1 限位 → 全力减速中，等完美平层')
             return
@@ -191,6 +196,18 @@ class ActionExecutor:
             return
         self._init_waiting_perfect_level = False
         await self._complete_action()
+
+    async def _check_perfect_level_direct(self) -> bool:
+        """直接从 IO 缓存读取 level_up & level_down，判断完美平层是否已就绪"""
+        try:
+            lu_addr = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
+            ld_addr = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
+            if self.io.get_input(lu_addr) == 1 and self.io.get_input(ld_addr) == 1:
+                await self._complete_initialize()
+                return True
+        except Exception:
+            pass
+        return False
 
     async def _on_level_reached(self, direction: Direction) -> None:
         """
@@ -357,6 +374,7 @@ class ActionExecutor:
                 self.car.direction = Direction.UP
                 if self.debug:
                     print(f'[exec] init up: top_limit_1 已触发，直接等完美平层')
+                await self._check_perfect_level_direct()
         else:  # down
             ibot_addr = self.mapper.db_to_i(self.mapper.addr_input('bottom_limit_1', self.car_id))
             running = self.io.get_input(ibot_addr) == 0
@@ -375,6 +393,7 @@ class ActionExecutor:
                 self.car.direction = Direction.DOWN
                 if self.debug:
                     print(f'[exec] init down: bottom_limit_1 已触发，直接等完美平层')
+                await self._check_perfect_level_direct()
 
     async def _start_move_up(self) -> None:
         """上行启动：高速 + 上 + 电机（之后靠 _on_level_reached 多级减速）"""
