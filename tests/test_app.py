@@ -36,21 +36,26 @@ def i_event(mapper, signal: str, bit: int, car_id: int = 1) -> IOEvent:
 
 
 @pytest.mark.asyncio
-async def test_app_starts_with_initialize(app: App):
-    """启动后应自动 INIT：全速上行（默认 init_direction=up）→ 等 bottom_limit_1"""
+async def test_app_starts_idle_without_init(app: App):
+    """启动后不自动 INITIALIZE（避免撞 2 限位），等待用户手动命令"""
     await asyncio.sleep(0.05)
-    assert app.car.direction == Direction.UP
     assert app.car.state == CarState.UNKNOWN
-    # 全速上行接触器 + 高速 + 电机
-    assert app.io.get_output(app.mapper.addr_output('up_contactor', 1)) == 1
-    assert app.io.get_output(app.mapper.addr_output('high_speed_contactor', 1)) == 1
-    assert app.io.get_output(app.mapper.addr_output('motor_start', 1)) == 1
+    assert app.car.direction == Direction.IDLE
+    # 所有接触器/电机不应被拉起
+    assert app.io.get_output(app.mapper.addr_output('up_contactor', 1)) == 0
+    assert app.io.get_output(app.mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert app.io.get_output(app.mapper.addr_output('motor_start', 1)) == 0
 
 
 @pytest.mark.asyncio
 async def test_initialize_end_to_end(app: App):
-    """完整跑通：全速上行 → 触 1 限位 → 全刹车减速 → 等完美平层 → READY"""
+    """完整跑通：手动 init → 全速上行 → 触 1 限位 → 全刹车减速 → 等完美平层 → READY"""
     await asyncio.sleep(0.05)
+    from core.actions import Action, ActionKind
+    # 手动触发 INITIALIZE（无自动 init 了）
+    await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.05)
+
     # 1. 触发 1 限位 → 全刹车减速
     await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
     await asyncio.sleep(0.05)
@@ -87,6 +92,10 @@ async def test_initialize_2_limit_emergency_stop(app: App):
 async def test_call_internal_triggers_move(app: App):
     """内召 → 算法发 MOVE_UP → executor 拉上行接触器"""
     await asyncio.sleep(0.05)
+    from core.actions import Action, ActionKind
+    # 手动 INITIALIZE
+    await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.05)
     # 完成 INITIALIZE：1 限位 + 完美平层
     await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
@@ -109,6 +118,9 @@ async def test_call_internal_triggers_move(app: App):
 @pytest.mark.asyncio
 async def test_move_to_5_floor_open_door(app: App):
     """完整链路：内召 5 → 4 次平层 → 门开 → 门关 → pending 清空"""
+    await asyncio.sleep(0.05)
+    from core.actions import Action, ActionKind
+    await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
     # 完成 INITIALIZE
     await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))

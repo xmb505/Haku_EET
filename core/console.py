@@ -135,13 +135,16 @@ class Console:
                     subs = self.commands_with_subs[cmd]
                     # /car 特殊处理：先补 car_id（数字），再补子命令
                     if cmd == '/car':
-                        # 第二个 token 不是纯数字 → 提示 car_id
-                        if current_word == '' or not current_word.isdigit():
+                        # 已经输入了数字 car_id（parts[1] 是数字）→ 补子命令
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            # 落到下面普通子命令补全
+                            pass
+                        else:
+                            # 还没输 car_id，或输的不是数字 → 补 car_id
                             for cid in ('1', '2', '3', '4', '5', '6'):
                                 if cid.startswith(current_word):
                                     yield Completion(cid, start_position=-len(current_word))
                             return
-                        # 第二个 token 已经是数字 → 落到下面补子命令
                     # 普通子命令补全
                     if current_word == '':
                         for s in subs:

@@ -85,8 +85,8 @@ class App:
         self._executor_task = asyncio.create_task(
             self.executor.run_loop(self.action_queue)
         )
-        # 首次 decide（启动时推 INITIALIZE 等）
-        await self._tick()
+        # 不自动 INITIALIZE——让用户手动发 /car N init <dir> <floor>
+        # 避免电梯在端站时自动启动撞上 2 限位（坠机限位）
 
     async def stop(self) -> None:
         if self._executor_task and not self._executor_task.done():
