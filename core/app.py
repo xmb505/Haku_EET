@@ -62,6 +62,8 @@ class App:
             display=self.display,
             car_id=int(self.config['elevator']['car_id']),
             init_direction=self.config['elevator']['initialization_direction'],
+            top_base_floor=self.config['building']['top_base_floor'],
+            bottom_base_floor=self.config['building']['bottom_base_floor'],
             on_action_done=self._on_action_done,
             on_emergency_stop=self._on_emergency_stop,
         )

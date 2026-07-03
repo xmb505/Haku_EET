@@ -39,6 +39,8 @@ class ActionExecutor:
         display: DisplayEncoder,
         car_id: int,
         init_direction: str = 'down',
+        top_base_floor: int = 11,
+        bottom_base_floor: int = -1,
         on_action_done: Callable[[Action], Awaitable[None]] | None = None,
         on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
@@ -48,6 +50,8 @@ class ActionExecutor:
         self.display = display
         self.car_id = car_id
         self.init_direction = init_direction  # 'down' or 'up'
+        self.top_base_floor = top_base_floor
+        self.bottom_base_floor = bottom_base_floor
         self.on_action_done = on_action_done
         self.on_emergency_stop = on_emergency_stop
 
@@ -260,8 +264,11 @@ class ActionExecutor:
             case ActionKind.INITIALIZE:
                 # 保存目标楼层（ /car N init <dir> <floor> ）
                 self._init_target_floor = action.floor if action.floor is not None else 1
-                # 基站楼层由方向决定
-                self._init_base_floor = 1 if self.init_direction == 'down' else 10
+                # 基站楼层由方向 + config 决定
+                self._init_base_floor = (
+                    self.bottom_base_floor if self.init_direction == 'down'
+                    else self.top_base_floor
+                )
                 await self._execute_initialize()
 
             case ActionKind.MOVE_UP:

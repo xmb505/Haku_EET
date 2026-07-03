@@ -52,7 +52,9 @@ async def test_initialize_end_to_end(app: App):
     """完整跑通：手动 init（down 方向）→ 全速下行 → 触 1 限位 → 全刹车减速 → 等完美平层 → READY"""
     await asyncio.sleep(0.05)
     from core.actions import Action, ActionKind
-    app.executor.init_direction = 'down'  # down 方向 → 基站 1 楼
+    app.executor.init_direction = 'down'
+    app.executor.top_base_floor = 10
+    app.executor.bottom_base_floor = 1  # 与测试期望一致
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
 
@@ -93,7 +95,9 @@ async def test_call_internal_triggers_move(app: App):
     """内召 → 算法发 MOVE_UP → executor 拉上行接触器"""
     await asyncio.sleep(0.05)
     from core.actions import Action, ActionKind
-    app.executor.init_direction = 'down'  # down 方向 → 基站 1 楼
+    app.executor.init_direction = 'down'
+    app.executor.top_base_floor = 10
+    app.executor.bottom_base_floor = 1
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
     # 完成 INITIALIZE（down 方向用 top_limit）
@@ -120,7 +124,9 @@ async def test_move_to_5_floor_open_door(app: App):
     """完整链路：内召 5 → 4 次平层 → 门开 → 门关 → pending 清空"""
     await asyncio.sleep(0.05)
     from core.actions import Action, ActionKind
-    app.executor.init_direction = 'down'  # down 方向 → 基站 1 楼
+    app.executor.init_direction = 'down'
+    app.executor.top_base_floor = 10
+    app.executor.bottom_base_floor = 1
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
     # 完成 INITIALIZE（down 方向）

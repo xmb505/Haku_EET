@@ -31,6 +31,7 @@ def setup():
     executor = ActionExecutor(
         car=car, io=io, mapper=mapper, display=display,
         car_id=1, init_direction='up',
+        top_base_floor=10, bottom_base_floor=1,  # 与 tests 期望一致
     )
     return car, io, mapper, display, executor
 
