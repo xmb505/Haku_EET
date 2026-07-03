@@ -143,17 +143,24 @@ class App:
         self.car.target_floor = floor
         await self._tick()
 
-    async def reset(self, direction: str | None = None) -> None:
-        """手动触发初始化（默认用 config 里的方向）"""
+    async def reset(self, direction: str | None = None,
+                    target_floor: int | None = None) -> None:
+        """手动触发初始化（/car N init <dir> <floor>）
+
+        直接推 INITIALIZE action 到队列（跳过算法层），
+        方向 = direction 或 config 默认，目标楼层 = target_floor 或 1
+        """
         from .player import FaultFlags
         self.car.state = CarState.UNKNOWN
         self.car.position = None
         self.car.target_floor = None
-        self.car.fault = FaultFlags()  # 清故障（紧急停止后可用此恢复）
+        self.car.fault = FaultFlags()
         self.pending_calls.clear()
         if direction:
             self.executor.init_direction = direction
-        await self._tick()
+        tf = target_floor if target_floor is not None else 1
+        action = Action(ActionKind.INITIALIZE, floor=tf)
+        await self.action_queue.put(action)
 
     async def set_algorithm(self, name: str) -> None:
         """热切换算法"""

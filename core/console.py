@@ -133,8 +133,17 @@ class Console:
                 cmd = parts[0]
                 if cmd in self.commands_with_subs:
                     subs = self.commands_with_subs[cmd]
+                    # /car 特殊处理：先补 car_id（数字），再补子命令
+                    if cmd == '/car':
+                        # 第二个 token 不是纯数字 → 提示 car_id
+                        if current_word == '' or not current_word.isdigit():
+                            for cid in ('1', '2', '3', '4', '5', '6'):
+                                if cid.startswith(current_word):
+                                    yield Completion(cid, start_position=-len(current_word))
+                            return
+                        # 第二个 token 已经是数字 → 落到下面补子命令
+                    # 普通子命令补全
                     if current_word == '':
-                        # 刚输入完空格，列出所有子命令
                         for s in subs:
                             yield Completion(s, start_position=0)
                     else:
@@ -516,9 +525,36 @@ class Console:
         print('[manual] 已退出手动控制')
 
     async def cmd_init(self, args: list[str]) -> None:
-        direction = args[0] if args else None
-        await self.app.reset(direction=direction)
-        print(f'car {self.app.car.car_id} 初始化已触发，方向={direction or self.app.executor.init_direction}')
+        """
+        用法:
+          /init [<up|down> [<floor>]]
+          /car 1 init <up|down> <floor>
+
+        示例:
+          /car 1 init up 10     → 上行到上基站，触 1 限位 + 第一个完美平层，记录为 10 楼
+          /car 1 init down 2    → 下行到下基站，触 1 限位 + 第一个完美平层，记录为 2 楼
+          /init down             → 用 config 方向 + 默认楼层 1
+          /init                  → 用 config 方向 + 默认楼层 1
+        """
+        direction = None
+        target_floor = None
+        if args:
+            if args[0] in ('up', 'down'):
+                direction = args[0]
+                if len(args) > 1:
+                    try:
+                        target_floor = int(args[1])
+                    except ValueError:
+                        print(f'楼层必须是整数: {args[1]}')
+                        return
+            else:
+                print('参数错误: 第一个参数必须是 up 或 down')
+                print('用法: /car <id> init <up|down> [<floor>]')
+                return
+        await self.app.reset(direction=direction, target_floor=target_floor)
+        dir_str = direction or self.app.executor.init_direction
+        floor_str = str(target_floor) if target_floor else '1（默认）'
+        print(f'car {self.app.car.car_id} 初始化: {dir_str} 目标楼层={floor_str}')
 
     async def cmd_call(self, args: list[str]) -> None:
         if not args:

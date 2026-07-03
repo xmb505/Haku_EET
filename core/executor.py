@@ -58,6 +58,8 @@ class ActionExecutor:
         self.decel_state: str = ''
         # INITIALIZE 触发底端站限位后，等"level_up & level_down 同时为 1"的完美平层
         self._init_waiting_perfect_level: bool = False
+        # INITIALIZE 完成后轿厢应被标记为的楼层（由 /car N init <dir> <floor> 指定）
+        self._init_target_floor: int = 1
         # 手动刹车档位（0=不刹, 1-7=不同组合）
         self.manual_brake_level: int = 0
         # 当前实际写出去的刹车组合（用于幂等性检查）
@@ -258,6 +260,8 @@ class ActionExecutor:
 
         match action.kind:
             case ActionKind.INITIALIZE:
+                # 从 action.floor 读取目标楼层，如未指定默认为 1
+                self._init_target_floor = action.floor if action.floor is not None else 1
                 await self._execute_initialize()
 
             case ActionKind.MOVE_UP:
@@ -407,8 +411,8 @@ class ActionExecutor:
         # 根据动作类型更新 Car 状态
         match action.kind:
             case ActionKind.INITIALIZE:
-                # 无论 init_direction 是 up 还是 down，初始化后都到 1 楼
-                self.car.position = 1
+                # 用调用者指定的楼层初始化（/car N init <dir> <floor>）
+                self.car.position = self._init_target_floor
                 self.car.state = CarState.READY
                 # 初始化完成 → 清掉端站限位 fault 标志
                 # (到达基站是"成功定位"而不是"撞限位故障")
