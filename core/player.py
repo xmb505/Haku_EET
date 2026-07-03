@@ -1,0 +1,98 @@
+"""
+player.py —— 电梯"玩家"抽象
+
+只保留现实状态：位置、方向、门、故障、显示。
+算法层只 import 这个模块，看不到 IO 地址。
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class CarState(Enum):
+    """轿厢整体状态机"""
+    UNKNOWN = "unknown"   # 启动未初始化，需要 INITIALIZE
+    READY = "ready"       # 已初始化，可正常调度
+    FAULT = "fault"       # 故障，停止响应任务
+
+
+class Direction(Enum):
+    """轿厢运行方向"""
+    IDLE = "idle"
+    UP = "up"
+    DOWN = "down"
+
+
+class DoorState(Enum):
+    """门状态机"""
+    CLOSED = "closed"
+    OPENING = "opening"
+    OPEN = "open"
+    CLOSING = "closing"
+
+
+@dataclass(frozen=True)
+class FaultFlags:
+    """故障/保护信号集合（任意一项为 True 都可能影响算法决策）"""
+    overload: bool = False           # 超重
+    service_mode: bool = False      # 检修模式
+    light_curtain: bool = False     # 光幕触发（防夹）
+    top_limit: bool = False         # 上端站限位
+    bottom_limit: bool = False      # 下端站限位
+
+    def any_active(self) -> bool:
+        return any((
+            self.overload,
+            self.service_mode,
+            self.light_curtain,
+            self.top_limit,
+            self.bottom_limit,
+        ))
+
+
+@dataclass
+class Car:
+    """
+    电梯 = 玩家（首版单实例）
+
+    算法层唯一能看到的状态对象。绝对不包含 IO 地址。
+    """
+    car_id: int
+    state: CarState = CarState.UNKNOWN
+    position: int | None = None              # None 表示位置未知（未初始化）
+    direction: Direction = Direction.IDLE
+    door_state: DoorState = DoorState.CLOSED
+    target_floor: int | None = None
+    fault: FaultFlags = field(default_factory=FaultFlags)
+    display: int = 1                         # 7 段显示的楼层数字
+    manual_speed: bool | None = None         # 手动模式当前速度档 (True=高速, False=低速, None=未在动)
+
+    def is_ready(self) -> bool:
+        return self.state == CarState.READY and not self.fault.service_mode
+
+    def snapshot(self) -> dict:
+        """给 REPL /status 用的快照（可序列化）"""
+        return {
+            'car_id': self.car_id,
+            'state': self.state.value,
+            'position': self.position,
+            'direction': self.direction.value,
+            'door_state': self.door_state.value,
+            'target_floor': self.target_floor,
+            'display': self.display,
+            'fault': {
+                'overload': self.fault.overload,
+                'service_mode': self.fault.service_mode,
+                'light_curtain': self.fault.light_curtain,
+                'top_limit': self.fault.top_limit,
+                'bottom_limit': self.fault.bottom_limit,
+            },
+        }
+
+    def __repr__(self) -> str:
+        pos = f'L{self.position}' if self.position is not None else '?'
+        return (
+            f'Car(id={self.car_id}, state={self.state.value}, pos={pos}, '
+            f'dir={self.direction.value}, door={self.door_state.value}, '
+            f'display={self.display})'
+        )

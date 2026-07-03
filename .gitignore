@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# pytest
+.pytest_cache/
+
+# Qwen Code
+.qwen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# history
+.haku_eet_history

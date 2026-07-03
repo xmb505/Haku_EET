@@ -1,0 +1,25 @@
+# Haku_EET 主配置
+# 比赛现场可直接修改 + /reload 热加载，无需重启程序
+
+io2http:
+  http_url: http://192.168.1.201:8080/gpio
+  ws_url: ws://192.168.1.201:8081/
+
+building:
+  min_floor: 1          # 最低楼层（1 = 底层）
+  max_floor: 10         # 最高楼层
+
+elevator:
+  car_id: 1             # 首版只跑 1 部
+  # 初始化方向：up = 从 1 楼基站段向上回到 1 楼（全速→触底限位→减速→完美平层）
+  #              down = 从 10 楼顶部向下回到 1 楼（不常见）
+  # 比赛现场如有变动，改这里然后在 REPL 跑 /reload
+  initialization_direction: up
+
+algorithm:
+  # 首版只实现 simple_internal_call（响应内召，到目标层开门）
+  name: simple_internal_call
+
+logging:
+  level: INFO
+  # debug 时改为 DEBUG，看 IO 事件、动作队列、状态机迁移全过程

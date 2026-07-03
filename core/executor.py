@@ -1,0 +1,501 @@
+"""
+executor.py —— 硬件层 FSM（动作 → IO 序列 + 等传感器确认）
+
+职责:
+    - 从 ActionQueue 取 Action
+    - 把 Action 展开为具体的 IO 操作（拉接触器、继电器、7 段显示）
+    - 监听 IO 事件，等传感器信号确认动作完成
+    - 维护 Car 的现实状态（position / door_state / direction / fault）
+    - 完成后回调 on_action_done，触发 app 重新调用 algorithm.decide()
+
+算法层完全不需要 import 这个文件。
+"""
+
+import asyncio
+import dataclasses
+from typing import Awaitable, Callable
+
+from .actions import Action, ActionKind, ActionQueue
+from .display import DisplayEncoder
+from .io_client import IOClient, IOEvent
+from .io_mapper import IOMapper
+from .player import Car, CarState, Direction, DoorState
+
+
+class ActionExecutor:
+    """
+    硬件层执行器
+
+    用法:
+        executor = ActionExecutor(car, io, mapper, display, car_id=1, init_direction='down')
+        await executor.run_loop(action_queue)  # 后台任务
+    """
+
+    def __init__(
+        self,
+        car: Car,
+        io: IOClient,
+        mapper: IOMapper,
+        display: DisplayEncoder,
+        car_id: int,
+        init_direction: str = 'down',
+        on_action_done: Callable[[Action], Awaitable[None]] | None = None,
+        on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self.car = car
+        self.io = io
+        self.mapper = mapper
+        self.display = display
+        self.car_id = car_id
+        self.init_direction = init_direction  # 'down' or 'up'
+        self.on_action_done = on_action_done
+        self.on_emergency_stop = on_emergency_stop
+
+        self.current_action: Action | None = None
+        # 等哪个信号 → (signal_name, expected_bit)
+        self.waiting_sensor: tuple[str, int] | None = None
+        # 多级减速子状态: 'high_speed' / 'decel_1' / 'decel_2' / 'decel_3'
+        self.decel_state: str = ''
+        # INITIALIZE 触发底端站限位后，等"level_up & level_down 同时为 1"的完美平层
+        self._init_waiting_perfect_level: bool = False
+        # 手动刹车档位（0=不刹, 1-7=不同组合）
+        self.manual_brake_level: int = 0
+        # 当前实际写出去的刹车组合（用于幂等性检查）
+        self.manual_current_brake_state: int = 0
+        # 上一次 level_up / level_down 值，用于检测上升沿（经过平层点）
+        self._last_level_up: int = 0
+        self._last_level_down: int = 0
+        # 调试输出
+        self.debug = False
+
+    # ===== 主循环 =====
+
+    async def run_loop(self, queue: ActionQueue) -> None:
+        """阻塞循环：取 Action → 执行 → 等传感器 → 完成 → 下一个"""
+        while True:
+            action = await queue.get()
+            self.current_action = action
+            self.waiting_sensor = None
+            await self._start_action(action)
+            # 如果是立即完成的动作（SET_DISPLAY / NOOP），已经 _complete_action 过了
+            # 否则等待 on_io_event 推进
+
+    # ===== IO 事件入口 =====
+
+    async def on_io_event(self, event: IOEvent) -> None:
+        """IOClient 收到变化时调用"""
+        # 1. 更新 Car 的故障标志
+        await self._update_fault_flags(event)
+
+        # 2. 推进当前动作
+        if self.current_action is None:
+            # 即使没有当前动作也要检查保护逻辑（如 2 限位）
+            sig2 = self.mapper.lookup_signal_by_i(event.i_addr)
+            if sig2 is not None and sig2[0] == self.car_id:
+                if sig2[1] in ('bottom_limit_2', 'top_limit_2') and event.bit == 1:
+                    await self._emergency_stop(reason='limit_2_touched')
+            return
+
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None:
+            return
+        car_id, name = sig
+        if car_id != self.car_id:
+            return
+
+        # 2.5 安全保护：2 限位（坠机限位）触发 = 立即紧急停止
+        if name in ('bottom_limit_2', 'top_limit_2') and event.bit == 1:
+            await self._emergency_stop(reason='limit_2_touched')
+            return
+
+        # 2.6 INITIALIZE 流程：电梯从基站段（1 楼下方）全速向上
+        # 触到 1 限位时切低速 + 全刹车减速（不停车），等"完美平层"（level_up & level_down 同时 1）
+        # 2 限位是坠机红线，绝对不能碰
+        if (self.current_action.kind == ActionKind.INITIALIZE
+                and name in ('bottom_limit_1', 'top_limit_1')
+                and event.bit == 1):
+            # 不停车！切低速 + 全力减速，让惯性把轿厢带到 1 楼平层位置
+            await self._set_outputs({
+                'high_speed_contactor': 0,
+                'low_speed_contactor': 1,
+                'brake_1': 1,
+                'brake_2': 1,
+                'brake_3': 1,
+                'motor_start': 0,  # 关电机，靠惯性 + 刹车停车
+            })
+            self._init_waiting_perfect_level = True
+            self.waiting_sensor = None
+            if self.debug:
+                print(f'[exec] INITIALIZE 触到 1 限位 → 全力减速中，等完美平层')
+            return
+
+        # 3. 检测平层信号边沿
+        if name in ('level_up', 'level_down'):
+            if name == 'level_up':
+                self._last_level_up = event.bit
+            else:
+                self._last_level_down = event.bit
+
+            # 3a. INITIALIZE 等"level_up & level_down 同时为 1"完美平层判定
+            if self._init_waiting_perfect_level and self._last_level_up == 1 and self._last_level_down == 1:
+                await self._complete_initialize()
+                return
+
+            # 3b. 正常 MOVE_UP/MOVE_DOWN 的减速曲线
+            if event.bit == 1:
+                if name == 'level_up' and self.current_action.kind == ActionKind.MOVE_UP:
+                    await self._on_level_reached(direction=Direction.UP)
+                elif name == 'level_down' and self.current_action.kind == ActionKind.MOVE_DOWN:
+                    await self._on_level_reached(direction=Direction.DOWN)
+            return
+
+        # 4. 等待特定传感器的动作（OPEN/CLOSE_DOOR 等）
+        if self.waiting_sensor is None:
+            return
+        wait_name, expected_bit = self.waiting_sensor
+        if name == wait_name and event.bit == expected_bit:
+            await self._complete_action()
+
+    async def _emergency_stop(self, reason: str = 'unknown') -> None:
+        """
+        紧急停止：清所有接触器+电机+制动，置 fault 状态
+
+        用于：
+            - 2 限位（坠机限位）触发
+            - 用户手动 EMERGENCY_STOP
+            - 任何"丢分"危险情况
+        """
+        if self.debug:
+            print(f'[exec] EMERGENCY STOP: {reason}')
+        await self._all_outputs_off()
+        self.car.state = CarState.FAULT
+        self.car.direction = Direction.IDLE
+        self._init_waiting_perfect_level = False
+        # 如果有当前动作也清掉（不再等传感器）
+        self.current_action = None
+        self.waiting_sensor = None
+        if self.on_emergency_stop is not None:
+            await self.on_emergency_stop()
+
+    async def _complete_initialize(self) -> None:
+        """INITIALIZE 完美平层达成（level_up & level_down 同时为 1）"""
+        if self.current_action is None or self.current_action.kind != ActionKind.INITIALIZE:
+            return
+        self._init_waiting_perfect_level = False
+        await self._complete_action()
+
+    async def _on_level_reached(self, direction: Direction) -> None:
+        """
+        处理一次平层信号（每经过一层触发一次）。
+        维护 position 追踪 + 多级减速曲线。
+        """
+        if self.car.position is None:
+            return
+        target = self.car.target_floor
+        if target is None:
+            return
+
+        # 1. 更新 position（经过一个平层点）
+        if direction == Direction.UP:
+            self.car.position += 1
+        else:
+            self.car.position -= 1
+
+        new_pos = self.car.position
+        remaining = target - new_pos  # 还差几层（正数=还需上行，负数=还需下行）
+
+        if self.debug:
+            print(f'[exec] level reached: pos={new_pos} target={target} remaining={remaining} decel_state={self.decel_state}')
+
+        # 2. 到达目标层 → 完全停车
+        if new_pos == target:
+            await self._stop_motion()
+            self.decel_state = ''
+            self.car.direction = Direction.IDLE
+            # 更新 7 段显示
+            await self._write_display(self.display.get_segments_for_floor(target))
+            self.car.display = target
+            await self._complete_action()
+            return
+
+        # 3. 多级减速曲线
+        # 高速段（remaining >= 4）：保持高速
+        # remaining == 3 → 切低速 + brake_1
+        # remaining == 2 → + brake_2
+        # remaining == 1 → + brake_3 + 关闭电机（让惯性停车）
+        if remaining >= 4:
+            if self.decel_state != 'high_speed':
+                # 已经在高速阶段，无需动作
+                self.decel_state = 'high_speed'
+        elif remaining == 3:
+            if self.decel_state != 'decel_1':
+                await self._set_outputs({
+                    'high_speed_contactor': 0,
+                    'low_speed_contactor': 1,
+                    'brake_1': 1,
+                })
+                self.decel_state = 'decel_1'
+        elif remaining == 2:
+            if self.decel_state != 'decel_2':
+                await self._set_outputs({
+                    'brake_2': 1,
+                })
+                self.decel_state = 'decel_2'
+        elif remaining == 1:
+            if self.decel_state != 'decel_3':
+                await self._set_outputs({
+                    'brake_3': 1,
+                    'motor_start': 0,  # 切断电机，让惯性 + 制动停车
+                })
+                self.decel_state = 'decel_3'
+
+    # ===== Action 展开 =====
+
+    async def _start_action(self, action: Action) -> None:
+        """展开 Action 为 IO 序列，设置等待传感器"""
+        if self.debug:
+            print(f'[exec] start {action}')
+
+        match action.kind:
+            case ActionKind.INITIALIZE:
+                await self._execute_initialize()
+
+            case ActionKind.MOVE_UP:
+                await self._start_move_up()
+
+            case ActionKind.MOVE_DOWN:
+                await self._start_move_down()
+
+            case ActionKind.OPEN_DOOR:
+                await self._set_outputs({
+                    'door_open_relay': 1,
+                    'door_close_relay': 0,
+                })
+                self.car.door_state = DoorState.OPENING
+                self.waiting_sensor = ('door_open_done', 1)
+
+            case ActionKind.CLOSE_DOOR:
+                await self._set_outputs({
+                    'door_open_relay': 0,
+                    'door_close_relay': 1,
+                })
+                self.car.door_state = DoorState.CLOSING
+                self.waiting_sensor = ('door_close_done', 1)
+
+            case ActionKind.SET_DISPLAY:
+                if action.glyph is not None:
+                    # 直接按字符写（自定义字符如 'up'/'down'/'fault'）
+                    segments = self.display.get_segments_for_glyph(action.glyph)
+                elif action.floor is not None:
+                    segments = self.display.get_segments_for_floor(action.floor)
+                else:
+                    # 兜底：全灭
+                    segments = set()
+                await self._write_display(segments)
+                if action.floor is not None:
+                    self.car.display = action.floor
+                # SET_DISPLAY 立即完成（无传感器等待）
+                await self._complete_action()
+
+            case ActionKind.RESET_FAULT:
+                # 简化版：清所有输出（除 ready 信号外）
+                await self._all_outputs_off()
+                self.car.state = CarState.READY
+                await self._complete_action()
+
+            case ActionKind.EMERGENCY_STOP:
+                await self._all_outputs_off()
+                self.car.state = CarState.FAULT
+                await self._complete_action()
+
+            case ActionKind.NOOP:
+                await self._complete_action()
+
+    async def _execute_initialize(self) -> None:
+        """
+        初始化子状态机：朝 init_direction 全速启动
+
+        流程:
+            1. 高速 + 方向 + 电机启动（全速朝 1 楼基地方向跑）
+            2. 触到底端站 1 限位 → 切低速 + 三级减速刹车（不停车，靠惯性带）
+            3. 等 level_up & level_down 同时为 1（完美卡到 1 楼层点位）→ 停车 + READY
+            4. 触到 2 限位（坠机限位） → 紧急停止 + 故障
+
+        关键：千万不能触到 2 限位（坠机扣分）
+        """
+        if self.init_direction == 'down':
+            # 从 10 楼顶部往下初始化（少见）
+            await self._set_outputs({
+                'up_contactor': 0,
+                'down_contactor': 1,
+                'high_speed_contactor': 1,    # 全速下行
+                'low_speed_contactor': 0,
+                'motor_start': 1,
+            })
+            self.waiting_sensor = ('top_limit_1', 1)
+            self.car.direction = Direction.DOWN
+        else:  # 'up' —— 默认场景：电梯在 1 楼基站段，要上到 1 楼
+            await self._set_outputs({
+                'up_contactor': 1,
+                'down_contactor': 0,
+                'high_speed_contactor': 1,    # 全速上行
+                'low_speed_contactor': 0,
+                'motor_start': 1,
+            })
+            self.waiting_sensor = ('bottom_limit_1', 1)
+            self.car.direction = Direction.UP
+
+    async def _start_move_up(self) -> None:
+        """上行启动：高速 + 上 + 电机（之后靠 _on_level_reached 多级减速）"""
+        self.decel_state = 'high_speed'
+        self._last_level_up = 0
+        await self._set_outputs({
+            'up_contactor': 1,
+            'down_contactor': 0,
+            'high_speed_contactor': 1,
+            'low_speed_contactor': 0,
+            'motor_start': 1,
+            'brake_1': 0,
+            'brake_2': 0,
+            'brake_3': 0,
+        })
+        self.car.direction = Direction.UP
+        self.waiting_sensor = None  # 不等特定传感器，靠 level_up 边沿推进
+
+    async def _start_move_down(self) -> None:
+        """下行启动：高速 + 下 + 电机"""
+        self.decel_state = 'high_speed'
+        self._last_level_down = 0
+        await self._set_outputs({
+            'up_contactor': 0,
+            'down_contactor': 1,
+            'high_speed_contactor': 1,
+            'low_speed_contactor': 0,
+            'motor_start': 1,
+            'brake_1': 0,
+            'brake_2': 0,
+            'brake_3': 0,
+        })
+        self.car.direction = Direction.DOWN
+        self.waiting_sensor = None
+
+    async def _stop_motion(self) -> None:
+        """完全停车：清所有电机/接触器/制动"""
+        await self._set_outputs({
+            'up_contactor': 0,
+            'down_contactor': 0,
+            'high_speed_contactor': 0,
+            'low_speed_contactor': 0,
+            'motor_start': 0,
+            'brake_1': 0,
+            'brake_2': 0,
+            'brake_3': 0,
+        })
+
+    async def _complete_action(self) -> None:
+        """动作完成：更新 Car 状态 + 清接触器 + 触发回调"""
+        action = self.current_action
+        self.current_action = None
+        self.waiting_sensor = None
+
+        if self.debug:
+            print(f'[exec] done {action}')
+
+        if action is None:
+            return
+
+        # 根据动作类型更新 Car 状态
+        match action.kind:
+            case ActionKind.INITIALIZE:
+                # 无论 init_direction 是 up 还是 down，初始化后都到 1 楼
+                self.car.position = 1
+                self.car.state = CarState.READY
+                # 初始化完成 → 清掉端站限位 fault 标志
+                # (到达基站是"成功定位"而不是"撞限位故障")
+                self.car.fault = dataclasses.replace(
+                    self.car.fault, bottom_limit=False, top_limit=False
+                )
+                # 自动显示初始化层
+                await self._write_display(
+                    self.display.get_segments_for_floor(self.car.position)
+                )
+                self.car.display = self.car.position
+                # 完全停车
+                await self._stop_motion()
+
+            case ActionKind.MOVE_UP | ActionKind.MOVE_DOWN:
+                # MOVE_UP/MOVE_DOWN 完成时，_on_level_reached 已停车并更新 position
+                # 这里只需要重置 decel_state
+                self.decel_state = ''
+
+            case ActionKind.OPEN_DOOR:
+                self.car.door_state = DoorState.OPEN
+            case ActionKind.CLOSE_DOOR:
+                self.car.door_state = DoorState.CLOSED
+
+            case _:
+                pass
+
+        if self.on_action_done is not None:
+            await self.on_action_done(action)
+
+    # ===== 内部辅助 =====
+
+    async def _set_outputs(self, signals: dict[str, int]) -> None:
+        """逻辑信号名 + 值 → 写 IO"""
+        writes = {}
+        for sig, val in signals.items():
+            db_addr = self.mapper.addr_output(sig, self.car_id)
+            writes[db_addr] = val
+        await self.io.set_many(writes)
+
+    async def _write_display(self, segments: set[str]) -> None:
+        """写 7 段数码管（先全清再置位）"""
+        all_segs = set(self.display.segments)
+        writes = {}
+        for seg in all_segs:
+            db_addr = self.mapper.addr_output(f'segment_{seg}', self.car_id)
+            writes[db_addr] = 1 if seg in segments else 0
+        await self.io.set_many(writes)
+
+    async def _all_outputs_off(self) -> None:
+        """清所有输出（除 ready 信号外）"""
+        for sig in self.mapper.all_output_signals(self.car_id):
+            if sig in ('ready', 'segment_a', 'segment_b', 'segment_c', 'segment_d',
+                       'segment_e', 'segment_f', 'segment_g', 'segment_h',
+                       'segment_i', 'segment_j', 'segment_k', 'segment_l',
+                       'segment_m', 'cabin_button_led_1', 'cabin_button_led_2',
+                       'cabin_button_led_3', 'cabin_button_led_4', 'cabin_button_led_5',
+                       'cabin_button_led_6', 'cabin_button_led_7', 'cabin_button_led_8',
+                       'cabin_button_led_9', 'cabin_button_led_10',
+                       'car_door_lock_led', 'up_indicator', 'down_indicator',
+                       'fault_indicator', 'light_indicator', 'fan_indicator',
+                       'full_load_indicator'):
+                continue
+            try:
+                await self.io.set(self.mapper.addr_output(sig, self.car_id), 0)
+            except KeyError:
+                pass
+
+    async def _update_fault_flags(self, event: IOEvent) -> None:
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None:
+            return
+        car_id, name = sig
+        if car_id != self.car_id:
+            return
+
+        updates: dict[str, bool] = {}
+        match name:
+            case 'overload':
+                updates['overload'] = event.bit == 1
+            case 'service_mode':
+                updates['service_mode'] = event.bit == 1
+            case 'light_curtain':
+                updates['light_curtain'] = event.bit == 1
+            case 'top_limit_1' | 'top_limit_2':
+                updates['top_limit'] = event.bit == 1
+            case 'bottom_limit_1' | 'bottom_limit_2':
+                updates['bottom_limit'] = event.bit == 1
+        if updates:
+            self.car.fault = dataclasses.replace(self.car.fault, **updates)
