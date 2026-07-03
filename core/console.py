@@ -321,7 +321,7 @@ class Console:
             print('[manual] 当前 stdin 不是 tty，无法捕获方向键。请在真实终端运行。')
             return
 
-        from core.player import Direction
+        from core.player import Direction, CarState
 
         print()
         print('=' * 50)
@@ -506,11 +506,13 @@ class Console:
             sys.stdout.flush()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
 
-        # 释放刹车 + 停电机 + 切回 auto
+        # 释放刹车 + 停电机 + 切回 auto（不自动 tick，避免 UNKNOWN 状态触发 INITIALIZE）
         await self.app.manual_brake(0)
         await self.app.manual_stop()
         self.app.manual_mode = False
-        await self.app._tick()
+        # 只有已初始化的电梯才恢复自动调度（UNKNOWN 状态停在原地不动）
+        if self.app.car.state == CarState.READY:
+            await self.app._tick()
         print('[manual] 已退出手动控制')
 
     async def cmd_init(self, args: list[str]) -> None:
