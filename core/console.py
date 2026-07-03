@@ -104,6 +104,11 @@ class Console:
             commands_with_subs = {
                 '/car': ['init', 'call', 'status', 'manual', 'auto'],
             }
+            # 子命令的下级参数补全
+            sub_sub_args: dict[str, list[str]] = {
+                'init': ['up', 'down'],
+                'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+            }
 
             def get_completions(self, document, complete_event):
                 text = document.text_before_cursor
@@ -146,6 +151,22 @@ class Console:
                                     yield Completion(cid, start_position=-len(current_word))
                             return
                     # 普通子命令补全
+                    # parts = ['/car', '1'] → 补子命令
+                    # parts = ['/car', '1', 'init'] → 补子命令参数
+                    if len(parts) >= 3:
+                        # 三级补全：子命令的参数（如 init → up/down）
+                        sub_cmd = parts[2]
+                        if sub_cmd in self.sub_sub_args:
+                            sub_subs = self.sub_sub_args[sub_cmd]
+                            if current_word == '':
+                                for s in sub_subs:
+                                    yield Completion(s, start_position=0)
+                            else:
+                                for s in sub_subs:
+                                    if s.startswith(current_word):
+                                        yield Completion(s, start_position=-len(current_word))
+                            return
+                        return
                     if current_word == '':
                         for s in subs:
                             yield Completion(s, start_position=0)
