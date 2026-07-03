@@ -258,7 +258,7 @@ async def test_action_done_callback(setup):
 
 @pytest.mark.asyncio
 async def test_initialize_up_triggers_bottom_limit(setup):
-    """默认 up 方向：全速上行 → 触 1 限位 → 减速 → 完美平层 → READY"""
+    """默认 up 方向：全速上行 → 触 1 限位 → 减速 → 完美平层 → READY（基站=10）"""
     car, io, mapper, display, executor = setup
     # 默认 init_direction = 'up'
     queue = ActionQueue()
@@ -285,7 +285,7 @@ async def test_initialize_up_triggers_bottom_limit(setup):
     await asyncio.sleep(0.02)
 
     assert car.state == CarState.READY
-    assert car.position == 1
+    assert car.position == 10  # up 方向基站为 10 楼
 
     task.cancel()
     try:

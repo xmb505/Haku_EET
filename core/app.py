@@ -118,6 +118,17 @@ class App:
                     c for c in self.pending_calls if c != self.car.target_floor
                 ]
                 self.car.target_floor = None
+
+        # INITIALIZE 完成后，如果目标楼层 != 基站楼层，自动移动到目标层
+        if last_action is not None and last_action.kind == ActionKind.INITIALIZE:
+            target = last_action.floor
+            if target is not None and target != self.car.position:
+                self.car.target_floor = target
+                dir_action = Action(
+                    ActionKind.MOVE_UP if target > self.car.position else ActionKind.MOVE_DOWN
+                )
+                await self.action_queue.put(dir_action)
+                return  # 不调 tick（MOVE 完成后会再回调）
         await self._tick()
 
     async def _on_io_event(self, event: IOEvent) -> None:

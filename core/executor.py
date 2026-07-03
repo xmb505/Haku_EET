@@ -58,7 +58,9 @@ class ActionExecutor:
         self.decel_state: str = ''
         # INITIALIZE 触发底端站限位后，等"level_up & level_down 同时为 1"的完美平层
         self._init_waiting_perfect_level: bool = False
-        # INITIALIZE 完成后轿厢应被标记为的楼层（由 /car N init <dir> <floor> 指定）
+        # INITIALIZE 完成后轿厢所在的基站楼层（由方向决定：up→10, down→1）
+        self._init_base_floor: int = 1
+        # INITIALIZE 到达基站后还要移动到的目标楼层（/car N init <dir> <floor>）
         self._init_target_floor: int = 1
         # 手动刹车档位（0=不刹, 1-7=不同组合）
         self.manual_brake_level: int = 0
@@ -220,16 +222,12 @@ class ActionExecutor:
             await self._complete_action()
             return
 
-        # 3. 多级减速曲线
-        # 高速段（remaining >= 4）：保持高速
-        # remaining == 3 → 切低速 + brake_1
-        # remaining == 2 → + brake_2
-        # remaining == 1 → + brake_3 + 关闭电机（让惯性停车）
-        if remaining >= 4:
+        # 3. 多级减速曲线（方向无关，按距目标绝对距离减速）
+        dist = abs(remaining)  # 距目标还有几层
+        if dist >= 4:
             if self.decel_state != 'high_speed':
-                # 已经在高速阶段，无需动作
                 self.decel_state = 'high_speed'
-        elif remaining == 3:
+        elif dist == 3:
             if self.decel_state != 'decel_1':
                 await self._set_outputs({
                     'high_speed_contactor': 0,
@@ -237,13 +235,13 @@ class ActionExecutor:
                     'brake_1': 1,
                 })
                 self.decel_state = 'decel_1'
-        elif remaining == 2:
+        elif dist == 2:
             if self.decel_state != 'decel_2':
                 await self._set_outputs({
                     'brake_2': 1,
                 })
                 self.decel_state = 'decel_2'
-        elif remaining == 1:
+        elif dist == 1:
             if self.decel_state != 'decel_3':
                 await self._set_outputs({
                     'brake_3': 1,
@@ -260,8 +258,10 @@ class ActionExecutor:
 
         match action.kind:
             case ActionKind.INITIALIZE:
-                # 从 action.floor 读取目标楼层，如未指定默认为 1
+                # 保存目标楼层（ /car N init <dir> <floor> ）
                 self._init_target_floor = action.floor if action.floor is not None else 1
+                # 基站楼层由方向决定
+                self._init_base_floor = 1 if self.init_direction == 'down' else 10
                 await self._execute_initialize()
 
             case ActionKind.MOVE_UP:
@@ -411,8 +411,8 @@ class ActionExecutor:
         # 根据动作类型更新 Car 状态
         match action.kind:
             case ActionKind.INITIALIZE:
-                # 用调用者指定的楼层初始化（/car N init <dir> <floor>）
-                self.car.position = self._init_target_floor
+                # 用 _init_base_floor（基站楼层），不是用户指定的目标楼层
+                self.car.position = self._init_base_floor
                 self.car.state = CarState.READY
                 # 初始化完成 → 清掉端站限位 fault 标志
                 # (到达基站是"成功定位"而不是"撞限位故障")

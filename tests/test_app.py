@@ -49,15 +49,15 @@ async def test_app_starts_idle_without_init(app: App):
 
 @pytest.mark.asyncio
 async def test_initialize_end_to_end(app: App):
-    """完整跑通：手动 init → 全速上行 → 触 1 限位 → 全刹车减速 → 等完美平层 → READY"""
+    """完整跑通：手动 init（down 方向）→ 全速下行 → 触 1 限位 → 全刹车减速 → 等完美平层 → READY"""
     await asyncio.sleep(0.05)
     from core.actions import Action, ActionKind
-    # 手动触发 INITIALIZE（无自动 init 了）
+    app.executor.init_direction = 'down'  # down 方向 → 基站 1 楼
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
 
-    # 1. 触发 1 限位 → 全刹车减速
-    await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
+    # 1. 触发 top_limit_1（下行方向使用 top）
+    await app.executor.on_io_event(i_event(app.mapper, 'top_limit_1', 1))
     await asyncio.sleep(0.05)
 
     # 还没完成：等完美平层
@@ -69,7 +69,7 @@ async def test_initialize_end_to_end(app: App):
     await asyncio.sleep(0.05)
 
     assert app.car.state == CarState.READY
-    assert app.car.position == 1
+    assert app.car.position == 1  # down 方向基站=1
     assert app.car.display == 1
     assert app.io.get_output(app.mapper.addr_output('segment_b', 1)) == 1
     assert app.io.get_output(app.mapper.addr_output('segment_c', 1)) == 1
@@ -93,17 +93,17 @@ async def test_call_internal_triggers_move(app: App):
     """内召 → 算法发 MOVE_UP → executor 拉上行接触器"""
     await asyncio.sleep(0.05)
     from core.actions import Action, ActionKind
-    # 手动 INITIALIZE
+    app.executor.init_direction = 'down'  # down 方向 → 基站 1 楼
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
-    # 完成 INITIALIZE：1 限位 + 完美平层
-    await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
+    # 完成 INITIALIZE（down 方向用 top_limit）
+    await app.executor.on_io_event(i_event(app.mapper, 'top_limit_1', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_down', 1))
     await asyncio.sleep(0.05)
     assert app.car.state == CarState.READY
 
-    # 内召 5 楼
+    # 内召 5 楼（从 1 楼向上）
     await app.call_internal(5)
     await asyncio.sleep(0.05)
 
@@ -120,10 +120,11 @@ async def test_move_to_5_floor_open_door(app: App):
     """完整链路：内召 5 → 4 次平层 → 门开 → 门关 → pending 清空"""
     await asyncio.sleep(0.05)
     from core.actions import Action, ActionKind
+    app.executor.init_direction = 'down'  # down 方向 → 基站 1 楼
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
-    # 完成 INITIALIZE
-    await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
+    # 完成 INITIALIZE（down 方向）
+    await app.executor.on_io_event(i_event(app.mapper, 'top_limit_1', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
     await app.executor.on_io_event(i_event(app.mapper, 'level_down', 1))
     await asyncio.sleep(0.05)
