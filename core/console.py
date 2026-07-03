@@ -152,9 +152,23 @@ class Console:
                             return
                     # 普通子命令补全
                     # parts = ['/car', '1'] → 补子命令
-                    # parts = ['/car', '1', 'init'] → 补子命令参数
+                    # parts = ['/car', '1', 'sub'] → 三级：子命令参数（init→up/down, call→1-10）
+                    # parts = ['/car', '1', 'init', 'up'] → 四级：楼层号
+                    if len(parts) >= 4:
+                        sub_cmd = parts[2]
+                        sub_param = parts[3]
+                        if sub_cmd == 'init' and sub_param in ('up', 'down'):
+                            floors = [str(i) for i in range(1, 11)]
+                            if current_word == '':
+                                for f in floors:
+                                    yield Completion(f, start_position=0)
+                            else:
+                                for f in floors:
+                                    if f.startswith(current_word):
+                                        yield Completion(f, start_position=-len(current_word))
+                            return
+                        return
                     if len(parts) >= 3:
-                        # 三级补全：子命令的参数（如 init → up/down）
                         sub_cmd = parts[2]
                         if sub_cmd in self.sub_sub_args:
                             sub_subs = self.sub_sub_args[sub_cmd]
