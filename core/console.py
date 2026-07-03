@@ -568,12 +568,15 @@ class Console:
           /init [<up|down> [<floor>]]
           /car 1 init <up|down> <floor>
 
-        示例:
-          /car 1 init up 10     → 上行到上基站，触 1 限位 + 第一个完美平层，记录为 10 楼
-          /car 1 init down 2    → 下行到下基站，触 1 限位 + 第一个完美平层，记录为 2 楼
-          /init down             → 用 config 方向 + 默认楼层 1
-          /init                  → 用 config 方向 + 默认楼层 1
+        程序刚启动时 IO 缓存为空（没收到 bitmap），get_input 读到所有信号都是 0，
+        导致 init 误判"没在限位上"往上跑撞 2 限位。
+        必须在第一次手动操作（如按轿内按钮）收到 IO2HTTP bitmap 后才能初始化。
         """
+        if not self.app.io._input_cache:
+            print('[init] 错误：尚未收到 PLC IO 状态（bitmap 为空）。')
+            print('       请先操作一个按钮（如轿内选层按钮），')
+            print('       触发 IO2HTTP 推送完整 I 区 bitmap 后再重试。')
+            return
         direction = None
         target_floor = None
         if args:
