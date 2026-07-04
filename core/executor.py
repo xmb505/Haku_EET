@@ -336,32 +336,28 @@ class ActionExecutor:
             await self._complete_action()
             return
 
-        # 3. 多级减速曲线（方向无关，按距目标绝对距离减速）
+        # 3. 减速逻辑：距目标 ≥2 层高速，剩 1 层切低速，到目标刹车
         dist = abs(remaining)  # 距目标还有几层
-        if dist >= 4:
+        if dist >= 2:
             if self.decel_state != 'high_speed':
+                await self._set_outputs({
+                    'high_speed_contactor': 1,
+                    'low_speed_contactor': 0,
+                    'brake_1': 0,
+                    'brake_2': 0,
+                    'brake_3': 0,
+                })
                 self.decel_state = 'high_speed'
-        elif dist == 3:
-            if self.decel_state != 'decel_1':
+        elif dist == 1:
+            if self.decel_state != 'decel':
                 await self._set_outputs({
                     'high_speed_contactor': 0,
                     'low_speed_contactor': 1,
-                    'brake_1': 1,
+                    'brake_1': 0,
+                    'brake_2': 0,
+                    'brake_3': 0,
                 })
-                self.decel_state = 'decel_1'
-        elif dist == 2:
-            if self.decel_state != 'decel_2':
-                await self._set_outputs({
-                    'brake_2': 1,
-                })
-                self.decel_state = 'decel_2'
-        elif dist == 1:
-            if self.decel_state != 'decel_3':
-                await self._set_outputs({
-                    'brake_3': 1,
-                    'motor_start': 0,  # 切断电机，让惯性 + 制动停车
-                })
-                self.decel_state = 'decel_3'
+                self.decel_state = 'decel'
 
     # ===== Action 展开 =====
 

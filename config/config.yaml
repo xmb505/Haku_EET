@@ -9,7 +9,7 @@ building:
   min_floor: 1            # 正常使用的最低层（有门）
   max_floor: 10           # 正常使用的最高层（有门）
   top_base_floor: 11      # 上基站楼层（初始化用，只有限位没有门）
-  bottom_base_floor: -1   # 下基站楼层（初始化用，只有限位没有门）
+  bottom_base_floor: 0   # 下基站楼层（=0层，只有限位没有门）
 
 elevator:
   car_id: 1             # 首版只跑 1 部

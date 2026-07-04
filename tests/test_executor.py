@@ -156,9 +156,10 @@ async def test_move_up_completes_on_level_up(setup):
     # 触发上平层 2 次（3→4→5）→ 到达 5 楼
     await executor.on_io_event(i_to_event(mapper, 'level_up', 1))  # 3→4
     await asyncio.sleep(0.02)
-    # 4 楼时 remaining=1，应触发 brake_3 + 关闭电机
-    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
-    assert io.get_output(mapper.addr_output('motor_start', 1)) == 0
+    # 4 楼时 remaining=1，应切低速（dist=1），保持电机运行
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert io.get_output(mapper.addr_output('motor_start', 1)) == 1
 
     await executor.on_io_event(i_to_event(mapper, 'level_up', 1))  # 4→5
     await asyncio.sleep(0.02)
@@ -169,6 +170,7 @@ async def test_move_up_completes_on_level_up(setup):
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 0
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 0
 
     task.cancel()
     try:

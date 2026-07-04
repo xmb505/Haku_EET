@@ -24,6 +24,7 @@ HELP_TEXT = """
   /debug show input_change       toggle 输入变化监视（打印变化的 I 点信号名）
   /debug show websocket_connect_status  toggle WebSocket 连接状态监视
   /debug show exec_trace          toggle executor [exec] 执行日志
+  /debug show elevator_speed      toggle 速度档位监视（高速/减速/刹车）
   /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
@@ -74,6 +75,9 @@ class Console:
         self._ws_monitor_task: asyncio.Task | None = None
         self._last_ws_connected: bool = False
         self.exec_trace_enabled: bool = False
+        self.elevator_speed_enabled: bool = False
+        self._elevator_speed_task: asyncio.Task | None = None
+        self._last_speed_state: str = ''
 
     def _resolve_car_id(self, args: list[str]) -> int:
         """从参数里提取 car_id（如果有），否则用当前选中的"""
@@ -106,7 +110,7 @@ class Console:
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed'],
             }
 
             def get_completions(self, document, complete_event):
@@ -608,10 +612,12 @@ class Console:
             ic = '启用' if self.input_change_monitor_enabled else '禁用'
             ws = '启用' if self.ws_monitor_enabled else '禁用'
             et = '启用' if self.exec_trace_enabled else '禁用'
+            es = '启用' if self.elevator_speed_enabled else '禁用'
             print(f'pass_floor 监视:             {pf}')
             print(f'input_change 监视:           {ic}')
             print(f'websocket_connect_status 监视: {ws}')
             print(f'exec_trace 监视:             {et}')
+            print(f'elevator_speed 监视:         {es}')
             return
         topic = args[1]
         if topic == 'pass_floor':
@@ -622,6 +628,8 @@ class Console:
             self._toggle_ws_monitor()
         elif topic == 'exec_trace':
             self._toggle_exec_trace()
+        elif topic == 'elevator_speed':
+            self._toggle_elevator_speed()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -753,6 +761,41 @@ class Console:
         self.app.executor.exec_log_enabled = self.exec_trace_enabled
         status = '启用' if self.exec_trace_enabled else '禁用'
         print(f'[debug] exec_trace 监视已{status}')
+
+    def _toggle_elevator_speed(self) -> None:
+        if self.elevator_speed_enabled:
+            self._disable_elevator_speed()
+        else:
+            self._enable_elevator_speed()
+
+    def _enable_elevator_speed(self) -> None:
+        self.elevator_speed_enabled = True
+        speed_map = {'high_speed': '高速', 'decel': '减速', '': '停止'}
+        self._last_speed_state = self.app.executor.decel_state
+        label = speed_map.get(self._last_speed_state, '?')
+        print(f'[debug] 当前速度: {label}')
+        self._elevator_speed_task = asyncio.create_task(self._poll_elevator_speed())
+
+    def _disable_elevator_speed(self) -> None:
+        self.elevator_speed_enabled = False
+        if self._elevator_speed_task and not self._elevator_speed_task.done():
+            self._elevator_speed_task.cancel()
+        self._elevator_speed_task = None
+        print('[debug] elevator_speed 监视已禁用')
+
+    async def _poll_elevator_speed(self) -> None:
+        speed_map = {'high_speed': '高速', 'decel': '减速', '': '停止'}
+        try:
+            while self.elevator_speed_enabled:
+                await asyncio.sleep(0.2)
+                current = self.app.executor.decel_state
+                if current != self._last_speed_state:
+                    self._last_speed_state = current
+                    label = speed_map.get(current, '?')
+                    print(f'[DEBUG] speed {label}', file=sys.stderr)
+                    sys.stderr.flush()
+        except asyncio.CancelledError:
+            pass
 
     async def cmd_reload(self, args: list[str]) -> None:
         await self.app.reload()
