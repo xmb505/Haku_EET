@@ -100,6 +100,10 @@ class IOMapper:
         """WebSocket 事件反查: I 地址 → (car_id, signal_name)，未找到返回 None"""
         return self._i_to_signal.get(i_addr)
 
+    def lookup_all_i_addresses(self) -> list[str]:
+        """列出所有已知的 I 地址（用于 IOClient bitmap 派发过滤）"""
+        return list(self._i_to_signal.keys())
+
     # ===== DB ↔ I 换算 =====
 
     def db_to_i(self, db_addr: str) -> str:

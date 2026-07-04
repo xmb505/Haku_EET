@@ -126,43 +126,49 @@ class TestSimulateInput:
 class TestBitmap:
     """IO2HTTP 新版 WebSocket 事件里带 bitmap 全局快照的解析"""
 
-    def test_apply_bitmap_updates_cache(self, client):
+    @pytest.mark.asyncio
+    async def test_apply_bitmap_updates_cache(self, client):
         # byte 0 = 0x03 = 00000011 → I0.0=1, I0.1=1
         bitmap = '03' + '00' * 99
-        client._apply_bitmap(bitmap)
+        await client._apply_bitmap(bitmap)
         assert client.get_input('I0.0') == 1
         assert client.get_input('I0.1') == 1
         assert client.get_input('I0.2') == 0
         assert client.get_input('I1.0') == 0
 
-    def test_apply_bitmap_800_bits(self, client):
+    @pytest.mark.asyncio
+    async def test_apply_bitmap_800_bits(self, client):
         bitmap = 'ff' * 100
-        client._apply_bitmap(bitmap)
+        await client._apply_bitmap(bitmap)
         for byte_idx in range(100):
             for bit_idx in range(8):
                 assert client.get_input(f'I{byte_idx}.{bit_idx}') == 1
         # 越界位置
         assert client.get_input('I100.0') == 0
 
-    def test_apply_bitmap_only_updates_changed(self, client):
-        client._apply_bitmap('03' + '00' * 99)
-        assert client._apply_bitmap('03' + '00' * 99) == 0
-        assert client._apply_bitmap('ff' + '00' * 99) == 6
+    @pytest.mark.asyncio
+    async def test_apply_bitmap_only_updates_changed(self, client):
+        await client._apply_bitmap('03' + '00' * 99)
+        assert await client._apply_bitmap('03' + '00' * 99) == 0
+        assert await client._apply_bitmap('ff' + '00' * 99) == 6
 
-    def test_apply_bitmap_invalid_hex(self, client):
-        assert client._apply_bitmap('not_hex_garbage') == 0
+    @pytest.mark.asyncio
+    async def test_apply_bitmap_invalid_hex(self, client):
+        assert await client._apply_bitmap('not_hex_garbage') == 0
 
-    def test_get_all_inputs_returns_snapshot(self, client):
-        client._apply_bitmap('ff' * 100)
+    @pytest.mark.asyncio
+    async def test_get_all_inputs_returns_snapshot(self, client):
+        await client._apply_bitmap('ff' * 100)
         snapshot = client.get_all_inputs()
         assert len(snapshot) == 800
         assert snapshot['I0.0'] == 1
         assert snapshot['I99.7'] == 1
 
-    def test_apply_bitmap_matches_user_example(self, client):
+    @pytest.mark.asyncio
+    async def test_apply_bitmap_matches_user_example(self, client):
         """用户给的真实示例: byte 0..4 = 03 00 00 00 0e"""
         bitmap = '030000000e000000' + '00' * 92
-        client._apply_bitmap(bitmap)
+        await client._apply_bitmap(bitmap)
         assert client.get_input('I0.0') == 1
         assert client.get_input('I0.1') == 1
         assert client.get_input('I4.1') == 1

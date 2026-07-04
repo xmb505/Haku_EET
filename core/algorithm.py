@@ -7,14 +7,13 @@ algorithm.py —— 高层调度算法
     - 无内部状态（每次 decide 都是纯函数），方便测试和热切换
 
 首版只实现 SimpleInternalCall，验证端到端链路。
-后续要加集选/节能，只在这个文件加新类，/algo set 切换即可。
 """
 
 from abc import ABC, abstractmethod
 from typing import Iterable
 
 from .actions import Action, ActionKind
-from .player import Car, CarState, Direction
+from .player import Car, CarState
 
 
 class ElevatorAlgorithm(ABC):
@@ -32,15 +31,19 @@ class ElevatorAlgorithm(ABC):
 
 class SimpleInternalCall(ElevatorAlgorithm):
     """
-    首版算法：响应内召
+    首版算法：响应内召。call 命令直接 MOVE 到目标层，不碰门。
+
+    设计原则:
+        - call 是测试运动用的，直接到目标即可（不开门、不关门、不 SET_DISPLAY）
+        - 门开关是另一个独立子系统（门状态机），不应耦合到调度算法里
+        - 让调度算法保持极简：MOVE / 等，下发一个 Action 就等它完成
 
     行为:
-        1. car.state == UNKNOWN → 发 INITIALIZE（启动定位）
+        1. car.state == UNKNOWN → 发 INITIALIZE
         2. 没有任务 → 空
         3. 当前层 < 目标 → MOVE_UP
         4. 当前层 > 目标 → MOVE_DOWN
-        5. 当前层 == 目标 且门关 → SET_DISPLAY + OPEN_DOOR
-        6. 当前层 == 目标 且门开 → 空（等关门）
+        5. 当前层 == 目标 → 空（MOVE 完成后由 _on_action_done 清掉 pending）
     """
 
     name = "simple_internal_call"
@@ -54,33 +57,26 @@ class SimpleInternalCall(ElevatorAlgorithm):
         if car.state == CarState.FAULT or car.fault.any_active():
             return []
 
-        calls = list(pending_calls)
-        if not calls:
-            return []
+        # 优先使用 call_internal 设的"立即目标" target_floor；
+        # 没有再退回 pending_calls 取一个（队列非空）。
+        # 用 target_floor 而非 pending[0] 是关键——call 命令刚下时
+        # 算法不能挑 pending[0]（之前未完成的）而忽略 call 设的 target。
+        target = car.target_floor
+        if target is None:
+            calls = list(pending_calls)
+            if not calls:
+                return []
+            target = calls[0]
 
-        # 取最近一个召唤作为目标（FIFO）
-        target = calls[0]
-
-        # 5/6. 已到达目标层
+        # 已到达目标层：空（让 _on_action_done 在 MOVE 完成时清掉 pending + target_floor）
         if car.position == target:
-            door = car.door_state.value
-            if door == 'closed':
-                # 门关着 → 显示 + 开门
-                return [
-                    Action(ActionKind.SET_DISPLAY, floor=target),
-                    Action(ActionKind.OPEN_DOOR),
-                ]
-            if door == 'open':
-                # 门已开 → 关门（任务完成后由 _on_action_done 清理 pending）
-                return [Action(ActionKind.CLOSE_DOOR)]
-            # 门在中间状态（OPENING/CLOSING）→ 等
             return []
 
-        # 3. 需要上行
+        # 需要上行
         if car.position is not None and car.position < target:
             return [Action(ActionKind.MOVE_UP)]
 
-        # 4. 需要下行
+        # 需要下行
         if car.position is not None and car.position > target:
             return [Action(ActionKind.MOVE_DOWN)]
 

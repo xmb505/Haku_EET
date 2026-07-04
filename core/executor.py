@@ -13,6 +13,7 @@ executor.py —— 硬件层 FSM（动作 → IO 序列 + 等传感器确认）
 
 import asyncio
 import dataclasses
+import sys
 from typing import Awaitable, Callable
 
 from .actions import Action, ActionKind, ActionQueue
@@ -55,17 +56,31 @@ class ActionExecutor:
         self.on_action_done = on_action_done
         self.on_emergency_stop = on_emergency_stop
 
+        # 日志回调（外部可注入，让 REPL 能正确显示后台任务的 print）
+        # 默认走 stderr（不会被 prompt_toolkit 吞掉）
+        self._log_stream = sys.stderr
+
         self.current_action: Action | None = None
         # 等哪个信号 → (signal_name, expected_bit)
         self.waiting_sensor: tuple[str, int] | None = None
         # 多级减速子状态: 'high_speed' / 'decel_1' / 'decel_2' / 'decel_3'
         self.decel_state: str = ''
-        # INITIALIZE 触发底端站限位后，等"level_up & level_down 同时为 1"的完美平层
-        self._init_waiting_perfect_level: bool = False
-        # INITIALIZE 完成后轿厢所在的基站楼层（由方向决定：up→10, down→1）
+        # 暂停标志：手动模式下设为 True，on_io_event 直接 return，不做任何处理
+        # （让手动调试模式完全 raw——2 限位、状态机、IO 写都不会干扰）
+        self.paused: bool = False
+        # INITIALIZE 触到 1 限位后反向运行，逐层计数完美平层直达 target_floor
+        self._init_reverse_mode: bool = False
+        # 是否正处于"完美平层"瞬态（用于边沿检测：上升沿 step，下降沿 reset）
+        # ——代替旧的 _init_last_reverse_pos 防抖，因为现在 read cache 而非 state 字段，
+        #   cache 在一次脉冲中两个 signal 都=1 时单次 edge 事件可能重复触发（虚拟 PLC
+        #   fire level_up + level_down 各触发一次 dispatch）。
+        self._init_perfect_leveling_active: bool = False
+        # INITIALIZE 完成后轿厢所在的基站楼层（由方向决定：up→top, down→bottom）
         self._init_base_floor: int = 1
         # INITIALIZE 到达基站后还要移动到的目标楼层（/car N init <dir> <floor>）
         self._init_target_floor: int = 1
+        # 上一次 perfection level 触发的 position 值（防止重复递减）
+        self._init_last_reverse_pos: int | None = None
         # 手动刹车档位（0=不刹, 1-7=不同组合）
         self.manual_brake_level: int = 0
         # 当前实际写出去的刹车组合（用于幂等性检查）
@@ -75,6 +90,7 @@ class ActionExecutor:
         self._last_level_down: int = 0
         # 调试输出
         self.debug = False
+        self.exec_log_enabled = False  # 是否打印 [exec] 执行日志（/debug show exec_trace 控制）
 
     # ===== 主循环 =====
 
@@ -88,10 +104,25 @@ class ActionExecutor:
             # 如果是立即完成的动作（SET_DISPLAY / NOOP），已经 _complete_action 过了
             # 否则等待 on_io_event 推进
 
+    def _log(self, msg: str) -> None:
+        """后台任务的 print：走 stderr + flush，避开 prompt_toolkit"""
+        if not self.exec_log_enabled:
+            return
+        self._log_stream.write(msg + '\n')
+        self._log_stream.flush()
+
     # ===== IO 事件入口 =====
 
     async def on_io_event(self, event: IOEvent) -> None:
         """IOClient 收到变化时调用"""
+        # 0. 暂停模式（手动 debug 模式）：直接忽略所有事件
+        #     让出键自由控制电机，不被 2 限位 / 紧急停止干扰
+        if self.paused:
+            return
+        # 同步 cache（让 cache 与 event 保持一致，方便后续基于 cache 的判断——比如
+        # "level_up & level_down 都=1"完美平层条件）
+        self.io.observe_input(event.i_addr, event.bit)
+
         # 1. 更新 Car 的故障标志
         await self._update_fault_flags(event)
 
@@ -111,35 +142,52 @@ class ActionExecutor:
         if car_id != self.car_id:
             return
 
-        # 2.5 安全保护：2 限位（坠机限位）触发 = 立即紧急停止
+        # 2.5 安全保护：当前 event 是 2 限位 = 立即急停（最常见路径）
         if name in ('bottom_limit_2', 'top_limit_2') and event.bit == 1:
             await self._emergency_stop(reason='limit_2_touched')
             return
 
-        # 2.6 INITIALIZE 流程：电梯从基站段（1 楼下方）全速向上
-        # 触到 1 限位时切低速 + 全刹车减速（不停车），等"完美平层"（level_up & level_down 同时 1）
-        # 2 限位是坠机红线，绝对不能碰
+        # 补充防护：cache 里任何 2 限位为 1 = 立即急停
+        # （应对 bitmap 派发先来 1 限位 event 再来 2 限位 event 时，
+        #  1 限位处理之前主动查 cache，已确保撞 2 限位时必急停）
+        for limit_sig in ('top_limit_2', 'bottom_limit_2'):
+            try:
+                addr = self.mapper.db_to_i(self.mapper.addr_input(limit_sig, self.car_id))
+                if self.io.get_input(addr) == 1:
+                    await self._emergency_stop(reason=f'{limit_sig}_touched')
+                    return
+            except KeyError:
+                pass
+
+        # 2.6 INITIALIZE 流程：触到 1 限位 → 立即反向，逐层计数完美平层到目标
         if (self.current_action.kind == ActionKind.INITIALIZE
                 and name in ('bottom_limit_1', 'top_limit_1')
                 and event.bit == 1):
-            # 不停车！切低速 + 全力减速，让惯性把轿厢带到 1 楼平层位置
-            await self._set_outputs({
-                'high_speed_contactor': 0,
-                'low_speed_contactor': 1,
-                'brake_1': 1,
-                'brake_2': 1,
-                'brake_3': 1,
-                'motor_start': 0,  # 关电机，靠惯性 + 刹车停车
-            })
-            self._init_waiting_perfect_level = True
-            self.waiting_sensor = None
-            # 立即检查当前平层信号是否已经就绪（电梯可能已在站）
-            if await self._check_perfect_level_direct():
-                if self.debug:
-                    print(f'[exec] INITIALIZE 完美平层已就绪（当前 IO 读取）')
+            # 去抖：已经进入 reverse 模式后再触到 = 机械开关抖动 / PLC 同帧重发，
+            # 不要再设一次输出 + 重置计数器（会让反向计数从 base 重新开始）
+            if self._init_reverse_mode:
                 return
-            if self.debug:
-                print(f'[exec] INITIALIZE 触到 1 限位 → 全力减速中，等完美平层')
+            # 不停车！反向（方向接触器互换），高速保持，启动逐层计数
+            # 对 init up：触顶后反向往下，每层 --position 到 target
+            # 对 init down：触底后反向往上，每层 ++position 到 target
+            was_up = self.init_direction == 'up'
+            await self._set_outputs({
+                'up_contactor': 0 if was_up else 1,
+                'down_contactor': 1 if was_up else 0,
+                'high_speed_contactor': 1,
+                'low_speed_contactor': 0,
+                'motor_start': 1,
+            })
+            self.car.position = self._init_base_floor  # 基站位（11 或 -1）
+            self._init_reverse_mode = True
+            self._init_last_reverse_pos = None
+            self.waiting_sensor = None
+            # 如果 base == target，直接完成（电梯已在目标层）
+            if await self._try_complete_init_if_at_target():
+                return
+            dir_glyph = '↑' if not was_up else '↓'
+            self._log(f'[exec] 触到 1 限位 → 反向 {dir_glyph} 全速运行，'
+                      f'等待平层信号从 L{self._init_base_floor} 计数到 L{self._init_target_floor}')
             return
 
         # 3. 检测平层信号边沿
@@ -149,10 +197,60 @@ class ActionExecutor:
             else:
                 self._last_level_down = event.bit
 
-            # 3a. INITIALIZE 等"level_up & level_down 同时为 1"完美平层判定
-            if self._init_waiting_perfect_level and self._last_level_up == 1 and self._last_level_down == 1:
-                await self._complete_initialize()
-                return
+            # 3a. INITIALIZE 反向后完美平层逐层计数
+            # 完美平层 = level_up & level_down 同时为 1
+            # 必须读 cache（不是 _last_* 状态字段）——
+            #   真实硬件/VPLC 一次性 fire 两个信号，cache 里两个同步都是 1，
+            #   但 dispatch 异步导致 _last_* 字段更新有先后。
+            #   若读字段就漏掉"两边同时 1"的瞬间。
+            #
+            # 边沿检测：
+            #   上升沿 (0,0 → 1,1) → step + set active
+            #   下降沿 (1,1 → 0,0) → reset active
+            #   其他状态不变
+            if self._init_reverse_mode:
+                addr_up = self.mapper.db_to_i(
+                    self.mapper.addr_input('level_up', self.car_id)
+                )
+                addr_down = self.mapper.db_to_i(
+                    self.mapper.addr_input('level_down', self.car_id)
+                )
+                up_now = self.io.get_input(addr_up)
+                down_now = self.io.get_input(addr_down)
+                # 每条 level event 都打日志（真模式调试时看时序用）
+                self._log(
+                    f'[exec]   level event {name}={event.bit} '
+                    f'cache(up={up_now}, down={down_now}) '
+                    f'active={self._init_perfect_leveling_active} '
+                    f'pos={self.car.position} target={self._init_target_floor}'
+                )
+                if up_now == 1 and down_now == 1 and not self._init_perfect_leveling_active:
+                    # 上升沿：刚进入完美平层区 = 过了一层
+                    self._init_perfect_leveling_active = True
+                    pos = self.car.position
+                    was_up = self.init_direction == 'up'
+                    step = -1 if was_up else 1
+                    new_pos = pos + step
+                    self._log(f'[exec] 平层 L{pos} → L{new_pos} (目标 L{self._init_target_floor})')
+                    self.car.position = new_pos
+                    # 到达目标 → 完成
+                    if new_pos == self._init_target_floor:
+                        await self._stop_motion()
+                        self.car.direction = Direction.IDLE
+                        await self._write_display(
+                            self.display.get_segments_for_floor(new_pos)
+                        )
+                        self.car.display = new_pos
+                        self._init_reverse_mode = False
+                        # 清 active 防残留影响下次 init
+                        self._init_perfect_leveling_active = False
+                        self._log(f'[exec] ✓ INITIALIZE 完成，停在 L{new_pos}')
+                        await self._complete_action()
+                    return
+                elif up_now == 0 and down_now == 0 and self._init_perfect_leveling_active:
+                    # 下降沿：已离开完美平层区 → 重置，准备下一个上升沿
+                    self._init_perfect_leveling_active = False
+                    return
 
             # 3b. 正常 MOVE_UP/MOVE_DOWN 的减速曲线
             if event.bit == 1:
@@ -178,8 +276,8 @@ class ActionExecutor:
             - 用户手动 EMERGENCY_STOP
             - 任何"丢分"危险情况
         """
-        if self.debug:
-            print(f'[exec] EMERGENCY STOP: {reason}')
+        # 走 stderr + ANSI 红色 + flush，避免被 prompt_toolkit 吞掉
+        self._log(f'\n\033[1;31m[exec] !!! EMERGENCY STOP: {reason} !!!\033[0m')
         await self._all_outputs_off()
         self.car.state = CarState.FAULT
         self.car.direction = Direction.IDLE
@@ -190,23 +288,18 @@ class ActionExecutor:
         if self.on_emergency_stop is not None:
             await self.on_emergency_stop()
 
-    async def _complete_initialize(self) -> None:
-        """INITIALIZE 完美平层达成（level_up & level_down 同时为 1）"""
-        if self.current_action is None or self.current_action.kind != ActionKind.INITIALIZE:
-            return
-        self._init_waiting_perfect_level = False
-        await self._complete_action()
-
-    async def _check_perfect_level_direct(self) -> bool:
-        """直接从 IO 缓存读取 level_up & level_down，判断完美平层是否已就绪"""
-        try:
-            lu_addr = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
-            ld_addr = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
-            if self.io.get_input(lu_addr) == 1 and self.io.get_input(ld_addr) == 1:
-                await self._complete_initialize()
-                return True
-        except Exception:
-            pass
+    async def _try_complete_init_if_at_target(self) -> bool:
+        """如果反向开始前 position == target，直接完成 INITIALIZE"""
+        if self.car.position == self._init_target_floor:
+            await self._stop_motion()
+            self.car.direction = Direction.IDLE
+            await self._write_display(
+                self.display.get_segments_for_floor(self.car.position)
+            )
+            self.car.display = self.car.position
+            self._init_reverse_mode = False
+            await self._complete_action()
+            return True
         return False
 
     async def _on_level_reached(self, direction: Direction) -> None:
@@ -341,25 +434,26 @@ class ActionExecutor:
 
     async def _execute_initialize(self) -> None:
         """
-        初始化子状态机：朝方向跑触对应 1 限位，减速等完美平层定位基站
+        初始化子状态机：
 
         流程:
-            1. 高速 + 方向 + 电机启动
-            2. 触到端站 1 限位 → 切低速 + 三级减速刹车（不停车，靠惯性带）
-            3. 等 level_up & level_down 同时为 1（完美平层）→ 停车 + READY
-            4. 触到 2 限位（坠机限位） → 紧急停止 + 故障
+            1. 全速朝 init_direction 跑
+            2. 触到对应 1 限位 → 立即反向，保持全速
+            3. 反向运行中，每次检测到完美平层（level_up & level_down 同时=1）
+               位置向 target_floor 步进 ±1
+            4. position == target_floor → 完全停车 → READY
+
+        已触到限位时（例如上电时顶限位已触发）：直接从 base 开始反向计数。
 
         方向传感器映射：
-            up   → 向上跑到 top_limit_1 → 基站 top_base_floor
-            down → 向下跑到 bottom_limit_1 → 基站 bottom_base_floor
-
-        如果对应的 1 限位已经触发（电梯已在端站），直接走等完美平层。
+            up   → 上行碰 top_limit_1 → 反向往下，从 top_base_floor 开始递减
+            down → 下行碰 bottom_limit_1 → 反向往上，从 bottom_base_floor 开始递增
         """
         direction = self.init_direction
         if direction == 'up':
-            iverb_addr = self.mapper.db_to_i(self.mapper.addr_input('top_limit_1', self.car_id))
-            running = self.io.get_input(iverb_addr) == 0  # 还没触发才需要跑
-            if running:
+            top_addr = self.mapper.db_to_i(self.mapper.addr_input('top_limit_1', self.car_id))
+            at_limit = self.io.get_input(top_addr) == 1
+            if not at_limit:
                 await self._set_outputs({
                     'up_contactor': 1, 'down_contactor': 0,
                     'high_speed_contactor': 1, 'low_speed_contactor': 0,
@@ -367,18 +461,21 @@ class ActionExecutor:
                 })
                 self.waiting_sensor = ('top_limit_1', 1)
                 self.car.direction = Direction.UP
-            else:
-                # 已经在顶站，直接等完美平层
-                self._init_waiting_perfect_level = True
-                self.waiting_sensor = None
-                self.car.direction = Direction.UP
-                if self.debug:
-                    print(f'[exec] init up: top_limit_1 已触发，直接等完美平层')
-                await self._check_perfect_level_direct()
+                self._log(f'[exec] 初始化: 朝 ↑ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
+                return
+            # 已在限位 → 直接进入反向计数模式
+            self.car.position = self._init_base_floor
+            self._init_reverse_mode = True
+            self._init_last_reverse_pos = None
+            self.waiting_sensor = None
+            self.car.direction = Direction.UP
+            if await self._try_complete_init_if_at_target():
+                return
+            self._log(f'[exec] 初始化: 已在顶站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
         else:  # down
-            ibot_addr = self.mapper.db_to_i(self.mapper.addr_input('bottom_limit_1', self.car_id))
-            running = self.io.get_input(ibot_addr) == 0
-            if running:
+            bot_addr = self.mapper.db_to_i(self.mapper.addr_input('bottom_limit_1', self.car_id))
+            at_limit = self.io.get_input(bot_addr) == 1
+            if not at_limit:
                 await self._set_outputs({
                     'up_contactor': 0, 'down_contactor': 1,
                     'high_speed_contactor': 1, 'low_speed_contactor': 0,
@@ -386,14 +483,16 @@ class ActionExecutor:
                 })
                 self.waiting_sensor = ('bottom_limit_1', 1)
                 self.car.direction = Direction.DOWN
-            else:
-                # 已经在底站，直接等完美平层
-                self._init_waiting_perfect_level = True
-                self.waiting_sensor = None
-                self.car.direction = Direction.DOWN
-                if self.debug:
-                    print(f'[exec] init down: bottom_limit_1 已触发，直接等完美平层')
-                await self._check_perfect_level_direct()
+                self._log(f'[exec] 初始化: 朝 ↓ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
+                return
+            self.car.position = self._init_base_floor
+            self._init_reverse_mode = True
+            self._init_last_reverse_pos = None
+            self.waiting_sensor = None
+            self.car.direction = Direction.DOWN
+            if await self._try_complete_init_if_at_target():
+                return
+            self._log(f'[exec] 初始化: 已在底站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
 
     async def _start_move_up(self) -> None:
         """上行启动：高速 + 上 + 电机（之后靠 _on_level_reached 多级减速）"""
@@ -457,8 +556,7 @@ class ActionExecutor:
         # 根据动作类型更新 Car 状态
         match action.kind:
             case ActionKind.INITIALIZE:
-                # 用 _init_base_floor（基站楼层），不是用户指定的目标楼层
-                self.car.position = self._init_base_floor
+                # 反向逐层计数已在 on_io_event 中设置了正确 position
                 self.car.state = CarState.READY
                 # 初始化完成 → 清掉端站限位 fault 标志
                 # (到达基站是"成功定位"而不是"撞限位故障")

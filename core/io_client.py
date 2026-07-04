@@ -12,6 +12,7 @@ io_client.py —— 异步 IO2HTTP 客户端
 
 import asyncio
 import json
+import sys
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -52,6 +53,7 @@ class IOClient:
         self._input_cache: dict[str, int] = {}     # i_addr → bit
         self._output_cache: dict[str, int] = {}    # db_addr → value
         self._running = False
+        self.ws_connected: bool = False
 
     # ===== 生命周期 =====
 
@@ -82,6 +84,13 @@ class IOClient:
     def add_listener(self, listener: Listener) -> None:
         """注册 IO 变化回调，回调签名: async def listener(event: IOEvent)"""
         self._listeners.append(listener)
+
+    def remove_listener(self, listener: Listener) -> None:
+        """移除监听器"""
+        try:
+            self._listeners.remove(listener)
+        except ValueError:
+            pass
 
     async def _dispatch(self, event: IOEvent) -> None:
         for listener in list(self._listeners):
@@ -118,6 +127,14 @@ class IOClient:
         # 同字节合并是 IO2HTTP 内部做的（一次 read-modify-write）
         await asyncio.gather(*(self.set(addr, val) for addr, val in writes.items()))
 
+    def observe_input(self, i_addr: str, bit: int) -> None:
+        """观察性更新输入缓存（不影响 IO state，但让 cache 与 event 同步）
+
+        给 executor / 测试用：直接调 on_io_event 时同步 cache，
+        模拟"PLC bitmap 推过来时 cache + event 同步更新"的语义。
+        """
+        self._input_cache[i_addr] = 1 if bit else 0
+
     # ===== 读输入 =====
 
     def get_input(self, i_addr: str) -> int:
@@ -132,7 +149,16 @@ class IOClient:
         """返回当前所有 I 区状态的快照"""
         return dict(self._input_cache)
 
-    def _apply_bitmap(self, hex_str: str) -> int:
+    def set_known_i_addresses(self, addrs: set[str]) -> None:
+        """设置已知 I 地址集合（来自 IOMapper）
+
+        _apply_bitmap 派发事件时只针对这些地址，
+        避免 800 位全 dispatch 导致 listener 被爆。
+        未设置时（默认）所有变化的位都会 dispatch，由 listener 自己过滤。
+        """
+        self._known_i_addrs: set[str] | None = addrs
+
+    async def _apply_bitmap(self, hex_str: str) -> int:
         """
         解析 IO2HTTP 推送的 bitmap 字段，更新输入缓存
 
@@ -153,6 +179,12 @@ class IOClient:
             return 0
 
         updated = 0
+        # 收集变化的位并 dispatch 事件给 listener
+        # PLC 的 change_gpio 字段不一定可靠（比如限位被快速越过时
+        # 只记录最后一个边沿，导致反向逻辑没启动电梯撞 2 限位）
+        # 所以 bitmap 也派发；用 _known_i_addrs 过滤避免 800 位全 dispatch
+        known = getattr(self, '_known_i_addrs', None)
+        changed_events: list[IOEvent] = []
         for byte_idx, byte_val in enumerate(data):
             for bit_idx in range(8):
                 bit = (byte_val >> bit_idx) & 1
@@ -160,8 +192,15 @@ class IOClient:
                 if self._input_cache.get(i_addr) != bit:
                     self._input_cache[i_addr] = bit
                     updated += 1
+                    if known is None or i_addr in known:
+                        changed_events.append(IOEvent(i_addr=i_addr, bit=bit))
         if self.debug and updated > 0:
-            print(f'[io:ws] bitmap 更新 {updated} 位（总 {len(data) * 8} 位）')
+            print(f'[io:ws] bitmap 更新 {updated} 位（总 {len(data) * 8} 位），'
+                  f'dispatch {len(changed_events)} 个事件')
+        # 派发变化事件——串行 await，确保 listener 按 bitmap 位顺序处理
+        # （1 限位 + 2 限位同时为 1 时，让 executor 先看见 2 限位再急停）
+        for ev in changed_events:
+            await self._dispatch(ev)
         return updated
 
     # ===== 模拟输入（仅 simulate 模式） =====
@@ -170,18 +209,16 @@ class IOClient:
         """模拟一个 I 输入变化，触发监听器"""
         if not self.simulate:
             raise RuntimeError('simulate_input 只在 simulate=True 模式下可用')
-        bit = 1 if bit else 0
-        self._input_cache[i_addr] = bit
+        new_val = 1 if bit else 0
+        self._input_cache[i_addr] = new_val
         if self.debug:
-            print(f'[io:sim] INPUT {i_addr} = {bit}')
-        event = IOEvent(i_addr=i_addr, bit=bit)
+            print(f'[io:sim] INPUT {i_addr} = {new_val}')
+        event = IOEvent(i_addr=i_addr, bit=new_val)
         # 在事件循环里 dispatch
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self._dispatch(event))
         except RuntimeError:
-            # 没有事件循环（极少见，兼容用），跳过 dispatch
-            # listener 是 async 函数，必须有事件循环才能跑
             pass
 
     # ===== WebSocket 订阅循环 =====
@@ -189,33 +226,42 @@ class IOClient:
     async def _ws_loop(self) -> None:
         while self._running:
             try:
-                async with websockets.connect(self.ws_url) as ws:
-                    if self.debug:
-                        print(f'[io:ws] 已连接 {self.ws_url}')
-                    async for msg in ws:
-                        try:
-                            data = json.loads(msg)
-                        except json.JSONDecodeError:
-                            continue
-                        if data.get('type') != 'gpio_change':
-                            continue
-                        for device in data.get('gpios', []):
-                            # 1. 先用 bitmap 同步全局 I 区状态（800 位快照）
-                            bitmap_hex = device.get('bitmap')
-                            if bitmap_hex:
-                                self._apply_bitmap(bitmap_hex)
-                            # 2. 再 dispatch 变化位（listener 收到的 bit 与缓存一致）
-                            for change in device.get('change_gpio', []):
-                                i_addr = change.get('gpio')
-                                bit = change.get('bit')
-                                if i_addr is None or bit is None:
-                                    continue
-                                # 确保缓存与 change 一致（bitmap 可能是变化前的快照）
-                                self._input_cache[i_addr] = int(bit)
-                                await self._dispatch(IOEvent(i_addr=i_addr, bit=int(bit)))
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=None,
+                ) as ws:
+                    self.ws_connected = True
+                    try:
+                        async for msg in ws:
+                            try:
+                                data = json.loads(msg)
+                            except json.JSONDecodeError:
+                                continue
+                            if data.get('type') != 'gpio_change':
+                                continue
+                            for device in data.get('gpios', []):
+                                # 1. bitmap 全帧同步：dispatch 所有变化位
+                                bitmap_hex = device.get('bitmap')
+                                if bitmap_hex:
+                                    await self._apply_bitmap(bitmap_hex)
+                                # 2. change_gpio 增量边沿：只 dispatch 真正变化的值
+                                for change in device.get('change_gpio', []):
+                                    i_addr = change.get('gpio')
+                                    bit = change.get('bit')
+                                    if i_addr is None or bit is None:
+                                        continue
+                                    try:
+                                        new_val = int(bit)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if self._input_cache.get(i_addr) != new_val:
+                                        self._input_cache[i_addr] = new_val
+                                        await self._dispatch(IOEvent(i_addr=i_addr, bit=new_val))
+                    finally:
+                        self.ws_connected = False
             except asyncio.CancelledError:
+                self.ws_connected = False
                 raise
-            except Exception as e:
-                if self.debug:
-                    print(f'[io:ws] 错误: {e!r}，{self.reconnect_delay}秒后重连')
+            except Exception:
+                self.ws_connected = False
                 await asyncio.sleep(self.reconnect_delay)

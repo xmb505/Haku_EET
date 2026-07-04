@@ -49,29 +49,21 @@ async def test_app_starts_idle_without_init(app: App):
 
 @pytest.mark.asyncio
 async def test_initialize_end_to_end(app: App):
-    """完整跑通：手动 init（down 方向）→ 全速下行 → 触 1 限位 → 全刹车减速 → 等完美平层 → READY"""
+    """init down → 触 bottom_limit → 反向（base==target 立即完成）"""
     await asyncio.sleep(0.05)
     from core.actions import Action, ActionKind
     app.executor.init_direction = 'down'
     app.executor.top_base_floor = 10
-    app.executor.bottom_base_floor = 1  # 与测试期望一致
-    await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    app.executor.bottom_base_floor = 1  # base=1
+    await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))  # target=1
     await asyncio.sleep(0.05)
 
-    # 1. 触发 bottom_limit_1（下行方向等底限位）
+    # 触发 bottom_limit_1 → 反向 → base=1=target → 立即完成
     await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
     await asyncio.sleep(0.05)
 
-    # 还没完成：等完美平层
-    assert app.car.state == CarState.UNKNOWN
-
-    # 2. 触发 level_up & level_down（完美平层） → 完成 INITIALIZE
-    await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
-    await app.executor.on_io_event(i_event(app.mapper, 'level_down', 1))
-    await asyncio.sleep(0.05)
-
     assert app.car.state == CarState.READY
-    assert app.car.position == 1  # down 方向基站=1
+    assert app.car.position == 1
     assert app.car.display == 1
     assert app.io.get_output(app.mapper.addr_output('segment_b', 1)) == 1
     assert app.io.get_output(app.mapper.addr_output('segment_c', 1)) == 1
@@ -100,10 +92,8 @@ async def test_call_internal_triggers_move(app: App):
     app.executor.bottom_base_floor = 1
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
-    # 完成 INITIALIZE（down 方向等 bottom_limit）
+    # 触发 bottom_limit_1 → 反向完成（base=1=target）
     await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
-    await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
-    await app.executor.on_io_event(i_event(app.mapper, 'level_down', 1))
     await asyncio.sleep(0.05)
     assert app.car.state == CarState.READY
 
@@ -121,7 +111,7 @@ async def test_call_internal_triggers_move(app: App):
 
 @pytest.mark.asyncio
 async def test_move_to_5_floor_open_door(app: App):
-    """完整链路：内召 5 → 4 次平层 → 门开 → 门关 → pending 清空"""
+    """完整链路：内召 5 → 4 次平层 → 直接 complete（call 命令不碰门）→ pending 清空"""
     await asyncio.sleep(0.05)
     from core.actions import Action, ActionKind
     app.executor.init_direction = 'down'
@@ -129,10 +119,8 @@ async def test_move_to_5_floor_open_door(app: App):
     app.executor.bottom_base_floor = 1
     await app.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.05)
-    # 完成 INITIALIZE（down 方向）
+    # 触发 bottom_limit_1 → 反向完成（base=1=target）
     await app.executor.on_io_event(i_event(app.mapper, 'bottom_limit_1', 1))
-    await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
-    await app.executor.on_io_event(i_event(app.mapper, 'level_down', 1))
     await asyncio.sleep(0.05)
 
     await app.call_internal(5)
@@ -144,29 +132,9 @@ async def test_move_to_5_floor_open_door(app: App):
         await asyncio.sleep(0.02)
 
     assert app.car.position == 5
-    assert app.io.get_output(app.mapper.addr_output('door_open_relay', 1)) == 1
-
-    # 触发门开到位 → door=OPEN → 算法发 CLOSE_DOOR → executor 拉关门继电器
-    await app.executor.on_io_event(i_event(app.mapper, 'door_open_done', 1))
-    await asyncio.sleep(0.05)
-
-    # 此时 executor 已经在执行 CLOSE_DOOR
-    assert app.io.get_output(app.mapper.addr_output('door_close_relay', 1)) == 1
-    assert app.io.get_output(app.mapper.addr_output('door_open_relay', 1)) == 0
-
-    # 触发门关到位 → 任务完成，pending 清空
-    await app.executor.on_io_event(i_event(app.mapper, 'door_close_done', 1))
-    await asyncio.sleep(0.05)
-
-    assert app.car.door_state == DoorState.CLOSED
+    # MOVE_UP 到目标 → 算法发 NOOP → executor 完成 → _on_action_done 清理 pending
     assert 5 not in app.pending_calls
-
-
-@pytest.mark.asyncio
-async def test_algorithm_hot_swap(app: App):
-    """算法热切换后立即生效"""
-    await app.set_algorithm('simple_internal_call')
-    assert app.algorithm.name == 'simple_internal_call'
+    assert app.car.target_floor is None
 
 
 @pytest.mark.asyncio
@@ -215,9 +183,3 @@ async def test_status_snapshot(app: App):
     assert 'pending_calls' in snap
     assert snap['simulate'] is True
     assert snap['algorithm'] == 'simple_internal_call'
-
-
-@pytest.mark.asyncio
-async def test_available_algorithms(app: App):
-    algos = app.available_algorithms()
-    assert 'simple_internal_call' in algos

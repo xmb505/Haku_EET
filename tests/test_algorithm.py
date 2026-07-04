@@ -62,33 +62,53 @@ class TestSimpleInternalCall:
         actions = algo.decide(car, pending_calls=[2])
         assert actions == [Action(ActionKind.MOVE_DOWN)]
 
-    def test_at_target_door_closed_emits_display_and_open(self, algo):
-        car = Car(
-            car_id=1, state=CarState.READY, position=5,
-            door_state=DoorState.CLOSED,
-        )
-        actions = algo.decide(car, pending_calls=[5])
-        assert Action(ActionKind.SET_DISPLAY, floor=5) in actions
-        assert Action(ActionKind.OPEN_DOOR) in actions
-        assert len(actions) == 2
 
-    def test_at_target_door_open_emits_close(self, algo):
+class TestNoDoorLogic:
+    """call 命令不涉及门，任何门状态都不应该影响 dispatch"""
+
+    def test_at_target_door_open_returns_empty(self, algo):
         car = Car(
             car_id=1, state=CarState.READY, position=5,
             door_state=DoorState.OPEN,
         )
-        actions = algo.decide(car, pending_calls=[5])
-        assert actions == [Action(ActionKind.CLOSE_DOOR)]
+        assert algo.decide(car, pending_calls=[5]) == []
 
-    def test_at_target_door_opening_emits_empty(self, algo):
+    def test_at_target_door_closed_returns_empty(self, algo):
+        car = Car(
+            car_id=1, state=CarState.READY, position=5,
+            door_state=DoorState.CLOSED,
+        )
+        assert algo.decide(car, pending_calls=[5]) == []
+
+    def test_at_target_door_opening_returns_empty(self, algo):
         car = Car(
             car_id=1, state=CarState.READY, position=5,
             door_state=DoorState.OPENING,
         )
         assert algo.decide(car, pending_calls=[5]) == []
 
-    def test_fifo_takes_first_call(self, algo):
-        car = Car(car_id=1, state=CarState.READY, position=2, direction=Direction.IDLE)
-        # 多个召唤时取第一个
+
+class TestTargetFloorPreferredOverPending:
+    """target_floor 是 call 命令的立即目标；不要让它被 pending[0]（旧召唤）挡住"""
+
+    def test_target_floor_wins_when_pending_differs(self, algo):
+        car = Car(
+            car_id=1, state=CarState.READY, position=10,
+            target_floor=1,  # call 1 设的目标
+        )
+        actions = algo.decide(car, pending_calls=[10, 1])
+        # 不应该挑 pending[0]=10（之前没完成的），应该用 target_floor=1
+        assert actions == [Action(ActionKind.MOVE_DOWN)]
+
+    def test_no_target_floor_falls_back_to_pending(self, algo):
+        car = Car(
+            car_id=1, state=CarState.READY, position=2,
+            target_floor=None,
+        )
+        actions = algo.decide(car, pending_calls=[5])
+        assert actions == [Action(ActionKind.MOVE_UP)]
+
+    def test_fifo_when_no_target_floor(self, algo):
+        car = Car(car_id=1, state=CarState.READY, position=2, target_floor=None)
         actions = algo.decide(car, pending_calls=[5, 8, 3])
         assert actions == [Action(ActionKind.MOVE_UP)]

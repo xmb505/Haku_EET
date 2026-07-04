@@ -15,12 +15,13 @@ from typing import Any
 import yaml
 
 from .actions import Action, ActionKind, ActionQueue
-from .algorithm import ALGORITHM_REGISTRY, ElevatorAlgorithm, get_algorithm
+from .algorithm import ElevatorAlgorithm, get_algorithm
 from .display import DisplayEncoder
 from .executor import ActionExecutor
 from .io_client import IOClient, IOEvent
 from .io_mapper import IOMapper
 from .player import Car, CarState, Direction
+from .virtual_plc import VirtualPLC
 
 
 class App:
@@ -82,6 +83,10 @@ class App:
 
     async def start(self) -> None:
         await self.io.start()
+        # 把 IOMapper 已知的 I 地址告诉 IOClient，bitmap 派发事件时只针对这些
+        # （避免 800 位全 dispatch；listener 自己也会过滤，提前过滤更省）
+        if hasattr(self.io, 'set_known_i_addresses'):
+            self.io.set_known_i_addresses(set(self.mapper.lookup_all_i_addresses()))
         self.io.add_listener(self._on_io_event)
         # 后台跑 executor 主循环
         self._executor_task = asyncio.create_task(
@@ -89,8 +94,25 @@ class App:
         )
         # 不自动 INITIALIZE——让用户手动发 /car N init <dir> <floor>
         # 避免电梯在端站时自动启动撞上 2 限位（坠机限位）
+        # simulate 模式：启动虚拟 PLC，自动驱动 position + 触发平层/限位
+        if self.simulate:
+            building = self.config.get('building', {})
+            self.virtual_plc = VirtualPLC(
+                io=self.io,
+                mapper=self.mapper,
+                car=self.car,
+                car_id=int(self.config['elevator']['car_id']),
+                top_base=building.get('top_base_floor', 11),
+                bottom_base=building.get('bottom_base_floor', -1),
+                top_floor=building.get('max_floor', 10),
+                bottom_floor=building.get('min_floor', 1),
+            )
+            self.virtual_plc.start()
+            print('[vplc] 虚拟 PLC 已启动：写接触器后会自动驱动 position 变化')
 
     async def stop(self) -> None:
+        if self.simulate and getattr(self, 'virtual_plc', None):
+            await self.virtual_plc.stop()
         if self._executor_task and not self._executor_task.done():
             self._executor_task.cancel()
             try:
@@ -113,15 +135,20 @@ class App:
 
     async def _on_action_done(self, last_action: Action) -> None:
         """执行器完成一个动作后回调，重新 tick 并在合适时清理 pending_calls"""
-        # 关门完成 = 任务真正完成，从 pending_calls 中移除目标
-        if last_action is not None and last_action.kind == ActionKind.CLOSE_DOOR:
-            if self.car.target_floor is not None and self.car.position == self.car.target_floor:
+        # MOVE 完成 = 已到目标层，清理 pending + target_floor
+        # （call 命令直接 MOVE 不开门，这里是清理 pending 的唯一入口）
+        if last_action is not None and last_action.kind in (
+            ActionKind.MOVE_UP, ActionKind.MOVE_DOWN
+        ):
+            if (self.car.target_floor is not None
+                    and self.car.position == self.car.target_floor):
                 self.pending_calls = [
                     c for c in self.pending_calls if c != self.car.target_floor
                 ]
                 self.car.target_floor = None
+            # 该换目标时，算法决定下一步（可能是 NOOP 或下一 MOVE）
 
-        # INITIALIZE 完成后，如果目标楼层 != 基站楼层，自动移动到目标层
+        # INITIALIZE 完成后，如果目标楼层 != 当前位置，自动 MOVE 过去
         if last_action is not None and last_action.kind == ActionKind.INITIALIZE:
             target = last_action.floor
             if target is not None and target != self.car.position:
@@ -175,12 +202,6 @@ class App:
         action = Action(ActionKind.INITIALIZE, floor=tf)
         await self.action_queue.put(action)
 
-    async def set_algorithm(self, name: str) -> None:
-        """热切换算法"""
-        self.algorithm = get_algorithm(name)
-        self.config['algorithm']['name'] = name
-        await self._tick()
-
     async def reload(self) -> None:
         """重新读 config + io_config + display_config"""
         self._load_config()
@@ -188,18 +209,7 @@ class App:
         self.display.reload()
         self.executor.init_direction = self.config['elevator']['initialization_direction']
         print(f'[reload] config reloaded: '
-              f'algorithm={self.config["algorithm"]["name"]} '
               f'init_dir={self.executor.init_direction}')
-
-    async def set_display(self, glyph_or_floor) -> None:
-        """手动设置显示（调试用）"""
-        # 接受楼层号或字符
-        try:
-            floor = int(glyph_or_floor)
-            action = Action(ActionKind.SET_DISPLAY, floor=floor)
-        except (ValueError, TypeError):
-            action = Action(ActionKind.SET_DISPLAY, floor=None)
-        await self.action_queue.put(action)
 
     async def manual_up(self, high_speed: bool = True) -> None:
         """手动上行（幂等：重复调用安全，已在向上+同速度时跳过 IO 写）"""
@@ -313,6 +323,3 @@ class App:
             'simulate': self.simulate,
             'manual_mode': self.manual_mode,
         }
-
-    def available_algorithms(self) -> list[str]:
-        return list(ALGORITHM_REGISTRY)

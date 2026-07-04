@@ -135,18 +135,6 @@ floor_display:
 ```
 然后 `/reload`。
 
-### 改算法（热切换）
-
-REPL 里：
-```
-haku> /algo list
-可用算法:
-  - simple_internal_call ← 当前
-haku> /algo set simple_internal_call
-```
-
-未来加新算法：在 `core/algorithm.py` 里加新类（继承 `ElevatorAlgorithm`），加入 `ALGORITHM_REGISTRY`，重启即可发现。
-
 ### 调试日志
 
 ```

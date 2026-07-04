@@ -11,35 +11,30 @@ import tty
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .actions import ActionKind
 from .app import App
+from .io_client import IOEvent
 
 
 HELP_TEXT = """
 可用命令:
-  /help                          显示这个帮助
-  /status [car <id>]             查看玩家状态（默认 car 1）
-  /cars                          列出已启用的轿厢 ID
   /car <id> <action> [args...]   指定轿厢执行命令
     动作: init / call / status / manual / auto
-  /init [down|up]                手动触发初始化
-  /call <floor>                  内召：到目标楼层
   /clear                         将所有输出位置零（不含 ready 信号）
-  /sim input <signal> <0|1|toggle>  模拟输入变化
-  /sim position <floor>          直接修改轿厢位置
-  /display <floor|up|dn|fault|A> 设置 7 段显示
-  /actions                       查看动作队列长度
-  /algo list | show | set <name> 算法管理
-  /debug on|off                  调试日志开关
+  /debug show pass_floor         toggle 平层监视（每次经过楼层输出 [DEBUG] pass_floor L<n>）
+  /debug show input_change       toggle 输入变化监视（打印变化的 I 点信号名）
+  /debug show websocket_connect_status  toggle WebSocket 连接状态监视
+  /debug show exec_trace          toggle executor [exec] 执行日志
+  /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
 
 示例:
   /car 1 init                    1 号梯初始化（完整流程：全速→触 1 限位→减速→完美平层）
+  /car 1 init up 3               上行触顶后反向计数到 3 楼
   /car 1 manual                  进入手动控制（方向键控制，ESC 退出）
   /car 1 auto                    切回自动控制
   /car 1 call 5                  1 号梯内召 5 楼
-  /call 3                        默认 1 号梯内召 3 楼
+  /car 1 status                  查看 1 号梯状态
   /clear                         清空所有输出
 
 提示:
@@ -62,21 +57,23 @@ class Console:
         # 当前选中的 car_id（/car <id> 切换）
         self.current_car_id: int = app.car.car_id
         self._commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
-            'help': self.cmd_help,
-            'status': self.cmd_status,
-            'cars': self.cmd_cars,
             'car': self.cmd_car,
-            'init': self.cmd_init,
-            'call': self.cmd_call,
-            'sim': self.cmd_sim,
-            'display': self.cmd_display,
-            'actions': self.cmd_actions,
-            'algo': self.cmd_algo,
-            'debug': self.cmd_debug,
-            'reload': self.cmd_reload,
             'clear': self.cmd_clear,
+            'debug': self.cmd_debug,
+            'help': self.cmd_help,
+            'reload': self.cmd_reload,
             'quit': self.cmd_quit,
         }
+        # debug 监视项状态
+        self.pass_floor_monitor_enabled: bool = False
+        self._pass_floor_last_perfect: bool = False
+        self._pass_floor_listener_ref = None
+        self.input_change_monitor_enabled: bool = False
+        self._input_change_listener_ref = None
+        self.ws_monitor_enabled: bool = False
+        self._ws_monitor_task: asyncio.Task | None = None
+        self._last_ws_connected: bool = False
+        self.exec_trace_enabled: bool = False
 
     def _resolve_car_id(self, args: list[str]) -> int:
         """从参数里提取 car_id（如果有），否则用当前选中的"""
@@ -101,13 +98,15 @@ class Console:
         class HakuCompleter(Completer):
             cmds = sorted([f'/{c}' for c in self._commands])
             # 有子命令的一级命令（输入完整名 + Tab 自动补空格进二级）
-            commands_with_subs = {
+            commands_with_subs: dict[str, list[str]] = {
                 '/car': ['init', 'call', 'status', 'manual', 'auto'],
+                '/debug': ['show'],
             }
             # 子命令的下级参数补全
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace'],
             }
 
             def get_completions(self, document, complete_event):
@@ -151,25 +150,13 @@ class Console:
                                     yield Completion(cid, start_position=-len(current_word))
                             return
                     # 普通子命令补全
-                    # parts = ['/car', '1'] → 补子命令
-                    # parts = ['/car', '1', 'sub'] → 三级：子命令参数（init→up/down, call→1-10）
-                    # parts = ['/car', '1', 'init', 'up'] → 四级：楼层号
-                    if len(parts) >= 4:
-                        sub_cmd = parts[2]
-                        sub_param = parts[3]
-                        if sub_cmd == 'init' and sub_param in ('up', 'down'):
-                            floors = [str(i) for i in range(1, 11)]
-                            if current_word == '':
-                                for f in floors:
-                                    yield Completion(f, start_position=0)
-                            else:
-                                for f in floors:
-                                    if f.startswith(current_word):
-                                        yield Completion(f, start_position=-len(current_word))
-                            return
-                        return
-                    if len(parts) >= 3:
-                        sub_cmd = parts[2]
+                    # /car:       parts = ['/car', '1', 'init']      → sub_cmd=parts[2]
+                    # /debug:     parts = ['/debug', 'show']          → sub_cmd=parts[1]
+                    sub_cmd_idx = 2 if cmd == '/car' else 1
+
+                    if len(parts) > sub_cmd_idx:
+                        # 已输入子命令 → 补子命令参数（sub_sub_args）
+                        sub_cmd = parts[sub_cmd_idx]
                         if sub_cmd in self.sub_sub_args:
                             sub_subs = self.sub_sub_args[sub_cmd]
                             if current_word == '':
@@ -180,7 +167,22 @@ class Console:
                                     if s.startswith(current_word):
                                         yield Completion(s, start_position=-len(current_word))
                             return
+                        # /car 四级补全：/car N init up/down → 楼层号
+                        if cmd == '/car' and len(parts) >= 4:
+                            sub_param = parts[3]
+                            if sub_cmd == 'init' and sub_param in ('up', 'down'):
+                                floors = [str(i) for i in range(1, 11)]
+                                if current_word == '':
+                                    for f in floors:
+                                        yield Completion(f, start_position=0)
+                                else:
+                                    for f in floors:
+                                        if f.startswith(current_word):
+                                            yield Completion(f, start_position=-len(current_word))
+                                return
                         return
+
+                    # 还没输子命令：补子命令名
                     if current_word == '':
                         for s in subs:
                             yield Completion(s, start_position=0)
@@ -260,7 +262,7 @@ class Console:
     async def cmd_help(self, args: list[str]) -> None:
         print(HELP_TEXT)
 
-    async def cmd_status(self, args: list[str]) -> None:
+    async def _do_status(self, args: list[str]) -> None:
         snap = self.app.status_snapshot()
         car = snap['car']
         # 检查参数是否指定了 car_id
@@ -330,17 +332,17 @@ class Console:
 
         # 路由到对应命令
         if sub_action == 'init':
-            await self.cmd_init(sub_args)
+            await self._do_init(sub_args)
         elif sub_action == 'call':
-            await self.cmd_call(sub_args)
+            await self._do_call(sub_args)
         elif sub_action == 'status':
-            await self.cmd_status(sub_args)
+            await self._do_status(sub_args)
         elif sub_action == 'manual':
             await self._run_manual(car_id)
         elif sub_action == 'auto':
             await self.app.manual_auto()
         elif sub_action == 'goto':
-            await self.cmd_call(sub_args)
+            await self._do_call(sub_args)
         else:
             print(f'未知子命令: {sub_action}')
 
@@ -350,15 +352,24 @@ class Console:
 
         输入 → 高层动作（manual_up/down/stop/brake）
         输出 → 单行 \\r 覆盖的状态栏（永不 print 干扰）
-        位置 → 后台任务每秒推 1 层（仅 simulate 模式有效）
 
         操作：
             ↑/↓/←/→    上/下行（低速）
             Shift+↑/↓  上/下行（高速）
-            空格      立即停 + 刹车
-            数字 1-7  设置刹车档位
-            0         释放刹车
+            空格      立即停 + 刹车（最常用）
+            数字 1-7  设置刹车档位（0=释放, 7=全刹）
+            0         释放刹车（不动电机）
             ESC/q/Ctrl-C  退出
+
+        ⚠️ 部分限制（debug 模式主动关闭）：
+            - executor 在手动模式暂停（2 限位 / 紧急停止不触发），可以撞限位看 PLC 反应
+            - 不会因为"位置到顶/底"自动停电机（位置模拟器不跑）
+
+        ✅ 仍然遵循 raw 模式习惯：
+            - 松开方向键 ≈ 立即停电机（100ms 内）：
+              raw TTY 没有 key release 事件，靠"上次按键 100ms 内无新输入 = 松开"近似模拟。
+              标准终端 key repeat 间隔 30-50ms，所以按住时 deadline 永不到期；松开后最迟 100ms 停。
+              如果你的终端 key repeat 异常慢，可调大下面 MOVE_RELEASE_TIMEOUT。
 
         状态聚合（重复按方向键 → 幂等，不重写 IO）：
             current_motion = ('up', True/False) / ('down', ...) / None
@@ -372,28 +383,31 @@ class Console:
 
         print()
         print('=' * 50)
-        print(f'  car {car_id} 手动控制模式')
+        print(f'  car {car_id} 手动控制模式（executor 暂停，可撞限位）')
         print('  ↑ ↓ / ← →   = 上下行（低速）')
         print('  Shift+↑↓    = 上下行（高速）')
         print('  空格         = 立即停 + 刹车')
         print('  数字键 1-7   = 设置刹车档位（0=释放, 7=全刹）')
         print('  ESC / q      = 退出手动控制')
+        print(f'  退出会恢复 executor 2 限位保护')
         print('=' * 50)
 
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
         loop = asyncio.get_running_loop()
         brake_level = 0
-        # 松开方向键自动停的超时：50ms 没新输入就停电机
-        # 典型终端 key repeat 间隔 20-40ms，所以按住时永不停
-        # 松手 → 50ms 内 deadline 到期 → 立即停电机
-        MOVE_TIMEOUT = 0.05
+
+        # === 松开立即停 ===
+        # raw TTY 没有 key release 事件——靠"自上次按键 N ms 内无新输入"近似模拟。
+        # 标准终端 key repeat 间隔 30-50ms，100ms deadline 给出足够余量；
+        # 松开方向键后最迟 100ms 内 deadline 到期 → 立即 transition(None) = manual_stop
+        MOVE_RELEASE_TIMEOUT = 0.1  # 100ms
         stop_deadline: float | None = None
         current_motion: tuple[str, bool] | None = None
 
-        # 没位置的话给个初值（simulate 用），让位置模拟器能跑
-        if self.app.car.position is None:
-            self.app.car.position = 1
+        # 暂停 executor：手动模式下不让它的 2 限位 / 紧急停止干扰 raw 控制
+        executor_was_paused = self.app.executor.paused
+        self.app.executor.paused = True
 
         def render_status() -> None:
             """单行状态渲染（用 \\r 回到行首覆盖，永不 print 干扰）"""
@@ -421,34 +435,6 @@ class Console:
             sys.stdout.write(line)
             sys.stdout.flush()
 
-        # 后台任务：simulate 模式下每秒推 1 层位置（让状态实时变）
-        sim_stop = asyncio.Event()
-
-        async def position_simulator():
-            while not sim_stop.is_set():
-                try:
-                    await asyncio.wait_for(sim_stop.wait(), timeout=0.5)
-                    break
-                except asyncio.TimeoutError:
-                    pass
-                car = self.app.car
-                if not self.app.manual_mode:
-                    break
-                if car.direction == Direction.UP and car.position is not None:
-                    if car.position >= 10:
-                        await self.app.manual_stop()
-                        current_motion = None
-                    else:
-                        car.position += 1
-                    render_status()
-                elif car.direction == Direction.DOWN and car.position is not None:
-                    if car.position <= 1:
-                        await self.app.manual_stop()
-                        current_motion = None
-                    else:
-                        car.position -= 1
-                    render_status()
-
         async def transition(direction: str | None, high_speed: bool):
             """按当前运动状态路由。direction=None = 停。"""
             nonlocal current_motion
@@ -463,15 +449,14 @@ class Console:
             elif direction is None:
                 await self.app.manual_stop()
 
-        # 最简单的非阻塞 stdin：select.select + os.read（不用线程泄漏，不用 ibuf）
+        # 非阻塞 stdin：select.select + os.read（不用线程泄漏，不用 ibuf）
+        # + deadline 周期性检查（松开方向键立刻停电机）
         import select
         import os
 
         try:
             tty.setraw(fd)
             render_status()
-
-            sim_task = asyncio.create_task(position_simulator())
 
             try:
                 while True:
@@ -482,12 +467,12 @@ class Console:
                         render_status()
                         continue
 
-                    # 2. select 判断 stdin 是否可读（带 timeout）
+                    # 2. select 判断 stdin 是否可读（短超时，每轮都给 deadline 检查机会）
                     r, _, _ = await loop.run_in_executor(
-                        None, lambda: select.select([fd], [], [], MOVE_TIMEOUT)
+                        None, lambda: select.select([fd], [], [], 0.02)
                     )
                     if not r:
-                        continue  # 超时，回顶部检查 deadline
+                        continue  # 超时，回顶部再检 deadline
 
                     # 3. 读一字节（select 保证可读，不阻塞）
                     raw = os.read(fd, 1)
@@ -514,15 +499,16 @@ class Console:
                             is_shift = b';' in seq
                             if cmd_char in ('A', 'C'):
                                 await transition('up', is_shift)
-                                stop_deadline = loop.time() + MOVE_TIMEOUT
+                                stop_deadline = loop.time() + MOVE_RELEASE_TIMEOUT
                             elif cmd_char in ('B', 'D'):
                                 await transition('down', is_shift)
-                                stop_deadline = loop.time() + MOVE_TIMEOUT
+                                stop_deadline = loop.time() + MOVE_RELEASE_TIMEOUT
                             # 其他方向键忽略
                         # 单独的 ESC = 退出
                         if len(seq) == 1:
                             break
                     elif raw == b' ':
+                        # 空格 = 显式立即停 + 清 deadline（用户主动停）
                         stop_deadline = None
                         await transition(None, False)
                         if brake_level > 0:
@@ -538,12 +524,7 @@ class Console:
 
                     render_status()
             finally:
-                sim_stop.set()
-                sim_task.cancel()
-                try:
-                    await sim_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                pass
         finally:
             try:
                 loop.remove_reader(fd)
@@ -552,6 +533,8 @@ class Console:
             sys.stdout.write('\n')
             sys.stdout.flush()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+            # 退出手动模式：恢复 executor
+            self.app.executor.paused = executor_was_paused
 
         # 释放刹车 + 停电机 + 切回 auto（不自动 tick，避免 UNKNOWN 状态触发 INITIALIZE）
         await self.app.manual_brake(0)
@@ -562,7 +545,7 @@ class Console:
             await self.app._tick()
         print('[manual] 已退出手动控制')
 
-    async def cmd_init(self, args: list[str]) -> None:
+    async def _do_init(self, args: list[str]) -> None:
         """
         用法:
           /init [<up|down> [<floor>]]
@@ -597,7 +580,7 @@ class Console:
         floor_str = str(target_floor) if target_floor else '1（默认）'
         print(f'car {self.app.car.car_id} 初始化: {dir_str} 目标楼层={floor_str}')
 
-    async def cmd_call(self, args: list[str]) -> None:
+    async def _do_call(self, args: list[str]) -> None:
         if not args:
             print('用法: /call <floor>')
             return
@@ -615,115 +598,161 @@ class Console:
     async def cmd_clear(self, args: list[str]) -> None:
         await self.app.clear_outputs()
 
-    async def cmd_sim(self, args: list[str]) -> None:
-        if not self.app.simulate:
-            print('错误: /sim 只在 --simulate 模式下可用')
+    async def cmd_debug(self, args: list[str]) -> None:
+        if not args or args[0] != 'show':
+            print('用法: /debug show <pass_floor|input_change>')
             return
         if len(args) < 2:
-            print('用法:')
-            print('  /sim input <signal> <0|1|toggle>   模拟输入')
-            print('  /sim position <floor>              直接改位置')
+            # 显示当前所有监视项状态
+            pf = '启用' if self.pass_floor_monitor_enabled else '禁用'
+            ic = '启用' if self.input_change_monitor_enabled else '禁用'
+            ws = '启用' if self.ws_monitor_enabled else '禁用'
+            et = '启用' if self.exec_trace_enabled else '禁用'
+            print(f'pass_floor 监视:             {pf}')
+            print(f'input_change 监视:           {ic}')
+            print(f'websocket_connect_status 监视: {ws}')
+            print(f'exec_trace 监视:             {et}')
             return
-        sub = args[0]
-        if sub == 'input':
-            sig = args[1]
-            val_arg = args[2] if len(args) > 2 else '1'
-            if val_arg == 'toggle':
-                # 取当前 I 地址的缓存值
-                try:
-                    db = self.app.mapper.addr_input(sig, self.app.car.car_id)
-                except KeyError:
-                    print(f'未知输入信号: {sig}')
-                    return
-                i_addr = self.app.mapper.db_to_i(db)
-                cur = self.app.io.get_input(i_addr)
-                val = 0 if cur else 1
-            else:
-                val = 1 if val_arg == '1' else 0
-            try:
-                db = self.app.mapper.addr_input(sig, self.app.car.car_id)
-            except KeyError:
-                print(f'未知输入信号: {sig}（car_id={self.app.car.car_id}）')
-                return
-            i_addr = self.app.mapper.db_to_i(db)
-            self.app.io.simulate_input(i_addr, val)
-            print(f'已模拟 {sig} ({i_addr}) = {val}')
-        elif sub == 'position':
-            try:
-                floor = int(args[1])
-            except ValueError:
-                print('位置必须是整数')
-                return
-            self.app.car.position = floor
-            self.app.car.state = self.app.car.state  # 保持
-            await self.app._tick()
-            print(f'已将位置改为 L{floor}')
+        topic = args[1]
+        if topic == 'pass_floor':
+            self._toggle_pass_floor_monitor()
+        elif topic == 'input_change':
+            self._toggle_input_change_monitor()
+        elif topic == 'websocket_connect_status':
+            self._toggle_ws_monitor()
+        elif topic == 'exec_trace':
+            self._toggle_exec_trace()
         else:
-            print(f'未知子命令: {sub}')
+            print(f'未知 show 主题: {topic}')
 
-    async def cmd_display(self, args: list[str]) -> None:
-        if not args:
-            print('用法: /display <floor|up|dn|fault|blank>')
+    def _toggle_pass_floor_monitor(self) -> None:
+        """toggle pass_floor 监视：启用 / 禁用"""
+        if self.pass_floor_monitor_enabled:
+            self._disable_pass_floor_monitor()
+            print('[debug] pass_floor 监视已禁用')
+        else:
+            self._enable_pass_floor_monitor()
+            print('[debug] pass_floor 监视已启用')
+
+    def _enable_pass_floor_monitor(self) -> None:
+        self.pass_floor_monitor_enabled = True
+        self._pass_floor_last_perfect = self._check_perfect_leveling()
+        # 存住 bound method 引用，禁用时按同一引用移除（每次访问 self._on_pass_floor_event
+        # 会产生新的 bound method 对象，按 id/== 比对会失败）
+        self._pass_floor_listener_ref = self._on_pass_floor_event
+        self.app.io.add_listener(self._pass_floor_listener_ref)
+
+    def _disable_pass_floor_monitor(self) -> None:
+        self.pass_floor_monitor_enabled = False
+        ref = getattr(self, '_pass_floor_listener_ref', None)
+        if ref is not None:
+            self.app.io.remove_listener(ref)
+            self._pass_floor_listener_ref = None
+
+    def _check_perfect_leveling(self) -> bool:
+        car_id = self.app.car.car_id
+        mapper = self.app.mapper
+        io = self.app.io
+        up_addr = mapper.db_to_i(mapper.addr_input('level_up', car_id))
+        down_addr = mapper.db_to_i(mapper.addr_input('level_down', car_id))
+        return io.get_input(up_addr) == 1 and io.get_input(down_addr) == 1
+
+    async def _on_pass_floor_event(self, event: IOEvent) -> None:
+        """IO listener：每次 level_up/level_down 变化检查完美平层上升沿"""
+        car_id = self.app.car.car_id
+        up_addr = self.app.mapper.db_to_i(
+            self.app.mapper.addr_input('level_up', car_id)
+        )
+        down_addr = self.app.mapper.db_to_i(
+            self.app.mapper.addr_input('level_down', car_id)
+        )
+        if event.i_addr not in (up_addr, down_addr):
             return
-        target = args[0]
-        # 字符别名映射
-        glyph_map = {
-            'up': 'up',
-            'dn': 'down',
-            'down': 'down',
-            'fault': 'fault',
-            'blank': 'blank',
-        }
-        if target in glyph_map:
-            from .actions import Action
-            await self.app.action_queue.put(
-                Action(ActionKind.SET_DISPLAY, glyph=glyph_map[target])
-            )
-            print(f'已设置 7 段显示为字符 {glyph_map[target]!r}')
+        perfect_now = self._check_perfect_leveling()
+        if perfect_now and not self._pass_floor_last_perfect:
+            pos = self.app.car.position
+            pos_str = f'L{pos}' if pos is not None else 'N/A'
+            print(f'[DEBUG] pass_floor {pos_str}', file=sys.stderr)
+            sys.stderr.flush()
+        self._pass_floor_last_perfect = perfect_now
+
+    def _toggle_input_change_monitor(self) -> None:
+        if self.input_change_monitor_enabled:
+            self._disable_input_change_monitor()
+            print('[debug] input_change 监视已禁用')
+        else:
+            self._enable_input_change_monitor()
+            print('[debug] input_change 监视已启用')
+
+    def _enable_input_change_monitor(self) -> None:
+        self.input_change_monitor_enabled = True
+        self._input_change_listener_ref = self._on_input_change_event
+        # 保存启用时已收到的 cache 地址，跳过首次 bitmap 同步（从无到有的假变化）
+        self._input_change_known = set(self.app.io.get_all_inputs().keys())
+        self.app.io.add_listener(self._input_change_listener_ref)
+
+    def _disable_input_change_monitor(self) -> None:
+        self.input_change_monitor_enabled = False
+        ref = getattr(self, '_input_change_listener_ref', None)
+        if ref is not None:
+            self.app.io.remove_listener(ref)
+            self._input_change_listener_ref = None
+
+    async def _on_input_change_event(self, event: IOEvent) -> None:
+        """IO listener：每次任意 I 点变化时打印信号名 + 值"""
+        # 跳过首次 bitmap 填入：地址在启用时的 cache 中不存在 → 首次 sync
+        if event.i_addr not in self._input_change_known:
+            self._input_change_known.add(event.i_addr)
             return
-        # 楼层号
+        sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is not None:
+            car_id, name = sig
+            label = f'car{car_id}.{name}' if car_id else name
+        else:
+            label = '?'
+        print(f'[DEBUG] input {event.i_addr} {label} -> {event.bit}', file=sys.stderr)
+        sys.stderr.flush()
+
+    def _toggle_ws_monitor(self) -> None:
+        if self.ws_monitor_enabled:
+            self._disable_ws_monitor()
+            print('[debug] websocket 状态监视已禁用')
+        else:
+            self._enable_ws_monitor()
+            print('[debug] websocket 状态监视已启用')
+
+    def _enable_ws_monitor(self) -> None:
+        self.ws_monitor_enabled = True
+        self._last_ws_connected = self.app.io.ws_connected
+        status = '已连接' if self._last_ws_connected else '未连接'
+        print(f'[debug] WebSocket: {status}')
+        self._ws_monitor_task = asyncio.create_task(self._poll_ws_status())
+
+    def _disable_ws_monitor(self) -> None:
+        self.ws_monitor_enabled = False
+        if self._ws_monitor_task and not self._ws_monitor_task.done():
+            self._ws_monitor_task.cancel()
+        self._ws_monitor_task = None
+
+    async def _poll_ws_status(self) -> None:
+        """每秒轮询 ws_connected 变化，变化时输出"""
         try:
-            floor = int(target)
-        except ValueError:
-            print(f'参数必须是楼层号或字符别名 (up/dn/fault/blank): {target}')
-            return
-        await self.app.set_display(floor)
-        print(f'已设置 7 段显示为 L{floor}')
+            while self.ws_monitor_enabled:
+                await asyncio.sleep(1.0)
+                current = self.app.io.ws_connected
+                if current != self._last_ws_connected:
+                    self._last_ws_connected = current
+                    status = '已连接' if current else '断连'
+                    print(f'[DEBUG] websocket {status}', file=sys.stderr)
+                    sys.stderr.flush()
+        except asyncio.CancelledError:
+            pass
 
-    async def cmd_actions(self, args: list[str]) -> None:
-        print(f'动作队列长度: {self.app.action_queue.qsize()}')
-
-    async def cmd_algo(self, args: list[str]) -> None:
-        if not args:
-            print('用法: /algo list | show | set <name>')
-            return
-        sub = args[0]
-        if sub == 'list':
-            print('可用算法:')
-            for name in self.app.available_algorithms():
-                marker = ' ← 当前' if name == self.app.algorithm.name else ''
-                print(f'  - {name}{marker}')
-        elif sub == 'show':
-            print(f'当前算法: {self.app.algorithm.name}')
-        elif sub == 'set':
-            if len(args) < 2:
-                print('用法: /algo set <name>')
-                return
-            try:
-                await self.app.set_algorithm(args[1])
-            except KeyError as e:
-                print(f'错误: {e}')
-                return
-            print(f'已切换到算法: {args[1]}')
-        else:
-            print(f'未知子命令: {sub}')
-
-    async def cmd_debug(self, args: list[str]) -> None:
-        if not args:
-            print(f'debug = {self.app.debug}')
-            return
-        self.app.debug = args[0] == 'on'
-        print(f'debug = {self.app.debug}')
+    def _toggle_exec_trace(self) -> None:
+        self.exec_trace_enabled = not self.exec_trace_enabled
+        self.app.executor.exec_log_enabled = self.exec_trace_enabled
+        status = '启用' if self.exec_trace_enabled else '禁用'
+        print(f'[debug] exec_trace 监视已{status}')
 
     async def cmd_reload(self, args: list[str]) -> None:
         await self.app.reload()

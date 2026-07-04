@@ -42,14 +42,32 @@ def i_to_event(mapper: IOMapper, signal: str, bit: int, car_id: int = 1) -> IOEv
     return IOEvent(i_addr=i_addr, bit=bit)
 
 
+async def fire_perfect_level_pulse(executor: ActionExecutor, mapper: IOMapper,
+                                   car_id: int = 1) -> None:
+    """模拟一次完整的"完美平层"脉冲：上升沿 (1,1) + 下降沿 (0,0)
+
+    真实硬件行为：电梯经过一层平层区，level_up 和 level_down 同时=1 持续几百毫秒，
+    然后同时回 0。executor 的上升沿触发 step，下降沿 reset 以接受下一个上升沿。
+    """
+    addr_up = mapper.db_to_i(mapper.addr_input('level_up', car_id))
+    addr_down = mapper.db_to_i(mapper.addr_input('level_down', car_id))
+    # 上升沿：两个同时=1
+    await executor.on_io_event(IOEvent(i_addr=addr_up, bit=1))
+    await executor.on_io_event(IOEvent(i_addr=addr_down, bit=1))
+    # 下降沿：两个同时=0
+    await executor.on_io_event(IOEvent(i_addr=addr_up, bit=0))
+    await executor.on_io_event(IOEvent(i_addr=addr_down, bit=0))
+
+
 @pytest.mark.asyncio
 async def test_initialize_down_triggers_bottom_limit(setup):
     car, io, mapper, display, executor = setup
     executor.init_direction = 'down'
+    executor.bottom_base_floor = -1  # base=-1, target=1 → 真正需要反向计数
     queue = ActionQueue()
 
     task = asyncio.create_task(executor.run_loop(queue))
-    await queue.put(Action(ActionKind.INITIALIZE))
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.02)
 
     # 全速下行
@@ -58,19 +76,26 @@ async def test_initialize_down_triggers_bottom_limit(setup):
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 1
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
 
-    # 触发 bottom_limit_1（下行方向等底限位）
+    # 触发 bottom_limit_1（下行方向触底 → 反向全速上行）
     await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
     await asyncio.sleep(0.02)
-    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
-    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
-    assert io.get_output(mapper.addr_output('motor_start', 1)) == 0
+    # 反向：up_contactor=1, 高速保持, 电机保持
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1  # 反向
+    assert io.get_output(mapper.addr_output('down_contactor', 1)) == 0
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1  # 保持高速
+    assert io.get_output(mapper.addr_output('motor_start', 1)) == 1  # 电机保持
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 0  # 不刹车
+    assert car.position == -1  # 从底站开始
 
-    # 等完美平层（level_up & level_down 同时为 1）
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
-    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    # 模拟完美平层计数：-1 → 0 → 1（target=1）
+    # 每次跨层 = 一次完整脉冲（上升沿+下降沿）
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.position == 0
+    assert car.state == CarState.UNKNOWN  # 还没到 target=1
+
+    # 第二次完美平层 → 0→1 = target → complete
+    await fire_perfect_level_pulse(executor, mapper)
     await asyncio.sleep(0.02)
 
     assert car.state == CarState.READY
@@ -259,7 +284,7 @@ async def test_action_done_callback(setup):
 
 @pytest.mark.asyncio
 async def test_initialize_up_triggers_top_limit(setup):
-    """up 方向：全速上行 → 触 top_limit_1 → 减速 → 完美平层 → READY（基站=10）"""
+    """up 方向：全速上行 → 触 top_limit_1 → 反向全速下行 → 逐层计数→ READY"""
     car, io, mapper, display, executor = setup
     executor.init_direction = 'up'
     executor.top_base_floor = 10
@@ -267,27 +292,28 @@ async def test_initialize_up_triggers_top_limit(setup):
     queue = ActionQueue()
 
     task = asyncio.create_task(executor.run_loop(queue))
-    await queue.put(Action(ActionKind.INITIALIZE))
+    # target=1, base=10 → 从 10 开始每层 -1 直到 1
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.02)
 
-    # 全速上行等 top_limit_1
+    # 全速上行
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
-    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
 
+    # 触 top_limit_1 → 反向全速下行（不刹车）
     await executor.on_io_event(i_to_event(mapper, 'top_limit_1', 1))
     await asyncio.sleep(0.02)
-    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
-    assert io.get_output(mapper.addr_output('motor_start', 1)) == 0
+    assert io.get_output(mapper.addr_output('down_contactor', 1)) == 1  # 反向
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1  # 保持高速
+    assert io.get_output(mapper.addr_output('motor_start', 1)) == 1  # 电机保持
 
-    # 等完美平层
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
-    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    # 逆行计数：10→9→8→...→1（9 次完美平层，target=1）
+    # 每次跨层 = 一次完整平层脉冲（上升沿+下降沿）
+    for i in range(9):
+        await fire_perfect_level_pulse(executor, mapper)
     await asyncio.sleep(0.02)
 
     assert car.state == CarState.READY
-    assert car.position == 10  # up 方向基站=10
+    assert car.position == 1  # 最终到 1 楼
 
     task.cancel()
     try:
