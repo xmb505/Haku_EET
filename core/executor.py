@@ -115,6 +115,8 @@ class ActionExecutor:
         self._level_correct_in_progress: bool = False
         # 微调 Events
         self._relevel_future: asyncio.Future | None = None
+        # 站点吸附心跳任务(兜底:IO 事件稀疏时也检查保持状态)
+        self._hold_heartbeat_task: asyncio.Task | None = None
 
     # ===== 主循环 =====
 
@@ -296,9 +298,11 @@ class ActionExecutor:
             # 3c. 停车微调:下平层触发 → 通知等待协程(事件驱动,不 sleep)
             if name == 'level_down' and event.bit == 1 and self._relevel_future is not None:
                 self._relevel_future.set_result(True)
-            # 3d. 保持模式:平层信号变化 → 偏离了就反冲刹回
-            await self._level_hold_check()
             return
+
+        # 3d. 保持模式:每个 IO 事件(不只是 level)都检查平层偏离,
+        # 发现信号偏了立刻反冲刹回,不会因为没有 level 事件而"睡觉"。
+        await self._level_hold_check()
 
         # 4. 等待特定传感器的动作（OPEN/CLOSE_DOOR 等）
         if self.waiting_sensor is None:
@@ -400,12 +404,18 @@ class ActionExecutor:
     async def _level_hold_check(self) -> None:
         """保持模式:检查平层信号,偏离就反冲刹回
 
-        在 _level_hold_active 时,每次 level_up/down 事件触发后调用。
+        在 _level_hold_active 时,每次 IO 事件后调用。
         如果检测到偏离✓(↑1↓1),立刻释放刹车、向偏离反方向微动、
         等待信号恢复后刹停。不 sleep 轮询,全事件驱动。
+
+        同时维护一个心跳定时器(2s),IO 事件稀疏时兜底检查。
         """
         if self._level_correct_in_progress or not self._level_hold_active:
             return
+
+        # 启动心跳兜底(首次进入保持模式时)
+        if self._hold_heartbeat_task is None:
+            self._hold_heartbeat_task = asyncio.create_task(self._hold_heartbeat_loop())
         up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
         dn = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
         up_now = self.io.get_input(up)
@@ -429,12 +439,27 @@ class ActionExecutor:
             self._relevel_future = None
             self._level_correct_in_progress = False
 
+    async def _hold_heartbeat_loop(self) -> None:
+        """站点吸附心跳:每 2s 检查一次平层信号,IO 事件稀疏时兜底"""
+        try:
+            while self._level_hold_active:
+                await asyncio.sleep(2.0)
+                await self._level_hold_check()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._hold_heartbeat_task = None
+
     # ===== Action 展开 =====
 
     async def _start_action(self, action: Action) -> None:
         """展开 Action 为 IO 序列，设置等待传感器"""
         # 有新动作 → 退出保持模式,取消任何正在进行的反冲
         self._level_hold_active = False
+        # 停掉心跳任务(有新动作,车要移动了)
+        if self._hold_heartbeat_task is not None and not self._hold_heartbeat_task.done():
+            self._hold_heartbeat_task.cancel()
+            self._hold_heartbeat_task = None
         if self._relevel_future is not None and not self._relevel_future.done():
             self._relevel_future.cancel()
         self._relevel_future = None
