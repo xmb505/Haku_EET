@@ -255,26 +255,6 @@ class ActionExecutor:
                     self.car.display = new_pos
                     # 到达目标 → 完成
                     if new_pos == self._init_target_floor:
-                        # 反向计数防抖:如果反向开始后 <500ms 就触发了
-                        # (1,1),说明车还在 base 层附近,level 信号可能是
-                        # base 层的残留/抖动/车体未离开,不是真正的目标楼层。
-                        # 跳过这次计数,目标楼层 +1(补偿 skip),等下一层。
-                        # fix:car5 在 L0(base 层)
-                        #  触发(1,1)过早,停在 L0 而非 L1。
-                        # 仅真模式生效:模拟模式 event 由测试手动 fire,
-                        # 频率远快于真实硬件(ms vs s),会误触发 guard。
-                        now = asyncio.get_event_loop().time()
-                        start = self._init_reverse_start_time
-                        elapsed = now - start if start is not None else float('inf')
-                        if not self.io.simulate and elapsed < 0.5:
-                            self._log(
-                                f'[exec] INIT (1,1) 发生在 {elapsed:.3f}s < 500ms,'
-                                f' 跳过 base 层计数,目标调整到 L{self._init_target_floor + step}'
-                            )
-                            self._init_target_floor += step
-                            self._init_reverse_start_time = None
-                            return
-
                         await self._stop_motion()
                         self.car.direction = Direction.IDLE
                         # 灭方向灯
