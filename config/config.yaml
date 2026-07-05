@@ -4,6 +4,8 @@
 io2http:
   http_url: http://192.168.1.201:8080/gpio
   ws_url: ws://192.168.1.201:8081/
+  # 写合并 tick 间隔（毫秒）：50ms = 20Hz，增大减少 HTTP 请求数，减小降低 IO 延迟
+  tick_interval_ms: 50
 
 building:
   min_floor: 1            # 正常使用的最低层（有门）

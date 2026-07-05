@@ -39,6 +39,7 @@ class IOClient:
         simulate: bool = False,
         debug: bool = False,
         reconnect_delay: float = 3.0,
+        tick_interval_ms: float = 100,
     ) -> None:
         self.http_url = http_url
         self.ws_url = ws_url
@@ -46,6 +47,7 @@ class IOClient:
         self.simulate = simulate
         self.debug = debug
         self.reconnect_delay = reconnect_delay
+        self._tick_interval = max(0.01, tick_interval_ms / 1000.0)
 
         self._session: aiohttp.ClientSession | None = None
         self._ws_task: asyncio.Task | None = None
@@ -57,7 +59,6 @@ class IOClient:
         # 写合并缓冲区：累积同一 tick 内的所有写，定期批量 flush
         self._write_buffer: dict[str, int] = {}
         self._flush_task: asyncio.Task | None = None
-        self._tick_interval: float = 0.05  # 50ms tick
 
     # ===== 生命周期 =====
 

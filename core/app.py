@@ -51,6 +51,7 @@ class App:
             ws_url=io2http['ws_url'],
             simulate=simulate,
             debug=False,
+            tick_interval_ms=io2http.get('tick_interval_ms', 100),
         )
         self.mapper = IOMapper(io_config_path)
         self.display = DisplayEncoder(display_config_path)
@@ -243,6 +244,8 @@ class App:
         self.mapper.reload()
         self.display.reload()
         building = self.config['building']
+        io2http = self.config['io2http']
+        self.io._tick_interval = max(0.01, io2http.get('tick_interval_ms', 100) / 1000.0)
         for cid in CAR_IDS:
             self.executors[cid].top_base_floor = building['top_base_floor']
             self.executors[cid].bottom_base_floor = building['bottom_base_floor']
