@@ -109,7 +109,11 @@ class ActionExecutor:
         # 调试输出
         self.debug = False
         self.exec_log_enabled = False  # 是否打印 [exec] 执行日志（/debug show exec_trace 控制）
-        # 停车微调:等待下平层触发的事件 Future(事件驱动,不 sleep 轮询)
+        # 停车保持模式:到站后持续监听平层信号,偏离就反冲刹回
+        self._level_hold_active: bool = False
+        # 保持模式反冲中(防止重入)
+        self._level_correct_in_progress: bool = False
+        # 微调 Events
         self._relevel_future: asyncio.Future | None = None
 
     # ===== 主循环 =====
@@ -271,7 +275,7 @@ class ActionExecutor:
                         # 灭方向灯
                         await self.motor.set_direction_indicator(None)
                         await asyncio.sleep(0.1)  # 等 100ms 停稳
-                        await self._relevel_if_needed()
+                        self._level_hold_active = True
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
@@ -292,6 +296,8 @@ class ActionExecutor:
             # 3c. 停车微调:下平层触发 → 通知等待协程(事件驱动,不 sleep)
             if name == 'level_down' and event.bit == 1 and self._relevel_future is not None:
                 self._relevel_future.set_result(True)
+            # 3d. 保持模式:平层信号变化 → 偏离了就反冲刹回
+            await self._level_hold_check()
             return
 
         # 4. 等待特定传感器的动作（OPEN/CLOSE_DOOR 等）
@@ -329,6 +335,7 @@ class ActionExecutor:
             self.car.direction = Direction.IDLE
             await self.motor.set_direction_indicator(None)
             await asyncio.sleep(0.1)  # 等 100ms 停稳
+            self._level_hold_active = True
             await self.display.show_number(self.car.position, self.car_id)
             self.car.display = self.car.position
             self._init_reverse_mode = False
@@ -375,7 +382,7 @@ class ActionExecutor:
             # 灭方向灯
             await self.motor.set_direction_indicator(None)
             await asyncio.sleep(0.1)  # 等 100ms 停稳
-            await self._relevel_if_needed()
+            self._level_hold_active = True
             await self._complete_action()
             return
 
@@ -390,36 +397,48 @@ class ActionExecutor:
                 await self.motor.set_speed(high_speed=False)
                 self.decel_state = 'decel'
 
-    async def _relevel_if_needed(self) -> None:
-        """停车微调:若下平层未触发,启动慢速下行,等 level_down=1 事件驱动刹车
+    async def _level_hold_check(self) -> None:
+        """保持模式:检查平层信号,偏离就反冲刹回
 
-        不下 sleep/轮询。on_io_event 收到 level_down=1 时会 set Future,
-        这里 await 等 Future 完成后 hold_stop。
+        在 _level_hold_active 时,每次 level_up/down 事件触发后调用。
+        如果检测到偏离✓(↑1↓1),立刻释放刹车、向偏离反方向微动、
+        等待信号恢复后刹停。不 sleep 轮询,全事件驱动。
         """
-        if self._relevel_future is not None:
-            return  # 已在微调中
-        dn = self.mapper.db_to_i(
-            self.mapper.addr_input('level_down', self.car_id)
-        )
-        if self.io.get_input(dn) == 1:
-            self._log(f'[exec] car{self.car_id} 微调:下平层已触发 ✓')
+        if self._level_correct_in_progress or not self._level_hold_active:
             return
-        self._log(f'[exec] car{self.car_id} 微调:下平层 FALSE, 慢速下行等触发')
+        up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
+        dn = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
+        up_now = self.io.get_input(up)
+        dn_now = self.io.get_input(dn)
+        if up_now == 1 and dn_now == 1:
+            return  # 完美平层,不动
+
+        self._level_correct_in_progress = True
+        missing_dir = 'up' if up_now == 0 else 'down'  # 缺上→往上,缺下→往下
+        wait_signal = 'level_up' if up_now == 0 else 'level_down'
+        self._log(f'[exec] car{self.car_id} 保持: {missing_dir}反冲(✓→↑{up_now}↓{dn_now})')
         self._relevel_future = asyncio.get_running_loop().create_future()
         await self.motor.release_brakes()
-        await self.motor.start(high_speed=False, direction='down')
+        await self.motor.start(high_speed=False, direction=missing_dir)
         try:
             await asyncio.wait_for(self._relevel_future, timeout=3.0)
         except asyncio.TimeoutError:
-            self._log(f'[exec] car{self.car_id} 微调超时(3s), 放弃')
+            self._log(f'[exec] car{self.car_id} 保持反冲超时(3s)')
         finally:
             await self.motor.hold_stop()
             self._relevel_future = None
+            self._level_correct_in_progress = False
 
     # ===== Action 展开 =====
 
     async def _start_action(self, action: Action) -> None:
         """展开 Action 为 IO 序列，设置等待传感器"""
+        # 有新动作 → 退出保持模式,取消任何正在进行的反冲
+        self._level_hold_active = False
+        if self._relevel_future is not None and not self._relevel_future.done():
+            self._relevel_future.cancel()
+        self._relevel_future = None
+        self._level_correct_in_progress = False
         if self.debug:
             print(f'[exec] start {action}')
 
