@@ -270,6 +270,7 @@ class App:
         self.executors[cid]._init_reverse_mode = False
         self.executors[cid]._init_perfect_leveling_active = False
         self.executors[cid]._init_last_reverse_pos = None
+        self.executors[cid]._init_reverse_start_time = None
         if direction:
             self.executors[cid].init_direction = direction
         tf = target_floor if target_floor is not None else 1

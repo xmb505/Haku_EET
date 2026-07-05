@@ -85,6 +85,10 @@ class ActionExecutor:
         #   cache 在一次脉冲中两个 signal 都=1 时单次 edge 事件可能重复触发（虚拟 PLC
         #   fire level_up + level_down 各触发一次 dispatch）。
         self._init_perfect_leveling_active: bool = False
+        # 反向开始时的时间戳:用于跳过 base 层的第一个 (1,1)
+        # 如果 (1,1) 在 <500ms 内触发,说明在 base 层(车还没离开/level 抖动),
+        # 跳过等下一层的 (1,1) 再计数(fix car5 L0 层过早触发)
+        self._init_reverse_start_time: float | None = None
         # INITIALIZE 完成后轿厢所在的基站楼层（由方向决定：up→top, down→bottom）
         self._init_base_floor: int = 1
         # INITIALIZE 到达基站后还要移动到的目标楼层（/car N init <dir> <floor>）
@@ -190,6 +194,7 @@ class ActionExecutor:
             await self.motor.set_direction_indicator(reverse_dir)
             self.car.position = self._init_base_floor  # 基站位（11 或 -1）
             self._init_reverse_mode = True
+            self._init_reverse_start_time = asyncio.get_event_loop().time()
             self._init_last_reverse_pos = None
             self.waiting_sensor = None
             # 如果 base == target，直接完成（电梯已在目标层）
@@ -250,6 +255,26 @@ class ActionExecutor:
                     self.car.display = new_pos
                     # 到达目标 → 完成
                     if new_pos == self._init_target_floor:
+                        # 反向计数防抖:如果反向开始后 <500ms 就触发了
+                        # (1,1),说明车还在 base 层附近,level 信号可能是
+                        # base 层的残留/抖动/车体未离开,不是真正的目标楼层。
+                        # 跳过这次计数,目标楼层 +1(补偿 skip),等下一层。
+                        # fix:car5 在 L0(base 层)
+                        #  触发(1,1)过早,停在 L0 而非 L1。
+                        # 仅真模式生效:模拟模式 event 由测试手动 fire,
+                        # 频率远快于真实硬件(ms vs s),会误触发 guard。
+                        now = asyncio.get_event_loop().time()
+                        start = self._init_reverse_start_time
+                        elapsed = now - start if start is not None else float('inf')
+                        if not self.io.simulate and elapsed < 0.5:
+                            self._log(
+                                f'[exec] INIT (1,1) 发生在 {elapsed:.3f}s < 500ms,'
+                                f' 跳过 base 层计数,目标调整到 L{self._init_target_floor + step}'
+                            )
+                            self._init_target_floor += step
+                            self._init_reverse_start_time = None
+                            return
+
                         await self._stop_motion()
                         self.car.direction = Direction.IDLE
                         # 灭方向灯
@@ -384,6 +409,7 @@ class ActionExecutor:
                 self._init_reverse_mode = False
                 self._init_perfect_leveling_active = False
                 self._init_last_reverse_pos = None
+                self._init_reverse_start_time = None
                 await self._execute_initialize()
 
             case ActionKind.MOVE_UP:
@@ -456,6 +482,7 @@ class ActionExecutor:
             # 已在限位 → 直接进入反向计数模式
             self.car.position = self._init_base_floor
             self._init_reverse_mode = True
+            self._init_reverse_start_time = asyncio.get_event_loop().time()
             self._init_last_reverse_pos = None
             self.waiting_sensor = None
             self.car.direction = Direction.UP
@@ -475,6 +502,7 @@ class ActionExecutor:
                 return
             self.car.position = self._init_base_floor
             self._init_reverse_mode = True
+            self._init_reverse_start_time = asyncio.get_event_loop().time()
             self._init_last_reverse_pos = None
             self.waiting_sensor = None
             self.car.direction = Direction.DOWN
