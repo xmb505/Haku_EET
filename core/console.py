@@ -25,6 +25,7 @@ HELP_TEXT = """
   /debug show websocket_connect_status  toggle WebSocket 连接状态监视
   /debug show exec_trace          toggle executor [exec] 执行日志
   /debug show elevator_speed      toggle 速度档位监视（高速/减速/刹车）
+  /debug show level_check        toggle 平层检测（每次 level 翻转打印所有车 ↑↓）
   /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
@@ -73,6 +74,9 @@ class Console:
         self._input_change_listener_ref = None
         self.ws_monitor_enabled: bool = False
         self._ws_monitor_task: asyncio.Task | None = None
+        self.level_check_monitor_enabled: bool = False
+        self._level_check_last_state: dict[int, tuple[int, int]] = {}
+        self._level_check_listener_ref = None
         self._last_ws_connected: bool = False
         self.exec_trace_enabled: bool = False
         self.elevator_speed_enabled: bool = False
@@ -136,7 +140,7 @@ class Console:
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check'],
             }
 
             # ===== 通用补全原语 =====
@@ -815,7 +819,7 @@ class Console:
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':
-            print('用法: /debug show <pass_floor|input_change>')
+            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check>')
             return
         if len(args) < 2:
             # 显示当前所有监视项状态
@@ -824,11 +828,13 @@ class Console:
             ws = '启用' if self.ws_monitor_enabled else '禁用'
             et = '启用' if self.exec_trace_enabled else '禁用'
             es = '启用' if self.elevator_speed_enabled else '禁用'
+            lc = '启用' if self.level_check_monitor_enabled else '禁用'
             print(f'pass_floor 监视:             {pf}')
             print(f'input_change 监视:           {ic}')
             print(f'websocket_connect_status 监视: {ws}')
             print(f'exec_trace 监视:             {et}')
             print(f'elevator_speed 监视:         {es}')
+            print(f'level_check 监视:           {lc}')
             return
         topic = args[1]
         if topic == 'pass_floor':
@@ -841,6 +847,8 @@ class Console:
             self._toggle_exec_trace()
         elif topic == 'elevator_speed':
             self._toggle_elevator_speed()
+        elif topic == 'level_check':
+            self._toggle_level_check_monitor()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -883,6 +891,94 @@ class Console:
     def _check_perfect_leveling(self) -> bool:
         """仅保留签名兼容性（实际未使用，多车检测在 _on_pass_floor_event 内做）"""
         return False
+
+    def _toggle_level_check_monitor(self) -> None:
+        """toggle 平层检测：打印每部电梯的 level_up / level_down 状态
+
+        用于排查多车同步对齐问题。每当任一车的 level_up 或 level_down
+        信号翻转时,打印所有 6 部车的当前状态 + 是否完美平层。
+        """
+        if self.level_check_monitor_enabled:
+            self._disable_level_check_monitor()
+            print('[debug] level_check 监视已禁用')
+        else:
+            self._enable_level_check_monitor()
+            print('[debug] level_check 监视已启用(每次 level_up/down 翻转打印所有车状态)')
+
+    def _enable_level_check_monitor(self) -> None:
+        self.level_check_monitor_enabled = True
+        # 初始化每部车的当前状态(避免启用前累积的旧状态被误报为"翻转")
+        for cid in self.app.car_ids:
+            try:
+                up_addr = self.app.mapper.db_to_i(
+                    self.app.mapper.addr_input('level_up', cid)
+                )
+                down_addr = self.app.mapper.db_to_i(
+                    self.app.mapper.addr_input('level_down', cid)
+                )
+            except KeyError:
+                continue
+            self._level_check_last_state[cid] = (
+                self.app.io.get_input(up_addr),
+                self.app.io.get_input(down_addr),
+            )
+        self._level_check_listener_ref = self._on_level_check_event
+        self.app.io.add_listener(self._level_check_listener_ref)
+
+    def _disable_level_check_monitor(self) -> None:
+        self.level_check_monitor_enabled = False
+        ref = getattr(self, '_level_check_listener_ref', None)
+        if ref is not None:
+            self.app.io.remove_listener(ref)
+            self._level_check_listener_ref = None
+
+    async def _on_level_check_event(self, event: IOEvent) -> None:
+        """IO listener：任一 level_up/down 翻转时,打印所有车的平层状态
+
+        level_up/down 是 200ms 脉冲,翻转瞬间是定位平层错位的唯一时机。
+        不在 event.bit 上过滤,而是每收到一个 level_up/down event,
+        就 dump 所有 6 部车的 (level_up, level_down) 实时快照。
+        """
+        sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None or sig[1] not in ('level_up', 'level_down'):
+            return
+
+        # 收集所有 6 部车的当前状态
+        states: dict[int, tuple[int, int]] = {}
+        for cid in self.app.car_ids:
+            try:
+                up_addr = self.app.mapper.db_to_i(
+                    self.app.mapper.addr_input('level_up', cid)
+                )
+                down_addr = self.app.mapper.db_to_i(
+                    self.app.mapper.addr_input('level_down', cid)
+                )
+            except KeyError:
+                continue
+            states[cid] = (
+                self.app.io.get_input(up_addr),
+                self.app.io.get_input(down_addr),
+            )
+
+        # 任一车状态变化就打印 + 更新基线
+        changed = any(states.get(cid) != self._level_check_last_state.get(cid)
+                      for cid in states)
+        if changed:
+            self._dump_level_check(states)
+            self._level_check_last_state = dict(states)
+
+    def _dump_level_check(self, states: dict[int, tuple[int, int]]) -> None:
+        """单行打印所有 6 部车的平层快照(对齐失败用 ⚠ 标记)"""
+        parts = []
+        for cid in self.app.car_ids:
+            up, down = states.get(cid, (0, 0))
+            mark = '✓' if (up == 1 and down == 1) else \
+                   '↑' if up == 1 else \
+                   '↓' if down == 1 else '·'
+            parts.append(f'car{cid}:{mark}(↑{up}↓{down})')
+        line = '[DEBUG] 平层 ' + ' '.join(parts)
+        print(line, file=sys.stderr)
+        sys.stderr.flush()
 
     async def _on_pass_floor_event(self, event: IOEvent) -> None:
         """IO listener：扫描所有车的 level_up & level_down，detect 完美平层上升沿"""
