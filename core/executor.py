@@ -194,6 +194,13 @@ class ActionExecutor:
             await self.motor.set_direction_indicator(reverse_dir)
             self.car.position = self._init_base_floor  # 基站位（11 或 -1）
             self._init_reverse_mode = True
+            # 同步当前 cache 的 level 状态——DOWN 阶段的 level 脉冲(200ms)
+            # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
+            # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
+            # 后再计下个上升沿,确保从 L1 才开始计数。
+            _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
+            _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
+            self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
             self._init_reverse_start_time = asyncio.get_event_loop().time()
             self._init_last_reverse_pos = None
             self.waiting_sensor = None
@@ -462,6 +469,13 @@ class ActionExecutor:
             # 已在限位 → 直接进入反向计数模式
             self.car.position = self._init_base_floor
             self._init_reverse_mode = True
+            # 同步当前 cache 的 level 状态——DOWN 阶段的 level 脉冲(200ms)
+            # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
+            # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
+            # 后再计下个上升沿,确保从 L1 才开始计数。
+            _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
+            _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
+            self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
             self._init_reverse_start_time = asyncio.get_event_loop().time()
             self._init_last_reverse_pos = None
             self.waiting_sensor = None
@@ -482,6 +496,13 @@ class ActionExecutor:
                 return
             self.car.position = self._init_base_floor
             self._init_reverse_mode = True
+            # 同步当前 cache 的 level 状态——DOWN 阶段的 level 脉冲(200ms)
+            # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
+            # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
+            # 后再计下个上升沿,确保从 L1 才开始计数。
+            _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
+            _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
+            self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
             self._init_reverse_start_time = asyncio.get_event_loop().time()
             self._init_last_reverse_pos = None
             self.waiting_sensor = None
