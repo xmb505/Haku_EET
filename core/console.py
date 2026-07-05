@@ -166,14 +166,22 @@ class Console:
                 cmd = parts[0]
                 if cmd in self.commands_with_subs:
                     subs = self.commands_with_subs[cmd]
-                    # /car 特殊处理：先补 car_id（数字），再补子命令
+                    # /car 特殊处理：先补 car_id（数字或逗号列表），再补子命令
                     if cmd == '/car':
-                        # 已经输入了数字 car_id（parts[1] 是数字）→ 补子命令
-                        if len(parts) >= 2 and parts[1].isdigit():
-                            # 落到下面普通子命令补全
-                            pass
+                        # 已经输入了 car_id（数字或逗号列表）→ 补子命令
+                        if len(parts) >= 2:
+                            raw = parts[1]
+                            if raw.isdigit() or ',' in raw or raw == 'all' or '-' in raw:
+                                # 落到下面普通子命令补全
+                                pass
+                            else:
+                                # 还没输 car_id → 补 car_id
+                                for cid in ('1', '2', '3', '4', '5', '6'):
+                                    if cid.startswith(current_word):
+                                        yield Completion(cid, start_position=-len(current_word))
+                                return
                         else:
-                            # 还没输 car_id，或输的不是数字 → 补 car_id
+                            # 还没输 car_id → 补 car_id
                             for cid in ('1', '2', '3', '4', '5', '6'):
                                 if cid.startswith(current_word):
                                     yield Completion(cid, start_position=-len(current_word))
@@ -653,13 +661,12 @@ class Console:
         elif len(dirs) == 0:
             dirs = [None] * N
 
-        # 验证楼层
+        # 验证楼层：没有则每部车默认 1 楼
         if not floors:
-            print(f'缺少楼层列表')
-            print(f'  用法: /car {",".join(map(str,car_ids))} init <dir> <floor1,floor2,...>')
-            return
+            floors = [1] * N
         if len(floors) != N:
             print(f'楼层数量 ({len(floors)}) 与轿厢数量 ({N}) 不匹配')
+            print(f'  用法: /car {",".join(map(str,car_ids))} init <dir> <floor1,floor2,...>')
             return
 
         # 执行
