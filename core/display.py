@@ -57,20 +57,21 @@ class DisplayEncoder:
         return self.floor_display[floor]
 
     def get_segments_for_floor(self, floor: int) -> Set[str]:
-        """楼层 → 笔画名集合（支持两位数：≥10 楼时十位用 h-n）"""
-        segments = self.get_segments_for_glyph(self.get_glyph_for_floor(floor))
-        # ≥10 楼：十位数显示在 h-n（第二个 7 段管），个位数走 a-g
-        if floor >= 10:
-            tens = floor // 10
-            tens_glyph = str(tens)
-            tens_seg = self.get_segments_for_glyph(tens_glyph)
-            # a→h, b→i, c→j, d→k, e→l, f→m, g→n
-            shift = str.maketrans('abcdefg', 'hijklmn')
-            shifted: Set[str] = set()
-            for s in tens_seg:
-                shifted.add(s.translate(shift))
-            segments = segments.union(shifted)
-        return segments
+        """楼层 → 笔画名集合（十位 h-n + 个位 a-g）"""
+        return self.get_tens_segments(floor).union(self.get_units_segments(floor))
+
+    def get_units_segments(self, floor: int) -> Set[str]:
+        """个位数笔画（a-g，低位 7 段管）"""
+        return self.get_segments_for_glyph(self.get_glyph_for_floor(floor))
+
+    def get_tens_segments(self, floor: int) -> Set[str]:
+        """十位数笔画（h-n，高位 7 段管）；<10 楼返回空集"""
+        if floor < 10:
+            return set()
+        seg = self.get_segments_for_glyph(str(floor // 10))
+        # a→h, b→i, c→j, d→k, e→l, f→m, g→n
+        shift = str.maketrans('abcdefg', 'hijklmn')
+        return {s.translate(shift) for s in seg}
 
     def get_segments_for_glyph(self, glyph: str) -> Set[str]:
         """字符 → 笔画名集合"""
