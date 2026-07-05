@@ -429,7 +429,7 @@ class ActionExecutor:
         self._log(f'[exec] car{self.car_id} 保持: {missing_dir}反冲(✓→↑{up_now}↓{dn_now})')
         self._relevel_future = asyncio.get_running_loop().create_future()
         await self.motor.release_brakes()
-        await self.motor.start(high_speed=False, direction=missing_dir)
+        await self.motor.start(high_speed=True, direction=missing_dir)
         try:
             await asyncio.wait_for(self._relevel_future, timeout=3.0)
         except asyncio.TimeoutError:
