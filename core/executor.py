@@ -355,11 +355,17 @@ class ActionExecutor:
 
         # 2. 到达目标层 → 完全停车
         if new_pos == target:
+            # 先全刹(7档=三刹全开)再停电机,防止惯性滑过完美平层区。
+            # 之前只调 _stop_motion()(断电机),车靠惯性滑到上平层区,
+            # level_down 变 FALSE,导致 1/3/4 号车"没有完美平层"。
+            await self.motor.set_brake_level(7)
             await self._stop_motion()
             self.decel_state = ''
             self.car.direction = Direction.IDLE
             # 灭方向灯
             await self.motor.set_direction_indicator(None)
+            await asyncio.sleep(0.1)  # 等车停稳
+            await self.motor.release_brakes()  # 释放刹车
             await self._complete_action()
             return
 
