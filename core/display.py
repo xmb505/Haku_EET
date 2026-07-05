@@ -65,10 +65,9 @@ class DisplayEncoder:
         return self.get_segments_for_glyph(self.get_glyph_for_floor(floor))
 
     def get_tens_segments(self, floor: int) -> Set[str]:
-        """十位数笔画（h-n，高位 7 段管）；<10 楼返回空集"""
-        if floor < 10:
-            return set()
-        seg = self.get_segments_for_glyph(str(floor // 10))
+        """十位数笔画（h-n，高位 7 段管）；<10 楼补 '0'→ 显示 '09'"""
+        tens_glyph = str(floor // 10) if floor >= 10 else '0'
+        seg = self.get_segments_for_glyph(tens_glyph)
         # a→h, b→i, c→j, d→k, e→l, f→m, g→n
         shift = str.maketrans('abcdefg', 'hijklmn')
         return {s.translate(shift) for s in seg}

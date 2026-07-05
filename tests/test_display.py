@@ -61,10 +61,10 @@ class TestFloorDisplay:
         assert encoder.get_glyph_for_floor(10) == '0'
 
     def test_floor_segments(self, encoder):
-        # 1 楼 → 字符 '1' → 笔画 b, c
-        assert encoder.get_segments_for_floor(1) == {'b', 'c'}
-        # 5 楼 → 字符 '5' → 笔画 a, c, d, f, g
-        assert encoder.get_segments_for_floor(5) == {'a', 'c', 'd', 'f', 'g'}
+        # 1 楼 → 十位 '0'(h,i,j,k,l,m) + 个位 '1'(b,c) = 09
+        assert encoder.get_segments_for_floor(1) == {'b', 'c', 'h', 'i', 'j', 'k', 'l', 'm'}
+        # 5 楼 → 十位 '0'(h,i,j,k,l,m) + 个位 '5'(a,c,d,f,g)
+        assert encoder.get_segments_for_floor(5) == {'a', 'c', 'd', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm'}
         # 10 楼 → 十位 '1'(i,j) + 个位 '0'(a,b,c,d,e,f)
         assert encoder.get_segments_for_floor(10) == {'a', 'b', 'c', 'd', 'e', 'f', 'i', 'j'}
 
