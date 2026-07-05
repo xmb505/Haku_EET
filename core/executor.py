@@ -262,10 +262,14 @@ class ActionExecutor:
                     self.car.display = new_pos
                     # 到达目标 → 完成
                     if new_pos == self._init_target_floor:
+                        self._log(f'[exec] INIT 到达 L{new_pos}, 全刹(7) → 停电机 → 100ms → 释放')
+                        await self.motor.set_brake_level(7)
                         await self._stop_motion()
                         self.car.direction = Direction.IDLE
                         # 灭方向灯
                         await self.motor.set_direction_indicator(None)
+                        await asyncio.sleep(0.1)
+                        await self.motor.release_brakes()
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
@@ -316,9 +320,12 @@ class ActionExecutor:
     async def _try_complete_init_if_at_target(self) -> bool:
         """如果反向开始前 position == target，直接完成 INITIALIZE"""
         if self.car.position == self._init_target_floor:
+            await self.motor.set_brake_level(7)
             await self._stop_motion()
             self.car.direction = Direction.IDLE
             await self.motor.set_direction_indicator(None)
+            await asyncio.sleep(0.1)
+            await self.motor.release_brakes()
             await self.display.show_number(self.car.position, self.car_id)
             self.car.display = self.car.position
             self._init_reverse_mode = False
