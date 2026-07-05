@@ -353,12 +353,16 @@ class Console:
         sub_action = args[1] if len(args) > 1 else None
         sub_args = args[2:]
 
-        # 批量 init
+        # 批量 init / call / manual
         if len(car_ids) > 1:
             if sub_action == 'init':
                 await self._do_init_batch(car_ids, sub_args)
+            elif sub_action == 'call':
+                await self._do_call_batch(car_ids, sub_args)
+            elif sub_action == 'manual':
+                await self._run_manual(car_ids)
             else:
-                print(f'批量命令只支持 init，不支持 {sub_action}')
+                print(f'批量命令只支持 init/call/manual，不支持 {sub_action}')
             return
 
         # 单 car
@@ -380,7 +384,7 @@ class Console:
         elif sub_action == 'status':
             await self._do_status(sub_args)
         elif sub_action == 'manual':
-            await self._run_manual(car_id)
+            await self._run_manual([car_id])
         elif sub_action == 'auto':
             await self.app.manual_auto(car_id=car_id)
         elif sub_action == 'goto':
@@ -388,44 +392,29 @@ class Console:
         else:
             print(f'未知子命令: {sub_action}')
 
-    async def _run_manual(self, car_id: int) -> None:
+    async def _run_manual(self, car_ids: list[int]) -> None:
         """
         手动控制 raw key loop（前后端彻底解耦）：
 
         输入 → 高层动作（manual_up/down/stop/brake）
         输出 → 单行 \\r 覆盖的状态栏（永不 print 干扰）
 
-        操作：
-            ↑/↓/←/→    上/下行（低速）
-            Shift+↑/↓  上/下行（高速）
-            空格      立即停 + 刹车（最常用）
-            数字 1-7  设置刹车档位（0=释放, 7=全刹）
-            0         释放刹车（不动电机）
-            ESC/q/Ctrl-C  退出
-
-        ⚠️ 部分限制（debug 模式主动关闭）：
-            - executor 在手动模式暂停（2 限位 / 紧急停止不触发），可以撞限位看 PLC 反应
-            - 不会因为"位置到顶/底"自动停电机（位置模拟器不跑）
-
-        ✅ 仍然遵循 raw 模式习惯：
-            - 松开方向键 ≈ 立即停电机（100ms 内）：
-              raw TTY 没有 key release 事件，靠"上次按键 100ms 内无新输入 = 松开"近似模拟。
-              标准终端 key repeat 间隔 30-50ms，所以按住时 deadline 永不到期；松开后最迟 100ms 停。
-              如果你的终端 key repeat 异常慢，可调大下面 MOVE_RELEASE_TIMEOUT。
-
-        状态聚合（重复按方向键 → 幂等，不重写 IO）：
-            current_motion = ('up', True/False) / ('down', ...) / None
-            direction + speed 相同时跳过手动_up/down 调用
+        支持 1 部或全部轿厢：/car 1 manual 或 /car all manual。
+        多部时所有操作（方向键、刹车、停止）广播到每部车。
         """
         if not sys.stdin.isatty():
             print('[manual] 当前 stdin 不是 tty，无法捕获方向键。请在真实终端运行。')
             return
 
         from core.player import Direction, CarState
+        first_id = car_ids[0]
+        label = f'cars {car_ids}' if len(car_ids) > 1 else f'car {first_id}'
+        # 多部手动时以第一部为准显示状态（self.app.car / executor 指向第一部）
+        self.current_car_id = first_id
 
         print()
         print('=' * 50)
-        print(f'  car {car_id} 手动控制模式（executor 暂停，可撞限位）')
+        print(f'  {label} 手动控制模式（executor 暂停，可撞限位）')
         print('  ↑ ↓ / ← →   = 上下行（低速）')
         print('  Shift+↑↓    = 上下行（高速）')
         print('  空格         = 立即停 + 刹车')
@@ -440,16 +429,15 @@ class Console:
         brake_level = 0
 
         # === 松开立即停 ===
-        # raw TTY 没有 key release 事件——靠"自上次按键 N ms 内无新输入"近似模拟。
-        # 标准终端 key repeat 间隔 30-50ms，100ms deadline 给出足够余量；
-        # 松开方向键后最迟 100ms 内 deadline 到期 → 立即 transition(None) = manual_stop
         MOVE_RELEASE_TIMEOUT = 0.1  # 100ms
         stop_deadline: float | None = None
         current_motion: tuple[str, bool] | None = None
 
-        # 暂停 executor：手动模式下不让它的 2 限位 / 紧急停止干扰 raw 控制
-        executor_was_paused = self.app.executor.paused
-        self.app.executor.paused = True
+        # 暂停所有 target executor
+        exec_was_paused: dict[int, bool] = {}
+        for cid in car_ids:
+            exec_was_paused[cid] = self.app.executors[cid].paused
+            self.app.executors[cid].paused = True
 
         def render_status() -> None:
             """单行状态渲染（用 \\r 回到行首覆盖，永不 print 干扰）"""
@@ -471,25 +459,33 @@ class Console:
             if car.fault.bottom_limit: faults.append('下限位')
             fault_str = ','.join(faults) if faults else '正常'
             line = (
-                f'\r[car {car_id}] L={pos}{speed_label} 方向={dir_label} 门={door} '
+                f'\r[{label}] L={pos}{speed_label} 方向={dir_label} 门={door} '
                 f'刹车={brake_level} {fault_str}      '
             )
             sys.stdout.write(line)
             sys.stdout.flush()
 
         async def transition(direction: str | None, high_speed: bool):
-            """按当前运动状态路由。direction=None = 停。"""
+            """按当前运动状态路由。direction=None = 停。广播到所有 target car。"""
             nonlocal current_motion
             target = None if direction is None else (direction, high_speed)
             if current_motion == target:
                 return  # 幂等
             current_motion = target
-            if direction == 'up':
-                await self.app.manual_up(high_speed=high_speed, car_id=car_id)
-            elif direction == 'down':
-                await self.app.manual_down(high_speed=high_speed, car_id=car_id)
-            elif direction is None:
-                await self.app.manual_stop(car_id=car_id)
+            if len(car_ids) == 1:
+                # 单台：走原有逐台方法
+                cid = car_ids[0]
+                if direction == 'up':
+                    await self.app.manual_up(high_speed=high_speed, car_id=cid)
+                elif direction == 'down':
+                    await self.app.manual_down(high_speed=high_speed, car_id=cid)
+                elif direction is None:
+                    await self.app.manual_stop(car_id=cid)
+            else:
+                # 多台：一次 set_many 批量发所有车，避免 HTTP 串行阻塞
+                from core.player import Direction as D
+                dir_enum = {'up': D.UP, 'down': D.DOWN, None: None}.get(direction)
+                await self.app.manual_batch(dir_enum, high_speed, car_ids)
 
         # 非阻塞 stdin：select.select + os.read（不用线程泄漏，不用 ibuf）
         # + deadline 周期性检查（松开方向键立刻停电机）
@@ -554,7 +550,10 @@ class Console:
                         stop_deadline = None
                         await transition(None, False)
                         if brake_level > 0:
-                            await self.app.manual_brake(brake_level, car_id=car_id)
+                            if len(car_ids) == 1:
+                                await self.app.manual_brake(brake_level, car_id=car_ids[0])
+                            else:
+                                await self.app.manual_brake_batch(brake_level, car_ids)
                     elif raw in (b'q', b'Q'):
                         break
                     elif raw == b'\x03':  # Ctrl-C
@@ -576,12 +575,19 @@ class Console:
             sys.stdout.flush()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
             # 退出手动模式：恢复 executor
-            self.app.executor.paused = executor_was_paused
+            # 恢复所有 target executor 的 paused 状态
+            for cid in car_ids:
+                self.app.executors[cid].paused = exec_was_paused.get(cid, False)
 
         # 释放刹车 + 停电机 + 切回 auto（不自动 tick，避免 UNKNOWN 状态触发 INITIALIZE）
-        await self.app.manual_brake(0, car_id=car_id)
-        await self.app.manual_stop(car_id=car_id)
-        self.app.manual_mode[car_id] = False
+        if len(car_ids) == 1:
+            cid = car_ids[0]
+            await self.app.manual_brake(0, car_id=cid)
+            await self.app.manual_stop(car_id=cid)
+            self.app.manual_mode[cid] = False
+        else:
+            await self.app.manual_brake_batch(0, car_ids)
+            await self.app.manual_batch(None, False, car_ids)
         # 只有已初始化的电梯才恢复自动调度（UNKNOWN 状态停在原地不动）
         if self.app.car.state == CarState.READY:
             await self.app._tick()
@@ -661,9 +667,11 @@ class Console:
         elif len(dirs) == 0:
             dirs = [None] * N
 
-        # 验证楼层：没有则每部车默认 1 楼
+        # 验证楼层：没有则每部车默认 1 楼；1 个则广播到所有车
         if not floors:
             floors = [1] * N
+        elif len(floors) == 1:
+            floors = floors * N
         if len(floors) != N:
             print(f'楼层数量 ({len(floors)}) 与轿厢数量 ({N}) 不匹配')
             print(f'  用法: /car {",".join(map(str,car_ids))} init <dir> <floor1,floor2,...>')
@@ -676,6 +684,34 @@ class Console:
             dir_label = d or self.app.executor.init_direction
             parts.append(f'car{cid} {dir_label}→{f}')
         print(f'[batch init] {", ".join(parts)}')
+
+    async def _do_call_batch(self, car_ids: list[int],
+                             sub_args: list[str]) -> None:
+        """批量 call：/car all call 1,4,7,2,5,8"""
+        if not sub_args:
+            print(f'缺少楼层列表')
+            print(f'  用法: /car {",".join(map(str,car_ids))} call <floor1,floor2,...>')
+            return
+        try:
+            floors = [int(x.strip()) for x in sub_args[0].split(',') if x.strip()]
+        except ValueError:
+            print(f'楼层列表无效: {sub_args[0]}')
+            return
+
+        N = len(car_ids)
+        if len(floors) == 1:
+            floors = floors * N
+        elif len(floors) != N:
+            print(f'楼层数量 ({len(floors)}) 与轿厢数量 ({N}) 不匹配')
+            return
+
+        parts: list[str] = []
+        for cid, f in zip(car_ids, floors):
+            if self.app.manual_mode.get(cid, False):
+                await self.app.manual_auto(car_id=cid)
+            await self.app.call_internal(f, car_id=cid)
+            parts.append(f'car{cid}→L{f}')
+        print(f'[batch call] {", ".join(parts)}')
 
     async def _do_call(self, args: list[str]) -> None:
         if not args:
