@@ -271,6 +271,7 @@ class ActionExecutor:
                         # 灭方向灯
                         await self.motor.set_direction_indicator(None)
                         await asyncio.sleep(0.1)  # 等 100ms 停稳
+                        await self._relevel_if_needed()
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
