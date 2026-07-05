@@ -207,6 +207,10 @@ class App:
                   f'pending={self.pending_calls[cid]}')
         actions = self.algorithm.decide(self.cars[cid], self.pending_calls[cid])
         for action in actions:
+            # 推 MOVE 时如果 target_floor 还没设,从 pending[0] 取(FIFO)
+            if action.kind in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN) and self.cars[cid].target_floor is None:
+                if self.pending_calls[cid]:
+                    self.cars[cid].target_floor = self.pending_calls[cid][0]
             if self.debug:
                 print(f'[tick]   → {action}')
             await self.action_queues[cid].put(action)
@@ -259,7 +263,9 @@ class App:
         if self.cars[cid].position == floor:
             return
         self.pending_calls[cid].append(floor)
-        self.cars[cid].target_floor = floor
+        # 只有空闲时才立即设目标（否则等当前任务完成后再从 pending[0] 取）
+        if self.cars[cid].target_floor is None:
+            self.cars[cid].target_floor = floor
         await self._tick(cid)
 
     async def reset(self, direction: str | None = None,
