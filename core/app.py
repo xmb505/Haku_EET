@@ -54,7 +54,7 @@ class App:
             tick_interval_ms=io2http.get('tick_interval_ms', 100),
         )
         self.mapper = IOMapper(io_config_path)
-        self.display = DisplayEncoder(display_config_path)
+        self.display = DisplayEncoder(display_config_path, io=self.io, mapper=self.mapper)
         self.algorithm: ElevatorAlgorithm = get_algorithm(
             self.config['algorithm']['name']
         )

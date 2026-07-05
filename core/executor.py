@@ -239,9 +239,7 @@ class ActionExecutor:
                     if new_pos == self._init_target_floor:
                         await self._stop_motion()
                         self.car.direction = Direction.IDLE
-                        await self._write_display(
-                            self.display.get_segments_for_floor(new_pos)
-                        )
+                        await self.display.show_number(new_pos, self.car_id)
                         self.car.display = new_pos
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
@@ -295,9 +293,7 @@ class ActionExecutor:
         if self.car.position == self._init_target_floor:
             await self._stop_motion()
             self.car.direction = Direction.IDLE
-            await self._write_display(
-                self.display.get_segments_for_floor(self.car.position)
-            )
+            await self.display.show_number(self.car.position, self.car_id)
             self.car.display = self.car.position
             self._init_reverse_mode = False
             await self._complete_action()
@@ -333,7 +329,7 @@ class ActionExecutor:
             self.decel_state = ''
             self.car.direction = Direction.IDLE
             # 更新 7 段显示
-            await self._write_display(self.display.get_segments_for_floor(target))
+            await self.display.show_number(target, self.car_id)
             self.car.display = target
             await self._complete_action()
             return
@@ -409,15 +405,9 @@ class ActionExecutor:
 
             case ActionKind.SET_DISPLAY:
                 if action.glyph is not None:
-                    # 直接按字符写（自定义字符如 'up'/'down'/'fault'）
-                    segments = self.display.get_segments_for_glyph(action.glyph)
+                    await self.display.show_glyph(action.glyph, self.car_id)
                 elif action.floor is not None:
-                    segments = self.display.get_segments_for_floor(action.floor)
-                else:
-                    # 兜底：全灭
-                    segments = set()
-                await self._write_display(segments)
-                if action.floor is not None:
+                    await self.display.show_number(action.floor, self.car_id)
                     self.car.display = action.floor
                 # SET_DISPLAY 立即完成（无传感器等待）
                 await self._complete_action()
@@ -568,9 +558,7 @@ class ActionExecutor:
                     self.car.fault, bottom_limit=False, top_limit=False
                 )
                 # 自动显示初始化层
-                await self._write_display(
-                    self.display.get_segments_for_floor(self.car.position)
-                )
+                await self.display.show_number(self.car.position, self.car_id)
                 self.car.display = self.car.position
                 # 完全停车
                 await self._stop_motion()
@@ -600,19 +588,6 @@ class ActionExecutor:
             db_addr = self.mapper.addr_output(sig, self.car_id)
             writes[db_addr] = val
         await self.io.set_many(writes)
-
-    async def _write_display(self, segments: set[str]) -> None:
-        """写 7 段数码管（先全清再置位）"""
-        all_segs = set(self.display.segments)
-        writes = {}
-        for seg in all_segs:
-            try:
-                db_addr = self.mapper.addr_output(f'segment_{seg}', self.car_id)
-                writes[db_addr] = 1 if seg in segments else 0
-            except KeyError:
-                continue
-        if writes:
-            await self.io.set_many(writes)
 
     async def _all_outputs_off(self) -> None:
         """清所有输出（除 ready 信号外）"""

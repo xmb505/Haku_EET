@@ -27,7 +27,7 @@ def setup():
     car = Car(car_id=1)
     io = IOClient(simulate=True, debug=False)
     mapper = IOMapper(IO_CONFIG_PATH)
-    display = DisplayEncoder(DISPLAY_PATH)
+    display = DisplayEncoder(DISPLAY_PATH, io=io, mapper=mapper)
     executor = ActionExecutor(
         car=car, io=io, mapper=mapper, display=display,
         car_id=1, init_direction='up',

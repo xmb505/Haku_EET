@@ -1,21 +1,29 @@
 """
-display.py —— 7 段数码管编码查表
+display.py —— 7 段数码管编码 + IO 写入
 
 从 config/display_config.yaml 读字符 → 笔画映射 + 楼层 → 字符映射。
 比赛现场想改 10 楼显示、加新字符，都只动 config 文件 + /reload。
 
-完全独立：不知道 IO 地址，不知道 car_id，硬件层 executor 拿笔画名后再查 io_mapper。
+上层只需要调用 show_number(floor, car_id)，无需关心 segment 名和 IO 地址。
 """
 
 from pathlib import Path
-from typing import Set
+from typing import TYPE_CHECKING, Set
 
 import yaml
 
+if TYPE_CHECKING:
+    from .io_client import IOClient
+    from .io_mapper import IOMapper
+
 
 class DisplayEncoder:
-    def __init__(self, config_path: str | Path) -> None:
+    def __init__(self, config_path: str | Path,
+                 io: 'IOClient | None' = None,
+                 mapper: 'IOMapper | None' = None) -> None:
         self.config_path = Path(config_path)
+        self.io = io
+        self.mapper = mapper
         self.segments: list[str] = []
         self.glyphs: dict[str, list[str]] = {}
         self.floor_display: dict[int, str] = {}
@@ -47,6 +55,36 @@ class DisplayEncoder:
                     f'floor {floor} 映射到字符 {glyph!r}，但 glyphs 里没有该字符，'
                     f'请在 display_config.yaml 的 glyphs 里补齐'
                 )
+
+    # ---- 核心 IO API：传入数字，直接写 IO ---- #
+
+    async def show_number(self, number: int, car_id: int) -> None:
+        """显示一个数字 → 自动计算笔画 → 写 IO（经 tick 缓冲区）"""
+        await self._write_segments(self.number_to_segments(number), car_id)
+
+    async def show_glyph(self, glyph_name: str, car_id: int) -> None:
+        """显示一个命名字符（up/down/fault/blank 等），十位补 0"""
+        glyph_seg = self.get_segments_for_glyph(glyph_name)
+        full = self.number_to_segments(0).union(glyph_seg)
+        await self._write_segments(full, car_id)
+
+    async def clear_display(self, car_id: int) -> None:
+        """全灭"""
+        await self._write_segments(set(), car_id)
+
+    async def _write_segments(self, segments: Set[str], car_id: int) -> None:
+        """笔画集合 → 写 IO（经 tick 缓冲区）"""
+        if self.io is None or self.mapper is None:
+            return
+        writes: dict[str, int] = {}
+        for seg in set(self.segments):
+            try:
+                addr = self.mapper.addr_output(f'segment_{seg}', car_id)
+                writes[addr] = 1 if seg in segments else 0
+            except KeyError:
+                continue
+        if writes:
+            await self.io.set_many(writes)
 
     def get_glyph_for_floor(self, floor: int) -> str:
         """楼层 → 显示字符"""
