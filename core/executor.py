@@ -583,11 +583,13 @@ class ActionExecutor:
     async def _start_action(self, action: Action) -> None:
         """展开 Action 为 IO 序列，设置等待传感器"""
         # 有新动作 → 退出保持模式,取消任何正在进行的反冲
-        self._level_seek_active = False
-        if self._relevel_future is not None and not self._relevel_future.done():
-            self._relevel_future.cancel()
-        self._relevel_future = None
-        self._level_correct_in_progress = False
+        # NOOP 不退出保持模式（算法在空闲时持续发 NOOP,每隔退出 hold 会让吸附永久不激活）
+        if action.kind != ActionKind.NOOP:
+            self._level_seek_active = False
+            if self._relevel_future is not None and not self._relevel_future.done():
+                self._relevel_future.cancel()
+            self._relevel_future = None
+            self._level_correct_in_progress = False
         if self.debug:
             print(f'[exec] start {action}')
 
