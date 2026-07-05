@@ -322,3 +322,71 @@ async def test_initialize_up_triggers_top_limit(setup):
         await task
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_motor_stop_does_not_touch_brakes(setup):
+    """验证重构后 stop() 不动刹车状态（手动刹车档位不被吃掉）
+
+    场景:手动模式设了 brake_level=5,之后调 motor.stop()
+    期望:接触器清零 + motor_start=0,但 brake_1/2/3 保持非 0
+    """
+    car, io, mapper, display, executor = setup
+    # 模拟手动模式设了刹车档位 5 (=101,b1=1, b2=0, b3=1)
+    await executor.motor.set_brake_level(5)
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    # 模拟手动停电机(空格或退出手动)
+    await executor.motor.start(high_speed=True, direction='up')
+    await executor.motor.stop()
+
+    # stop 后接触器清零 + 电机断电
+    assert io.get_output(mapper.addr_output('motor_start', 1)) == 0
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 刹车状态保持（不被 stop 吃掉）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    # 显式 release_brakes 才会清
+    await executor.motor.release_brakes()
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 0
+
+
+@pytest.mark.asyncio
+async def test_release_brakes_called_on_move_start(setup):
+    """验证 _start_move_up/down 启动前调用 release_brakes（确保刹车释放让电机驱动）"""
+    car, io, mapper, display, executor = setup
+    queue = ActionQueue()
+    car.state = CarState.READY
+    car.position = 3
+    car.target_floor = 5
+
+    # 先人为设个非零刹车状态（模拟手动模式残留）
+    await executor.motor.set_brake_level(3)
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    await queue.put(Action(ActionKind.MOVE_UP))
+    await asyncio.sleep(0.02)
+
+    # 启动 MOVE_UP 后,_start_move_up 应释放刹车(让电机能驱动)
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 0
+    # 接触器 + 电机正常
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('motor_start', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

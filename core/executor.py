@@ -463,20 +463,20 @@ class ActionExecutor:
             self._log(f'[exec] 初始化: 已在底站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
 
     async def _start_move_up(self) -> None:
-        """上行启动：高速 + 上 + 电机（之后靠 _on_level_reached 减速）"""
+        """上行启动：释放刹车 + 高速 + 上 + 电机（之后靠 _on_level_reached 减速）"""
         self.decel_state = 'high_speed'
         self._last_level_up = 0
+        await self.motor.release_brakes()
         await self.motor.start(high_speed=True, direction='up')
-        await self.motor.set_brakes(0, 0, 0)
         self.car.direction = Direction.UP
         self.waiting_sensor = None  # 不等特定传感器，靠 level_up 边沿推进
 
     async def _start_move_down(self) -> None:
-        """下行启动：高速 + 下 + 电机"""
+        """下行启动：释放刹车 + 高速 + 下 + 电机"""
         self.decel_state = 'high_speed'
         self._last_level_down = 0
+        await self.motor.release_brakes()
         await self.motor.start(high_speed=True, direction='down')
-        await self.motor.set_brakes(0, 0, 0)
         self.car.direction = Direction.DOWN
         self.waiting_sensor = None
 
