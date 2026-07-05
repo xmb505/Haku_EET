@@ -190,6 +190,7 @@ class ActionExecutor:
             # 对 init down：触底后反向往上，每层 ++position 到 target
             was_up = self.init_direction == 'up'
             reverse_dir = 'down' if was_up else 'up'
+            await self.motor.release_brakes()  # 释放前一次停车时保持的全刹
             await self.motor.start(high_speed=True, direction=reverse_dir)
             await self.motor.set_direction_indicator(reverse_dir)
             self.car.position = self._init_base_floor  # 基站位（11 或 -1）
@@ -268,8 +269,7 @@ class ActionExecutor:
                         self.car.direction = Direction.IDLE
                         # 灭方向灯
                         await self.motor.set_direction_indicator(None)
-                        await asyncio.sleep(0.1)
-                        await self.motor.release_brakes()
+                        await asyncio.sleep(0.1)  # 等 100ms 停稳
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
@@ -324,8 +324,7 @@ class ActionExecutor:
             await self._stop_motion()
             self.car.direction = Direction.IDLE
             await self.motor.set_direction_indicator(None)
-            await asyncio.sleep(0.1)
-            await self.motor.release_brakes()
+            await asyncio.sleep(0.1)  # 等 100ms 停稳
             await self.display.show_number(self.car.position, self.car_id)
             self.car.display = self.car.position
             self._init_reverse_mode = False
@@ -372,8 +371,7 @@ class ActionExecutor:
             self.car.direction = Direction.IDLE
             # 灭方向灯
             await self.motor.set_direction_indicator(None)
-            await asyncio.sleep(0.1)  # 等车停稳
-            await self.motor.release_brakes()  # 释放刹车
+            await asyncio.sleep(0.1)  # 等 100ms 停稳
             await self._complete_action()
             return
 
@@ -474,6 +472,7 @@ class ActionExecutor:
             top_addr = self.mapper.db_to_i(self.mapper.addr_input('top_limit_1', self.car_id))
             at_limit = self.io.get_input(top_addr) == 1
             if not at_limit:
+                await self.motor.release_brakes()
                 await self.motor.set_direction_indicator('up')
                 await self.motor.start(high_speed=True, direction='up')
                 self.waiting_sensor = ('top_limit_1', 1)
@@ -502,6 +501,7 @@ class ActionExecutor:
             bot_addr = self.mapper.db_to_i(self.mapper.addr_input('bottom_limit_1', self.car_id))
             at_limit = self.io.get_input(bot_addr) == 1
             if not at_limit:
+                await self.motor.release_brakes()
                 await self.motor.set_direction_indicator('down')
                 await self.motor.start(high_speed=True, direction='down')
                 self.waiting_sensor = ('bottom_limit_1', 1)

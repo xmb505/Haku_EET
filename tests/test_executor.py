@@ -169,8 +169,10 @@ async def test_move_up_completes_on_level_up(setup):
     # 接触器清零
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 0
-    assert io.get_output(mapper.addr_output('brake_1', 1)) == 0
-    assert io.get_output(mapper.addr_output('brake_3', 1)) == 0
+    # 停车后保持全刹(7档),防止过冲,直到下一次 MOVE 才释放
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     task.cancel()
     try:
