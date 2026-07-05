@@ -201,3 +201,18 @@ async def test_multi_init_no_emergency(app: App):
     # 不应该触发 emergency（状态是 READY 而不是 FAULT）
     assert app.cars[1].state != CarState.FAULT, f'emergency: {app.cars[1].fault}'
     assert app.cars[1].position == 1, f'预期 L1 实际 L{app.cars[1].position}'
+
+
+@pytest.mark.asyncio
+async def test_batch_init(app: App):
+    """批量 init 多部轿厢（模拟 /car 1,2,3 init down 5,6,7）"""
+    for cid, floor in [(1, 5), (2, 6), (3, 7)]:
+        await app.reset(direction='down', target_floor=floor, car_id=cid)
+    await asyncio.sleep(5.0)  # 等所有 init 完成（8 层 × 0.4s + 余量）
+
+    for cid in (1, 2, 3):
+        assert app.cars[cid].state != CarState.FAULT, \
+            f'car{cid} emergency: {app.cars[cid].fault}'
+    assert app.cars[1].position == 5
+    assert app.cars[2].position == 6
+    assert app.cars[3].position == 7

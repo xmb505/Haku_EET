@@ -85,6 +85,31 @@ class Console:
             return int(args[0])
         return self.current_car_id
 
+    def _parse_car_list(self, s: str) -> list[int]:
+        """'1,2,3' / '1-3' / 'all' / '5' → list[int]，失败抛 ValueError"""
+        s = s.strip()
+        if s == 'all':
+            return list(CAR_IDS)
+        # 范围: 1-6
+        if '-' in s:
+            parts = s.split('-', 1)
+            lo, hi = int(parts[0]), int(parts[1])
+            return [i for i in range(lo, hi + 1) if i in CAR_IDS]
+        # 逗号列表
+        ids = [int(x.strip()) for x in s.split(',') if x.strip()]
+        for cid in ids:
+            if cid not in CAR_IDS:
+                raise ValueError(f'无效轿厢 ID: {cid}')
+        return ids
+
+    def _parse_token_list(self, s: str, *, cast=int, sep=','):
+        """'1,2,3' → [1,2,3]  或 'up,down' → ['up','down']"""
+        return [cast(x.strip()) for x in s.split(sep) if x.strip()]
+
+    def _parse_dir_list(self, s: str) -> list[str]:
+        """'up' / 'up,down,up' → list[str]"""
+        return [x.strip() for x in s.split(',') if x.strip()]
+
     async def run(self) -> None:
         print('=' * 60)
         print('  Haku_EET  西门子杯电梯控制离散算法  REPL')
@@ -307,30 +332,39 @@ class Console:
         """
         /car <id> <action> [args...]  切换或路由命令到指定 car
         /car <id>                     切换当前选中的 car（影响后续命令默认值）
+        /car 1,2,3,4,5,6 init down 1,2,3,4,5,6  批量 init
         """
         if not args:
             print('用法: /car <id> [init|call|status|manual|auto] [...]')
             return
         try:
-            car_id = int(args[0])
-        except ValueError:
-            print(f'car_id 必须是整数: {args[0]}')
+            car_ids = self._parse_car_list(args[0])
+        except (ValueError, IndexError) as e:
+            print(f'参数错误: {e}')
             return
         sub_action = args[1] if len(args) > 1 else None
         sub_args = args[2:]
 
+        # 批量 init
+        if len(car_ids) > 1:
+            if sub_action == 'init':
+                await self._do_init_batch(car_ids, sub_args)
+            else:
+                print(f'批量命令只支持 init，不支持 {sub_action}')
+            return
+
+        # 单 car
+        car_id = car_ids[0]
         if car_id not in set(CAR_IDS):
             print(f'无效轿厢 ID: {car_id}（有效值: {CAR_IDS}）')
             return
 
-        # 切换当前选中的 car（让 self.app.car / executor / action_queue 指向它）
         self.current_car_id = car_id
 
         if sub_action is None:
             print(f'已切换当前轿厢: car {car_id}')
             return
 
-        # 路由到对应命令
         if sub_action == 'init':
             await self._do_init(sub_args)
         elif sub_action == 'call':
@@ -580,6 +614,61 @@ class Console:
         dir_str = direction or self.app.executor.init_direction
         floor_str = str(target_floor) if target_floor else '1（默认）'
         print(f'car {self.current_car_id} 初始化: {dir_str} 目标楼层={floor_str}')
+
+    async def _do_init_batch(self, car_ids: list[int],
+                             sub_args: list[str]) -> None:
+        """批量 init：/car 1,2,3,4,5,6 init <dir> <floorlist>"""
+        # 解析方向列表
+        dirs: list[str | None] = []
+        if sub_args and sub_args[0] in ('up', 'down'):
+            dirs = [sub_args[0]]  # 广播
+            target_token = sub_args[1] if len(sub_args) > 1 else None
+        elif sub_args:
+            try:
+                dirs = self._parse_dir_list(sub_args[0])
+            except Exception:
+                print(f'方向参数无效: {sub_args[0]}')
+                return
+            target_token = sub_args[1] if len(sub_args) > 1 else None
+        else:
+            target_token = None
+
+        # 解析楼层列表
+        floors: list[int] = []
+        if target_token:
+            try:
+                floors = [int(x.strip()) for x in target_token.split(',') if x.strip()]
+            except ValueError:
+                print(f'楼层列表无效: {target_token}')
+                return
+
+        N = len(car_ids)
+        # 验证方向
+        if len(dirs) not in (0, 1, N):
+            print(f'方向数量 ({len(dirs)}) 与轿厢数量 ({N}) 不匹配')
+            print(f'  用法: /car {",".join(map(str,car_ids))} init <dir> <floor1,floor2,...>')
+            return
+        if len(dirs) == 1:
+            dirs = dirs * N
+        elif len(dirs) == 0:
+            dirs = [None] * N
+
+        # 验证楼层
+        if not floors:
+            print(f'缺少楼层列表')
+            print(f'  用法: /car {",".join(map(str,car_ids))} init <dir> <floor1,floor2,...>')
+            return
+        if len(floors) != N:
+            print(f'楼层数量 ({len(floors)}) 与轿厢数量 ({N}) 不匹配')
+            return
+
+        # 执行
+        parts: list[str] = []
+        for cid, d, f in zip(car_ids, dirs, floors):
+            await self.app.reset(direction=d, target_floor=f, car_id=cid)
+            dir_label = d or self.app.executor.init_direction
+            parts.append(f'car{cid} {dir_label}→{f}')
+        print(f'[batch init] {", ".join(parts)}')
 
     async def _do_call(self, args: list[str]) -> None:
         if not args:
