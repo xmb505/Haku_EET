@@ -341,7 +341,7 @@ class App:
             except KeyError:
                 # 没有 level 信号（异常配置）→ 仅激活 hold,让下次 IO 事件触发检查
                 exe._level_seek_active = True
-                await exe._level_seek_check()
+                asyncio.create_task(exe._level_seek_check())
                 activate_count += 1
                 continue
 
@@ -356,7 +356,7 @@ class App:
             else:
                 # 已在平层区(含偏离 1,0 / 0,1),立即激活 hold
                 exe._level_seek_active = True
-                await exe._level_seek_check()
+                asyncio.create_task(exe._level_seek_check())
                 activate_count += 1
 
         return {
