@@ -254,57 +254,34 @@ class App:
 
     async def manual_batch(self, direction: Direction | None,
                            high_speed: bool, car_ids: list[int]) -> None:
-        """批量手动方向：一次 set_many 发所有车，避免逐台 HTTP 串行阻塞"""
-        writes: dict[str, int] = {}
+        """批量手动方向"""
         for cid in car_ids:
             self.manual_mode[cid] = True
             car = self.cars[cid]
             if direction == Direction.UP:
                 if car.direction == Direction.UP and car.manual_speed == high_speed:
-                    continue  # 幂等
+                    continue
                 car.direction = Direction.UP
                 car.manual_speed = high_speed
-                writes[self.mapper.addr_output('up_contactor', cid)] = 1
-                writes[self.mapper.addr_output('down_contactor', cid)] = 0
-                writes[self.mapper.addr_output('high_speed_contactor', cid)] = 1 if high_speed else 0
-                writes[self.mapper.addr_output('low_speed_contactor', cid)] = 0 if high_speed else 1
-                writes[self.mapper.addr_output('motor_start', cid)] = 1
+                await self.executors[cid].motor.start(high_speed=high_speed, direction='up')
             elif direction == Direction.DOWN:
                 if car.direction == Direction.DOWN and car.manual_speed == high_speed:
                     continue
                 car.direction = Direction.DOWN
                 car.manual_speed = high_speed
-                writes[self.mapper.addr_output('up_contactor', cid)] = 0
-                writes[self.mapper.addr_output('down_contactor', cid)] = 1
-                writes[self.mapper.addr_output('high_speed_contactor', cid)] = 1 if high_speed else 0
-                writes[self.mapper.addr_output('low_speed_contactor', cid)] = 0 if high_speed else 1
-                writes[self.mapper.addr_output('motor_start', cid)] = 1
+                await self.executors[cid].motor.start(high_speed=high_speed, direction='down')
             else:  # stop
                 if car.direction == Direction.IDLE and car.manual_speed is False:
                     continue
-                writes[self.mapper.addr_output('up_contactor', cid)] = 0
-                writes[self.mapper.addr_output('down_contactor', cid)] = 0
-                writes[self.mapper.addr_output('high_speed_contactor', cid)] = 0
-                writes[self.mapper.addr_output('low_speed_contactor', cid)] = 0
-                writes[self.mapper.addr_output('motor_start', cid)] = 0
+                await self.executors[cid].motor.stop()
                 car.direction = Direction.IDLE
                 car.manual_speed = False
-        if writes:
-            await self.io.set_many(writes)
 
     async def manual_brake_batch(self, level: int,
                                  car_ids: list[int]) -> None:
-        """批量刹车：一次 set_many 发所有车"""
-        writes: dict[str, int] = {}
-        b1 = 1 if (level & 0b001) else 0
-        b2 = 1 if (level & 0b010) else 0
-        b3 = 1 if (level & 0b100) else 0
+        """批量刹车"""
         for cid in car_ids:
-            writes[self.mapper.addr_output('brake_1', cid)] = b1
-            writes[self.mapper.addr_output('brake_2', cid)] = b2
-            writes[self.mapper.addr_output('brake_3', cid)] = b3
-        if writes:
-            await self.io.set_many(writes)
+            await self.executors[cid].motor.set_brake_level(level)
 
     async def manual_up(self, high_speed: bool = True,
                         car_id: int | None = None) -> None:
@@ -315,13 +292,7 @@ class App:
             return
         car.direction = Direction.UP
         car.manual_speed = high_speed
-        await self.io.set_many({
-            self.mapper.addr_output('up_contactor', cid): 1,
-            self.mapper.addr_output('down_contactor', cid): 0,
-            self.mapper.addr_output('high_speed_contactor', cid): 1 if high_speed else 0,
-            self.mapper.addr_output('low_speed_contactor', cid): 0 if high_speed else 1,
-            self.mapper.addr_output('motor_start', cid): 1,
-        })
+        await self.executors[cid].motor.start(high_speed=high_speed, direction='up')
 
     async def manual_down(self, high_speed: bool = True,
                           car_id: int | None = None) -> None:
@@ -332,26 +303,14 @@ class App:
             return
         car.direction = Direction.DOWN
         car.manual_speed = high_speed
-        await self.io.set_many({
-            self.mapper.addr_output('up_contactor', cid): 0,
-            self.mapper.addr_output('down_contactor', cid): 1,
-            self.mapper.addr_output('high_speed_contactor', cid): 1 if high_speed else 0,
-            self.mapper.addr_output('low_speed_contactor', cid): 0 if high_speed else 1,
-            self.mapper.addr_output('motor_start', cid): 1,
-        })
+        await self.executors[cid].motor.start(high_speed=high_speed, direction='down')
 
     async def manual_stop(self, car_id: int | None = None) -> None:
         cid = car_id if car_id is not None else self.current_car_id
         car = self.cars[cid]
         if car.direction == Direction.IDLE and car.manual_speed is False:
             return
-        await self.io.set_many({
-            self.mapper.addr_output('up_contactor', cid): 0,
-            self.mapper.addr_output('down_contactor', cid): 0,
-            self.mapper.addr_output('high_speed_contactor', cid): 0,
-            self.mapper.addr_output('low_speed_contactor', cid): 0,
-            self.mapper.addr_output('motor_start', cid): 0,
-        })
+        await self.executors[cid].motor.stop()
         car.direction = Direction.IDLE
         car.manual_speed = False
 
@@ -366,14 +325,7 @@ class App:
         if exe.manual_current_brake_state == level:
             return
         exe.manual_current_brake_state = level
-        b1 = 1 if (level & 0b001) else 0
-        b2 = 1 if (level & 0b010) else 0
-        b3 = 1 if (level & 0b100) else 0
-        await self.io.set_many({
-            self.mapper.addr_output('brake_1', cid): b1,
-            self.mapper.addr_output('brake_2', cid): b2,
-            self.mapper.addr_output('brake_3', cid): b3,
-        })
+        await exe.motor.set_brake_level(level)
 
     async def manual_emergency_stop(self, car_id: int | None = None) -> None:
         cid = car_id if car_id is not None else self.current_car_id

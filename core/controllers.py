@@ -70,6 +70,13 @@ class MotorController:
             self.mapper.addr_output('brake_3', self.car_id): b3,
         })
 
+    async def set_brake_level(self, level: int) -> None:
+        """8 档刹车（0=释放, 1-7=不同组合）"""
+        b1 = 1 if (level & 0b001) else 0
+        b2 = 1 if (level & 0b010) else 0
+        b3 = 1 if (level & 0b100) else 0
+        await self.set_brakes(b1, b2, b3)
+
 
 class DoorController:
     """门继电器控制器"""
