@@ -26,6 +26,7 @@ HELP_TEXT = """
   /debug show exec_trace          toggle executor [exec] 执行日志
   /debug show elevator_speed      toggle 速度档位监视（高速/减速/刹车）
   /debug show level_check        toggle 平层检测（每次 level 翻转打印所有车 ↑↓）
+  /debug show station_hold       toggle 站点吸附（吸附状态 / 反冲中 / 平层信号）
   /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
@@ -77,6 +78,8 @@ class Console:
         self.level_check_monitor_enabled: bool = False
         self._level_check_last_state: dict[int, tuple[int, int]] = {}
         self._level_check_listener_ref = None
+        self.level_hold_debug_enabled: bool = False
+        self._level_hold_debug_listener_ref = None
         self._last_ws_connected: bool = False
         self.exec_trace_enabled: bool = False
         self.elevator_speed_enabled: bool = False
@@ -140,7 +143,7 @@ class Console:
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_hold'],
             }
 
             # ===== 通用补全原语 =====
@@ -819,7 +822,7 @@ class Console:
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':
-            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check>')
+            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_hold>')
             return
         if len(args) < 2:
             # 显示当前所有监视项状态
@@ -835,6 +838,8 @@ class Console:
             print(f'exec_trace 监视:             {et}')
             print(f'elevator_speed 监视:         {es}')
             print(f'level_check 监视:           {lc}')
+            lh = '启用' if self.level_hold_debug_enabled else '禁用'
+            print(f'拉扯(站点吸附)监视:         {lh}')
             return
         topic = args[1]
         if topic == 'pass_floor':
@@ -849,6 +854,8 @@ class Console:
             self._toggle_elevator_speed()
         elif topic == 'level_check':
             self._toggle_level_check_monitor()
+        elif topic in ('拉扯', 'station_hold'):
+            self._toggle_level_hold_debug()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -978,6 +985,55 @@ class Console:
             parts.append(f'car{cid}:{mark}(↑{up}↓{down})')
         line = '[DEBUG] 平层 ' + ' '.join(parts)
         print(line, file=sys.stderr)
+        sys.stderr.flush()
+
+    def _toggle_level_hold_debug(self) -> None:
+        if self.level_hold_debug_enabled:
+            self._disable_level_hold_debug()
+            print('[debug] 拉扯监视已禁用')
+        else:
+            self._enable_level_hold_debug()
+            print('[debug] 拉扯监视已启用(每次 level 翻转打印吸附状态)')
+
+    def _enable_level_hold_debug(self) -> None:
+        self.level_hold_debug_enabled = True
+        self._level_hold_debug_listener_ref = self._on_level_hold_debug_event
+        self.app.io.add_listener(self._level_hold_debug_listener_ref)
+        self._dump_level_hold_status()
+
+    def _disable_level_hold_debug(self) -> None:
+        self.level_hold_debug_enabled = False
+        ref = getattr(self, '_level_hold_debug_listener_ref', None)
+        if ref is not None:
+            self.app.io.remove_listener(ref)
+            self._level_hold_debug_listener_ref = None
+
+    async def _on_level_hold_debug_event(self, event: IOEvent) -> None:
+        sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None or sig[1] not in ('level_up', 'level_down'):
+            return
+        self._dump_level_hold_status()
+
+    def _dump_level_hold_status(self) -> None:
+        """打印每部车的站点吸附状态"""
+        parts = ['[DEBUG] 拉扯']
+        for cid in self.app.car_ids:
+            exe = self.app.executors[cid]
+            up = '✓' if exe._level_hold_active else '·'
+            # 反冲中?
+            corr = '⚡' if exe._level_correct_in_progress else ' '
+            # 当前平层
+            try:
+                ua = self.app.mapper.db_to_i(self.app.mapper.addr_input('level_up', cid))
+                da = self.app.mapper.db_to_i(self.app.mapper.addr_input('level_down', cid))
+                lu = self.app.io.get_input(ua)
+                ld = self.app.io.get_input(da)
+            except KeyError:
+                lu, ld = 0, 0
+            p = exe.car.position
+            pos = f'L{p}' if p is not None else '?'
+            parts.append(f'car{cid}{corr}{up}[{pos}↑{lu}↓{ld}]')
+        print(' '.join(parts), file=sys.stderr)
         sys.stderr.flush()
 
     async def _on_pass_floor_event(self, event: IOEvent) -> None:
