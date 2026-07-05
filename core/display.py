@@ -56,21 +56,55 @@ class DisplayEncoder:
             )
         return self.floor_display[floor]
 
+    # ---- 核心 API：数字 → 笔画 ---- #
+
+    # 第 N 位（0=最右）的 7 段管笔画偏移
+    #   pos=0 → a-g（个位）
+    #   pos=1 → h-n（十位）
+    #   pos=2 → o-v（百位，预留）
+    _SEGMENT_OFFSETS = [
+        str.maketrans('abcdefg', 'hijklmn'),  # pos=1
+        str.maketrans('abcdefg', 'opqrstv'),  # pos=2
+    ]
+
+    def number_to_segments(self, number: int) -> Set[str]:
+        """任意数字 → 笔画名集合（自动分配多位 7 段管）"""
+        segments: Set[str] = set()
+        for pos, ch in enumerate(reversed(str(number).zfill(2))):
+            seg = self.get_segments_for_glyph(ch)
+            if pos > 0:
+                seg = {s.translate(self._SEGMENT_OFFSETS[pos - 1]) for s in seg}
+            segments.update(seg)
+        return segments
+
+    # ---- 保留接口（委托给 number_to_segments） ---- #
+
     def get_segments_for_floor(self, floor: int) -> Set[str]:
-        """楼层 → 笔画名集合（十位 h-n + 个位 a-g）"""
-        return self.get_tens_segments(floor).union(self.get_units_segments(floor))
+        """楼层 → 笔画名集合（兼容旧接口：使用 floor_display 做字符映射）"""
+        glyph = self.get_glyph_for_floor(floor)
+        # 标准数字字符（0-9）→ 正常多位数格式化
+        if glyph.isdigit() and len(glyph) == 1:
+            return self.number_to_segments(floor)
+        # 自定义字符（A、F、E 等）→ 字符显示在个位（a-g），十位从楼层数字计算
+        units = self.get_segments_for_glyph(glyph)
+        tens_glyph = str(floor)[-2] if len(str(floor)) >= 2 else '0'
+        tens_seg = self.get_segments_for_glyph(tens_glyph)
+        tens = {s.translate(self._SEGMENT_OFFSETS[0]) for s in tens_seg}
+        return tens.union(units)
 
     def get_units_segments(self, floor: int) -> Set[str]:
-        """个位数笔画（a-g，低位 7 段管）"""
-        return self.get_segments_for_glyph(self.get_glyph_for_floor(floor))
+        """个位数笔画（a-g），兼容旧调用"""
+        return self.get_segments_for_glyph(str(floor)[-1])
 
     def get_tens_segments(self, floor: int) -> Set[str]:
-        """十位数笔画（h-n，高位 7 段管）；<10 楼补 '0'→ 显示 '09'"""
-        tens_glyph = str(floor // 10) if floor >= 10 else '0'
-        seg = self.get_segments_for_glyph(tens_glyph)
-        # a→h, b→i, c→j, d→k, e→l, f→m, g→n
-        shift = str.maketrans('abcdefg', 'hijklmn')
-        return {s.translate(shift) for s in seg}
+        """十位数笔画（h-n），兼容旧调用"""
+        ch = str(floor)[-2] if len(str(floor)) >= 2 else '0'
+        seg = self.get_segments_for_glyph(ch)
+        return {s.translate(self._SEGMENT_OFFSETS[0]) for s in seg}
+
+    def _digit_to_segments(self, digit: int) -> Set[str]:
+        """数字的一位（0-9）→ 字符 → 笔画（a-g）"""
+        return self.get_segments_for_glyph(str(digit))
 
     def get_segments_for_glyph(self, glyph: str) -> Set[str]:
         """字符 → 笔画名集合"""
