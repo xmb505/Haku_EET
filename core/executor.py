@@ -209,7 +209,7 @@ class ActionExecutor:
             if await self._try_complete_init_if_at_target():
                 return
             dir_glyph = '↑' if not was_up else '↓'
-            self._log(f'[exec] 触到 1 限位 → 反向 {dir_glyph} 全速运行，'
+            self._log(f'[exec] car{self.car_id} 触到 1 限位 → 反向 {dir_glyph} 全速运行，'
                       f'等待平层信号从 L{self._init_base_floor} 计数到 L{self._init_target_floor}')
             return
 
@@ -242,7 +242,7 @@ class ActionExecutor:
                 down_now = self.io.get_input(addr_down)
                 # 每条 level event 都打日志（真模式调试时看时序用）
                 self._log(
-                    f'[exec]   level event {name}={event.bit} '
+                    f'[exec] car{self.car_id} level {name}={event.bit} '
                     f'cache(up={up_now}, down={down_now}) '
                     f'active={self._init_perfect_leveling_active} '
                     f'pos={self.car.position} target={self._init_target_floor}'
@@ -256,16 +256,15 @@ class ActionExecutor:
                     was_up = self.init_direction == 'up'
                     step = -1 if was_up else 1
                     new_pos = pos + step
-                    self._log(f'[exec] 平层 L{pos} → L{new_pos} (目标 L{self._init_target_floor})')
+                    self._log(f'[exec] car{self.car_id} 平层 L{pos} → L{new_pos} (目标 L{self._init_target_floor})')
                     self.car.position = new_pos
                     # 实时更新 7 段显示
                     await self.display.show_number(new_pos, self.car_id)
                     self.car.display = new_pos
                     # 到达目标 → 完成
                     if new_pos == self._init_target_floor:
-                        self._log(f'[exec] INIT 到达 L{new_pos}, 全刹(7) → 停电机 → 100ms → 释放')
-                        await self.motor.set_brake_level(7)
-                        await self._stop_motion()
+                        self._log(f'[exec] car{self.car_id} INIT 到达 L{new_pos}, 全刹→停车→保持(7)')
+                        await self.motor.hold_stop()
                         self.car.direction = Direction.IDLE
                         # 灭方向灯
                         await self.motor.set_direction_indicator(None)
@@ -273,7 +272,7 @@ class ActionExecutor:
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
-                        self._log(f'[exec] ✓ INITIALIZE 完成，停在 L{new_pos}')
+                        self._log(f'[exec] car{self.car_id} ✓ INITIALIZE 完成，停在 L{new_pos}')
                         await self._complete_action()
                     return
                 elif up_now == 0 and down_now == 0 and self._init_perfect_leveling_active:
@@ -320,8 +319,7 @@ class ActionExecutor:
     async def _try_complete_init_if_at_target(self) -> bool:
         """如果反向开始前 position == target，直接完成 INITIALIZE"""
         if self.car.position == self._init_target_floor:
-            await self.motor.set_brake_level(7)
-            await self._stop_motion()
+            await self.motor.hold_stop()
             self.car.direction = Direction.IDLE
             await self.motor.set_direction_indicator(None)
             await asyncio.sleep(0.1)  # 等 100ms 停稳
@@ -364,9 +362,8 @@ class ActionExecutor:
             # 先全刹(7档=三刹全开)再停电机,防止惯性滑过完美平层区。
             # 之前只调 _stop_motion()(断电机),车靠惯性滑到上平层区,
             # level_down 变 FALSE,导致 1/3/4 号车"没有完美平层"。
-            self._log(f'[exec] 到达 L{new_pos}, 全刹(7) motor=停 → 100ms → 释放刹车')
-            await self.motor.set_brake_level(7)
-            await self._stop_motion()
+            self._log(f'[exec] car{self.car_id} 到 L{new_pos}, 全刹→停→保持(7)')
+            await self.motor.hold_stop()
             self.decel_state = ''
             self.car.direction = Direction.IDLE
             # 灭方向灯
@@ -477,7 +474,7 @@ class ActionExecutor:
                 await self.motor.start(high_speed=True, direction='up')
                 self.waiting_sensor = ('top_limit_1', 1)
                 self.car.direction = Direction.UP
-                self._log(f'[exec] 初始化: 朝 ↑ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
+                self._log(f'[exec] car{self.car_id} 初始化: 朝 ↑ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
                 return
             # 已在限位 → 直接进入反向计数模式
             self.car.position = self._init_base_floor
@@ -506,7 +503,7 @@ class ActionExecutor:
                 await self.motor.start(high_speed=True, direction='down')
                 self.waiting_sensor = ('bottom_limit_1', 1)
                 self.car.direction = Direction.DOWN
-                self._log(f'[exec] 初始化: 朝 ↓ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
+                self._log(f'[exec] car{self.car_id} 初始化: 朝 ↓ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
                 return
             self.car.position = self._init_base_floor
             self._init_reverse_mode = True

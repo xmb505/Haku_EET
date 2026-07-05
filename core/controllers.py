@@ -85,6 +85,25 @@ class MotorController:
         """
         await self.set_brakes(0, 0, 0)
 
+    async def hold_stop(self) -> None:
+        """单次写入:全刹(7档)+停电机+清接触器,同时到 PLC
+
+        这是"到站停车"的专用方法:刹车和电机停在一笔 HTTP POST 里,
+        防止分两次写入时(刹车在 tick N,停电机在 tick N+1)之间 20ms 的自由滑行。
+
+        手动模式 / _all_outputs_off 等不应使用此方法(需分开控制)。
+        """
+        await self.io_write.set_many({
+            self.mapper.addr_output('up_contactor', self.car_id): 0,
+            self.mapper.addr_output('down_contactor', self.car_id): 0,
+            self.mapper.addr_output('high_speed_contactor', self.car_id): 0,
+            self.mapper.addr_output('low_speed_contactor', self.car_id): 0,
+            self.mapper.addr_output('motor_start', self.car_id): 0,
+            self.mapper.addr_output('brake_1', self.car_id): 1,
+            self.mapper.addr_output('brake_2', self.car_id): 1,
+            self.mapper.addr_output('brake_3', self.car_id): 1,
+        })
+
     async def set_direction_indicator(self, direction: str | None) -> None:
         """设置上下行方向指示灯
 
