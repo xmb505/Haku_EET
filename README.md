@@ -176,7 +176,7 @@ pytest tests/test_executor.py -v     # 单跑 executor
 ## 已知约束
 
 - **点位表是 IO 真相来源**：`tools/gen_io_config.py` 是它的消费端，改点位表后重跑脚本
-- **首版只支持 1 部电梯**：config 里 `elevator.car_id` 决定实例化哪部
+- **支持最多 6 部电梯**：`config.yaml` 里 `elevator.car_ids` 决定实例化哪些轿厢（默认全部 6 部），改完需重启程序生效
 - **首版算法只响应内召**：外召按钮点位已映射但未启用（算法直接忽略 hall_call）
 - **IO2HTTP 必须先于 Haku_EET 启动**：否则 HTTP POST 会失败
 

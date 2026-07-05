@@ -11,7 +11,7 @@ import tty
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .app import CAR_IDS, App
+from .app import App
 from .io_client import IOEvent
 
 
@@ -89,16 +89,16 @@ class Console:
         """'1,2,3' / '1-3' / 'all' / '5' → list[int]，失败抛 ValueError"""
         s = s.strip()
         if s == 'all':
-            return list(CAR_IDS)
+            return list(self.app.car_ids)
         # 范围: 1-6
         if '-' in s:
             parts = s.split('-', 1)
             lo, hi = int(parts[0]), int(parts[1])
-            return [i for i in range(lo, hi + 1) if i in CAR_IDS]
+            return [i for i in range(lo, hi + 1) if i in self.app.car_ids]
         # 逗号列表
         ids = [int(x.strip()) for x in s.split(',') if x.strip()]
         for cid in ids:
-            if cid not in CAR_IDS:
+            if cid not in self.app.car_ids:
                 raise ValueError(f'无效轿厢 ID: {cid}')
         return ids
 
@@ -125,6 +125,9 @@ class Console:
         from pathlib import Path
 
         class HakuCompleter(Completer):
+            def __init__(self, car_ids: list[int]):
+                self.car_ids = car_ids
+
             cmds = sorted([f'/{c}' for c in self._commands])
             commands_with_subs: dict[str, list[str]] = {
                 '/car': ['init', 'call', 'status', 'manual', 'auto'],
@@ -172,7 +175,7 @@ class Console:
                   '1,a'   → 补 all
                   'all,'  → 补空（_parse_car_list 不支持 all,1 这种）
                 """
-                candidates = [str(c) for c in CAR_IDS] + ['all']
+                candidates = [str(c) for c in self.car_ids] + ['all']
 
                 # word 含 ',' → 按最后 token 前缀匹配
                 if ',' in word:
@@ -180,7 +183,7 @@ class Console:
                         # 已确定的逗号列表 → 补剩余数字
                         # (排除 all:_parse_car_list 不支持 all,1)
                         used = self._parse_used_car_ids(word)
-                        remaining = [c for c in CAR_IDS if c not in used]
+                        remaining = [c for c in self.car_ids if c not in used]
                         yield from self._yield_options(
                             [str(c) for c in remaining], '')
                         return
@@ -204,7 +207,7 @@ class Console:
                     if not token:
                         continue
                     if token == 'all':
-                        used.update(CAR_IDS)
+                        used.update(self.car_ids)
                     elif '-' in token:
                         try:
                             lo_s, hi_s = token.split('-', 1)
@@ -308,7 +311,7 @@ class Console:
                 return False
 
         session = PromptSession(
-            completer=HakuCompleter(),
+            completer=HakuCompleter(car_ids=self.app.car_ids),
             history=FileHistory(str(Path.home() / '.haku_eet_history')),
             complete_style=CompleteStyle.READLINE_LIKE,
         )
@@ -412,7 +415,7 @@ class Console:
 
     async def cmd_cars(self, args: list[str]) -> None:
         print('已启用的轿厢:')
-        for cid in CAR_IDS:
+        for cid in self.app.car_ids:
             print(f'  - car {cid}')
 
     async def cmd_car(self, args: list[str]) -> None:
@@ -446,8 +449,8 @@ class Console:
 
         # 单 car
         car_id = car_ids[0]
-        if car_id not in set(CAR_IDS):
-            print(f'无效轿厢 ID: {car_id}（有效值: {CAR_IDS}）')
+        if car_id not in set(self.app.car_ids):
+            print(f'无效轿厢 ID: {car_id}（有效值: {self.app.car_ids}）')
             return
 
         self.current_car_id = car_id
@@ -852,7 +855,7 @@ class Console:
 
     def _enable_pass_floor_monitor(self) -> None:
         self.pass_floor_monitor_enabled = True
-        for cid in CAR_IDS:
+        for cid in self.app.car_ids:
             try:
                 up_addr = self.app.mapper.db_to_i(
                     self.app.mapper.addr_input('level_up', cid)
@@ -883,7 +886,7 @@ class Console:
 
     async def _on_pass_floor_event(self, event: IOEvent) -> None:
         """IO listener：扫描所有车的 level_up & level_down，detect 完美平层上升沿"""
-        for cid in CAR_IDS:
+        for cid in self.app.car_ids:
             try:
                 up_addr = self.app.mapper.db_to_i(
                     self.app.mapper.addr_input('level_up', cid)
@@ -985,10 +988,10 @@ class Console:
         切换 /car N 后旧车会被静默禁掉。新行为：所有车同步切换。
         """
         self.exec_trace_enabled = not self.exec_trace_enabled
-        for cid in CAR_IDS:
+        for cid in self.app.car_ids:
             self.app.executors[cid].exec_log_enabled = self.exec_trace_enabled
         status = '启用' if self.exec_trace_enabled else '禁用'
-        print(f'[debug] exec_trace 监视已{status}（全部 {len(CAR_IDS)} 部轿厢）')
+        print(f'[debug] exec_trace 监视已{status}（全部 {len(self.app.car_ids)} 部轿厢）')
 
     def _toggle_elevator_speed(self) -> None:
         if self.elevator_speed_enabled:
@@ -1000,7 +1003,7 @@ class Console:
         self.elevator_speed_enabled = True
         speed_map = {'high_speed': '高速', 'decel': '减速', '': '停止'}
         print('[debug] elevator_speed 已启用（监视 6 部电梯档位变化）')
-        for cid in CAR_IDS:
+        for cid in self.app.car_ids:
             label = speed_map.get(self.app.executors[cid].decel_state, '?')
             print(f'[debug] car{cid} 当前: {label}')
         self._elevator_speed_task = asyncio.create_task(self._poll_elevator_speed())
@@ -1015,12 +1018,12 @@ class Console:
     async def _poll_elevator_speed(self) -> None:
         speed_map = {'high_speed': '高速', 'decel': '减速', '': '停止'}
         last_states: dict[int, str] = {}
-        for cid in CAR_IDS:
+        for cid in self.app.car_ids:
             last_states[cid] = self.app.executors[cid].decel_state
         try:
             while self.elevator_speed_enabled:
                 await asyncio.sleep(0.2)
-                for cid in CAR_IDS:
+                for cid in self.app.car_ids:
                     current = self.app.executors[cid].decel_state
                     if current != last_states.get(cid):
                         last_states[cid] = current

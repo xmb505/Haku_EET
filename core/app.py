@@ -24,8 +24,8 @@ from .io_mapper import IOMapper
 from .player import Car, CarState, Direction
 from .virtual_plc import VirtualPLC
 
-# 支持的轿厢范围
-CAR_IDS = [1, 2, 3, 4, 5, 6]
+# 默认轿厢范围(若 config.yaml 里 elevator.car_ids 未配置)
+DEFAULT_CAR_IDS = [1, 2, 3, 4, 5, 6]
 
 
 class App:
@@ -69,7 +69,12 @@ class App:
         self._executor_tasks: dict[int, asyncio.Task] = {}
 
         building = self.config['building']
-        for cid in CAR_IDS:
+        # 从 config 读 car_ids,默认 [1..6]
+        # 注意:car_ids 在启动时确定,/reload 不会动态增删车
+        self.car_ids: list[int] = list(
+            self.config.get('elevator', {}).get('car_ids', DEFAULT_CAR_IDS)
+        )
+        for cid in self.car_ids:
             self.cars[cid] = Car(car_id=cid)
             self.action_queues[cid] = ActionQueue()
             self.pending_calls[cid] = []
@@ -118,7 +123,7 @@ class App:
         self.io.add_listener(self._on_io_event)
 
         building = self.config.get('building', {})
-        for cid in CAR_IDS:
+        for cid in self.car_ids:
             task = asyncio.create_task(
                 self.executors[cid].run_loop(self.action_queues[cid])
             )
@@ -126,7 +131,7 @@ class App:
 
         if self.simulate:
             self.virtual_plcs: dict[int, VirtualPLC] = {}
-            for cid in CAR_IDS:
+            for cid in self.car_ids:
                 vplc = VirtualPLC(
                     io=self.io,
                     mapper=self.mapper,
@@ -139,7 +144,7 @@ class App:
                 )
                 self.virtual_plcs[cid] = vplc
                 vplc.start()
-            print(f'[vplc] 已启动 {len(CAR_IDS)} 部虚拟 PLC')
+            print(f'[vplc] 已启动 {len(self.car_ids)} 部虚拟 PLC')
 
     async def stop(self) -> None:
         if self.simulate:
@@ -246,7 +251,7 @@ class App:
         building = self.config['building']
         io2http = self.config['io2http']
         self.io._tick_interval = max(0.01, io2http.get('tick_interval_ms', 100) / 1000.0)
-        for cid in CAR_IDS:
+        for cid in self.car_ids:
             self.executors[cid].top_base_floor = building['top_base_floor']
             self.executors[cid].bottom_base_floor = building['bottom_base_floor']
             self.executors[cid].init_direction = self.config['elevator']['initialization_direction']
@@ -339,7 +344,7 @@ class App:
         self.manual_mode[cid] = False
 
     async def clear_outputs(self) -> None:
-        for cid in CAR_IDS:
+        for cid in self.car_ids:
             writes: dict[str, int] = {}
             for sig in self.mapper.all_output_signals(cid):
                 if sig == 'ready':

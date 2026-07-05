@@ -216,3 +216,44 @@ async def test_batch_init(app: App):
     assert app.cars[1].position == 5
     assert app.cars[2].position == 6
     assert app.cars[3].position == 7
+
+
+def test_car_ids_loaded_from_config():
+    """验证 car_ids 从 config.yaml 加载,默认全跑"""
+    a = App(
+        config_path=CONFIG_PATH,
+        io_config_path=IO_CONFIG_PATH,
+        display_config_path=DISPLAY_PATH,
+        simulate=True,
+    )
+    # config.yaml 默认 [1, 2, 3, 4, 5, 6]
+    assert a.car_ids == [1, 2, 3, 4, 5, 6]
+    # 对应的 car/executor/action_queue 都已实例化
+    for cid in a.car_ids:
+        assert cid in a.cars
+        assert cid in a.executors
+        assert cid in a.action_queues
+    # car_ids 外的车不应存在
+    assert 99 not in a.cars
+
+
+def test_car_ids_partial(tmp_path):
+    """验证 car_ids 配置为子集时,只实例化配置的车"""
+    import yaml
+    # 复制一份 config,把 car_ids 改成 [2, 4]
+    cfg = yaml.safe_load(CONFIG_PATH.read_text())
+    cfg['elevator']['car_ids'] = [2, 4]
+    custom_cfg = tmp_path / 'config.yaml'
+    custom_cfg.write_text(yaml.safe_dump(cfg, allow_unicode=True))
+
+    a = App(
+        config_path=custom_cfg,
+        io_config_path=IO_CONFIG_PATH,
+        display_config_path=DISPLAY_PATH,
+        simulate=True,
+    )
+    assert a.car_ids == [2, 4]
+    assert 2 in a.cars
+    assert 4 in a.cars
+    assert 1 not in a.cars
+    assert 3 not in a.cars
