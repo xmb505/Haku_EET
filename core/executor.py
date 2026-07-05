@@ -47,6 +47,7 @@ class ActionExecutor:
         on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
         io_write: IOClient | None = None,
         station_hold_enabled: bool = False,
+        action_queue: ActionQueue | None = None,
     ) -> None:
         self.car = car
         self.io = io
@@ -60,6 +61,8 @@ class ActionExecutor:
         self.on_emergency_stop = on_emergency_stop
         # 站点吸附总开关（默认关，运行时由 app.set_station_hold 切换）
         self._station_hold_enabled: bool = station_hold_enabled
+        # ActionQueue 引用:auto-seek 撞 1 限位 fallback 入队 INITIALIZE 用
+        self.action_queue = action_queue
 
         # 控制器(不直接摸 IO)。
         # io_write:多车场景下 App 给每部电梯独立的写 IOClient,避免 6 部车
@@ -125,6 +128,9 @@ class ActionExecutor:
         self._level_correct_in_progress: bool = False
         # 微调 Events
         self._relevel_future: asyncio.Future | None = None
+        # Auto-seek 状态:active 时车在下跑找 (↑1↓1),找到了就停 + 激活 hold,
+        # 撞 bottom_limit_1 就 fallback 入队 INITIALIZE down 1
+        self._auto_seek_active: bool = False
 
     # ===== 主循环 =====
 
@@ -172,6 +178,30 @@ class ActionExecutor:
                         # 2 限位释放(manual 推出去了)→ 自动恢复 READY
                         self.car.state = CarState.READY
                         self._log(f'[exec] car{self.car_id} 2 限位释放 → 自动恢复 READY')
+
+                # Auto-seek 检查:在 active 时下跑,找 (↑1↓1) 立即停;撞 1 限位 fallback
+                if self._auto_seek_active:
+                    if sig2[1] in ('level_up', 'level_down'):
+                        try:
+                            up = self.io.get_input(self.mapper.db_to_i(
+                                self.mapper.addr_input('level_up', self.car_id)))
+                            dn = self.io.get_input(self.mapper.db_to_i(
+                                self.mapper.addr_input('level_down', self.car_id)))
+                            if up == 1 and dn == 1:
+                                self._auto_seek_active = False
+                                self._log(f'[exec] car{self.car_id} auto-seek 找到 (↑1↓1) → 停车')
+                                await self._arrive_and_brake()
+                                return
+                        except KeyError:
+                            pass
+                    elif sig2[1] in ('bottom_limit_1', 'top_limit_1') and event.bit == 1:
+                        # 撞 1 限位 → fallback 入队 INITIALIZE down 1
+                        self._auto_seek_active = False
+                        self._log(f'[exec] car{self.car_id} auto-seek 撞 1 限位 → 入队 INITIALIZE down 1')
+                        if self.action_queue is not None:
+                            await self.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
+                        return
+
             # 站点吸附反冲中:level_up/down=1 → 通知等待协程(即使 current_action=None)
             if (sig2 is not None and sig2[0] == self.car_id
                     and sig2[1] in ('level_up', 'level_down') and event.bit == 1
@@ -363,6 +393,8 @@ class ActionExecutor:
         if self._relevel_future is not None and not self._relevel_future.done():
             self._relevel_future.cancel()
         self._relevel_future = None
+        # Auto-seek 同步清场:否则 limit_2 撞 FAULT 后还可能继续往 (↑1↓1) 走
+        self._auto_seek_active = False
         if self.on_emergency_stop is not None:
             await self.on_emergency_stop()
 
@@ -527,6 +559,24 @@ class ActionExecutor:
 
     def is_station_hold_enabled(self) -> bool:
         return self._station_hold_enabled
+
+    async def start_auto_seek_down(self) -> None:
+        """Auto-seek 启动:低俗下跑找最近一个 (↑1↓1),找到了就停 + 激活 hold
+
+        与 INITIALIZE 的区别:
+          - 不预置位置、不需要反向计数、不走基站段
+          - 只要找到 (↑1↓1) 立刻停车（依靠 hold 反冲修正过冲）
+          - 撞 bottom_limit_1 才 fallback 入队 INITIALIZE（要完整的基站段确认位置）
+          - 撞 limit_2 → _emergency_stop（FAULT 锁死,manual 推出后自动恢复）
+        """
+        if self._auto_seek_active:
+            return  # 已经在跑
+        await self.motor.release_brakes()
+        await self.motor.set_direction_indicator('down')
+        await self.motor.start(high_speed=False, direction='down')  # 低速
+        self.car.direction = Direction.DOWN
+        self._auto_seek_active = True
+        self._log(f'[exec] car{self.car_id} auto-seek 启动:低俗下跑找 (↑1↓1)')
 
     # ===== Action 展开 =====
 

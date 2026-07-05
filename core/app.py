@@ -118,6 +118,7 @@ class App:
                 on_action_done=self._make_on_action_done(cid),
                 on_emergency_stop=self._make_on_emergency_stop(cid),
                 station_hold_enabled=self.config['elevator'].get('station_hold', False),
+                action_queue=self.action_queues[cid],
             )
 
         self._executor_task: asyncio.Task | None = None
@@ -360,9 +361,9 @@ class App:
             dn_now = self.io.get_input(dn_addr)
 
             if up_now == 0 and dn_now == 0:
-                # 车散在楼层之间,自动寻站:入队 INITIALIZE（默认方向走 config/down）
-                action = Action(ActionKind.INITIALIZE, floor=1)
-                await self.action_queues[cid].put(action)
+                # 车散在楼层之间 → auto-seek: 直接下跑找最近一个 (↑1↓1)
+                # 不入队 INITIALIZE（不需要反向、不需要计数到 L1）
+                await exe.start_auto_seek_down()
                 auto_seek_count += 1
             else:
                 # 已在平层区(含偏离 1,0 / 0,1),立即激活 hold
