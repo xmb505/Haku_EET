@@ -157,34 +157,40 @@ class Console:
                 )
 
             def _complete_car_id(self, word):
-                """car_id 补全：支持单数字、逗号列表、all、范围 1-6
+                """car_id 补全：单数字 / 'all' / 逗号列表 / 范围
 
-                解析 word 里已出现的车号，剩下未出现的作为候补。
-                例：
-                  ''      → 补 1,2,3,4,5,6
-                  '1,'    → 补 2,3,4,5,6
+                候选池 = 6 个单数字 + 'all' 关键字。
+                含 ',' 时按最后一个 token 前缀匹配；纯 token 时按 word 前缀匹配。
+                例:
+                  ''      → 补 1,2,3,4,5,6,all
+                  'a'     → 补 all
+                  'al'    → 补 all
+                  'all'   → 补 all
+                  '1'     → 补 1
+                  '1,'    → 补 2,3,4,5,6（不含 all,因 all 后不能接 ,）
                   '1,2,'  → 补 3,4,5,6
-                  '1,2'   → 补 3,4,5,6（last_token='2' 不匹配任何剩余前缀时跳过）
+                  '1,a'   → 补 all
+                  'all,'  → 补空（_parse_car_list 不支持 all,1 这种）
                 """
-                if word == '':
-                    yield from self._yield_options(
-                        [str(c) for c in CAR_IDS], word)
+                candidates = [str(c) for c in CAR_IDS] + ['all']
+
+                # word 含 ',' → 按最后 token 前缀匹配
+                if ',' in word:
+                    if word.endswith(','):
+                        # 已确定的逗号列表 → 补剩余数字
+                        # (排除 all:_parse_car_list 不支持 all,1)
+                        used = self._parse_used_car_ids(word)
+                        remaining = [c for c in CAR_IDS if c not in used]
+                        yield from self._yield_options(
+                            [str(c) for c in remaining], '')
+                        return
+                    # 中间状态: '1,2' / '1,a' → 按 last_token 过滤全部候选
+                    last_token = word.rsplit(',', 1)[-1]
+                    yield from self._yield_options(candidates, last_token)
                     return
 
-                # 解析已输入的车号
-                used = self._parse_used_car_ids(word)
-                remaining = [c for c in CAR_IDS if c not in used]
-
-                # word 以 ',' 结尾 → 补剩余车号(单数字)
-                if word.endswith(','):
-                    yield from self._yield_options(
-                        [str(c) for c in remaining], '')
-                    return
-
-                # 中间状态(如 '1,2') → 按最后一个 token 前缀匹配
-                last_token = word.rsplit(',', 1)[-1]
-                yield from self._yield_options(
-                    [str(c) for c in remaining], last_token)
+                # 单 token: 'a' / '1' / 'all'
+                yield from self._yield_options(candidates, word)
 
             def _parse_used_car_ids(self, word):
                 """从 '1,2,3-5,all,6,' 之类的字符串解析已出现的车号集合
