@@ -26,9 +26,9 @@ HELP_TEXT = """
   /debug show exec_trace          toggle executor [exec] 执行日志
   /debug show elevator_speed      toggle 速度档位监视（高速/减速/刹车）
   /debug show level_check        toggle 平层检测（每次 level 翻转打印所有车 ↑↓）
-  /debug show station_hold       toggle 站点吸附（吸附状态 / 反冲中 / 平层信号）
-  /module <name> [on|off]        切换功能模块（默认关）
-    模块: station_hold  站点吸附——到站后保持完美平层,偏离全速反冲
+  /debug show station_seek       toggle 站点吸附（吸附状态 / 反冲中 / 平层信号）
+  /module <name> [true|false]        切换功能模块（默认关）
+    模块: station_seek  站点吸附——到站后保持完美平层,偏离全速反冲
   /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
@@ -81,8 +81,8 @@ class Console:
         self.level_check_monitor_enabled: bool = False
         self._level_check_last_state: dict[int, tuple[int, int]] = {}
         self._level_check_listener_ref = None
-        self.level_hold_debug_enabled: bool = False
-        self._level_hold_debug_listener_ref = None
+        self.level_seek_debug_enabled: bool = False
+        self._level_seek_debug_listener_ref = None
         self._last_ws_connected: bool = False
         self.exec_trace_enabled: bool = False
         self.elevator_speed_enabled: bool = False
@@ -142,13 +142,13 @@ class Console:
             commands_with_subs: dict[str, list[str]] = {
                 '/car': ['init', 'call', 'status', 'manual', 'auto'],
                 '/debug': ['show'],
-                '/module': ['station_hold'],
+                '/module': ['station_seek'],
             }
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_hold'],
-                'station_hold': ['on', 'off'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek'],
+                'station_seek': ['true', 'false'],
             }
 
             # ===== 通用补全原语 =====
@@ -886,47 +886,47 @@ class Console:
 
         用法:
           /module                       显示所有模块当前状态
-          /module station_hold          显示当前状态
-          /module station_hold on|off   切换
+          /module station_seek          显示当前状态
+          /module station_seek on|off   切换
         """
         if not args:
             self._show_module_status()
             return
 
         name = args[0]
-        if name in ('station_hold', '拉扯'):
+        if name in ('station_seek', '拉扯'):
             if len(args) < 2:
-                # 显示 station_hold 当前状态
-                enabled = self.app.station_hold_enabled()
-                print(f'station_hold(站点吸附): {"启用" if enabled else "禁用"}')
+                # 显示 station_seek 当前状态
+                enabled = self.app.station_seek_enabled()
+                print(f'station_seek(站点吸附): {"启用" if enabled else "禁用"}')
                 return
             arg = args[1].lower()
-            if arg == 'on':
-                result = await self.app.set_station_hold(True)
-                print('[module] station_hold 已启用')
+            if arg == 'true':
+                result = await self.app.set_station_seek(True)
+                print('[module] station_seek 已启用')
                 if result['auto_seek_count'] > 0:
                     print(f'  → 自动寻站入队: {result["auto_seek_count"]} 部车(INIT down 1)')
                 if result['activate_count'] > 0:
                     print(f'  → 立即激活吸附: {result["activate_count"]} 部车')
                 if result['skipped_count'] > 0:
                     print(f'  → 忙车/手动模式跳过: {result["skipped_count"]} 部(等到站后激活)')
-            elif arg == 'off':
-                await self.app.set_station_hold(False)
-                print('[module] station_hold 已禁用(清 hold + 取消反冲)')
+            elif arg == 'false':
+                await self.app.set_station_seek(False)
+                print('[module] station_seek 已禁用(清吸附 + 取消反冲)')
             else:
-                print(f'未知开关: {args[1]}（要 on 或 off）')
+                print(f'未知开关: {args[1]}（要 true 或 false）')
         else:
             print(f'未知模块: {name}')
-            print('当前支持: station_hold')
+            print('当前支持: station_seek')
 
     def _show_module_status(self) -> None:
         """打印所有模块当前状态"""
-        enabled = self.app.station_hold_enabled()
-        print(f'station_hold(站点吸附): {"启用" if enabled else "禁用"}')
+        enabled = self.app.station_seek_enabled()
+        print(f'station_seek(站点吸附): {"启用" if enabled else "禁用"}')
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':
-            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_hold>')
+            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek>')
             return
         if len(args) < 2:
             # 显示当前所有监视项状态
@@ -942,7 +942,7 @@ class Console:
             print(f'exec_trace 监视:             {et}')
             print(f'elevator_speed 监视:         {es}')
             print(f'level_check 监视:           {lc}')
-            lh = '启用' if self.level_hold_debug_enabled else '禁用'
+            lh = '启用' if self.level_seek_debug_enabled else '禁用'
             print(f'拉扯(站点吸附)监视:         {lh}')
             return
         topic = args[1]
@@ -958,8 +958,8 @@ class Console:
             self._toggle_elevator_speed()
         elif topic == 'level_check':
             self._toggle_level_check_monitor()
-        elif topic in ('拉扯', 'station_hold'):
-            self._toggle_level_hold_debug()
+        elif topic in ('拉扯', 'station_seek'):
+            self._toggle_level_seek_debug()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -1091,28 +1091,28 @@ class Console:
         print(line, file=sys.stderr)
         sys.stderr.flush()
 
-    def _toggle_level_hold_debug(self) -> None:
-        if self.level_hold_debug_enabled:
-            self._disable_level_hold_debug()
+    def _toggle_level_seek_debug(self) -> None:
+        if self.level_seek_debug_enabled:
+            self._disable_level_seek_debug()
             print('[debug] 拉扯监视已禁用')
         else:
-            self._enable_level_hold_debug()
+            self._enable_level_seek_debug()
             print('[debug] 拉扯监视已启用(每次 level 翻转打印吸附状态)')
 
-    def _enable_level_hold_debug(self) -> None:
-        self.level_hold_debug_enabled = True
-        self._level_hold_debug_listener_ref = self._on_level_hold_debug_event
-        self.app.io.add_listener(self._level_hold_debug_listener_ref)
-        self._dump_level_hold_status()
+    def _enable_level_seek_debug(self) -> None:
+        self.level_seek_debug_enabled = True
+        self._level_seek_debug_listener_ref = self._on_level_seek_debug_event
+        self.app.io.add_listener(self._level_seek_debug_listener_ref)
+        self._dump_level_seek_status()
 
-    def _disable_level_hold_debug(self) -> None:
-        self.level_hold_debug_enabled = False
-        ref = getattr(self, '_level_hold_debug_listener_ref', None)
+    def _disable_level_seek_debug(self) -> None:
+        self.level_seek_debug_enabled = False
+        ref = getattr(self, '_level_seek_debug_listener_ref', None)
         if ref is not None:
             self.app.io.remove_listener(ref)
-            self._level_hold_debug_listener_ref = None
+            self._level_seek_debug_listener_ref = None
 
-    async def _on_level_hold_debug_event(self, event: IOEvent) -> None:
+    async def _on_level_seek_debug_event(self, event: IOEvent) -> None:
         sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
         if sig is None or sig[1] not in ('level_up', 'level_down'):
             return
@@ -1120,14 +1120,14 @@ class Console:
         # 手动模式(paused)下别刷屏
         if cid and cid in self.app.executors and self.app.executors[cid].paused:
             return
-        self._dump_level_hold_status()
+        self._dump_level_seek_status()
 
-    def _dump_level_hold_status(self) -> None:
+    def _dump_level_seek_status(self) -> None:
         """打印每部车的站点吸附状态"""
         parts = ['[DEBUG] 拉扯']
         for cid in self.app.car_ids:
             exe = self.app.executors[cid]
-            up = '✓' if exe._level_hold_active else '·'
+            up = '✓' if exe._level_seek_active else '·'
             # 反冲中?
             corr = '⚡' if exe._level_correct_in_progress else ' '
             # 当前平层

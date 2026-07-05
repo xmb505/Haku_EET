@@ -117,15 +117,12 @@ class App:
                 bottom_base_floor=building['bottom_base_floor'],
                 on_action_done=self._make_on_action_done(cid),
                 on_emergency_stop=self._make_on_emergency_stop(cid),
-                station_hold_enabled=self.config['elevator'].get('station_hold', False),
+                station_seek_enabled=self.config['elevator'].get('station_seek', False),
                 action_queue=self.action_queues[cid],
             )
 
         self._executor_task: asyncio.Task | None = None
         self.debug = False
-
-        # bitmap 触发自动寻站
-        self._auto_seek_started: bool = False
 
     @property
     def car(self) -> Car:
@@ -196,15 +193,6 @@ class App:
 
     async def _on_io_event(self, event: IOEvent) -> None:
         """IO 变化事件 → 查找归属轿厢 → 交给对应 executor"""
-        # 首次 bitmap 到达:自动寻站——每部 UNKNOWN 车启动 INIT
-        if not self._auto_seek_started and self.io._input_cache and not self.simulate:
-            self._auto_seek_started = True
-            for cid in self.car_ids:
-                if self.cars[cid].state == CarState.UNKNOWN and not self.executors[cid].paused:
-                    direction = self.config.get('elevator', {}).get('initialization_direction', 'up')
-                    print(f'[auto_seek] car{cid} {direction}, 目标 L1')
-                    await self.reset(direction=direction, target_floor=1, car_id=cid)
-
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
         cid = sig[0] if sig and sig[0] else self.current_car_id
         if cid in self.executors:
@@ -304,13 +292,13 @@ class App:
             self.executors[cid].bottom_base_floor = building['bottom_base_floor']
             self.executors[cid].init_direction = self.config['elevator']['initialization_direction']
         # 站点吸附开关 reload 同步
-        station_hold_enabled = self.config['elevator'].get('station_hold', False)
+        station_seek_enabled = self.config['elevator'].get('station_seek', False)
         for cid in self.car_ids:
-            self.executors[cid].set_station_hold(station_hold_enabled)
+            self.executors[cid].set_station_seek(station_seek_enabled)
         print(f'[reload] config reloaded: init_dir={self.config["elevator"]["initialization_direction"]}, '
-              f'station_hold={station_hold_enabled}')
+              f'station_seek={station_seek_enabled}')
 
-    async def set_station_hold(self, enabled: bool) -> dict[str, int]:
+    async def set_station_seek(self, enabled: bool) -> dict[str, int]:
         """切换站点吸附开关（高层 API，console 用）
 
         对所有轿厢:打开 flag。
@@ -327,7 +315,7 @@ class App:
         for cid in self.car_ids:
             exe = self.executors[cid]
             # 先设置 flag（executor 内部清/保留激活态）
-            exe.set_station_hold(enabled)
+            exe.set_station_seek(enabled)
 
             if not enabled:
                 continue
@@ -352,8 +340,8 @@ class App:
                 )
             except KeyError:
                 # 没有 level 信号（异常配置）→ 仅激活 hold,让下次 IO 事件触发检查
-                exe._level_hold_active = True
-                await exe._level_hold_check()
+                exe._level_seek_active = True
+                await exe._level_seek_check()
                 activate_count += 1
                 continue
 
@@ -367,8 +355,8 @@ class App:
                 auto_seek_count += 1
             else:
                 # 已在平层区(含偏离 1,0 / 0,1),立即激活 hold
-                exe._level_hold_active = True
-                await exe._level_hold_check()
+                exe._level_seek_active = True
+                await exe._level_seek_check()
                 activate_count += 1
 
         return {
@@ -377,10 +365,10 @@ class App:
             'skipped_count': skipped_count,
         }
 
-    def station_hold_enabled(self) -> bool:
+    def station_seek_enabled(self) -> bool:
         """是否有任意一部车的吸附开启"""
         return any(
-            self.executors[cid].is_station_hold_enabled()
+            self.executors[cid].is_station_seek_enabled()
             for cid in self.car_ids
         )
 

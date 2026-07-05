@@ -22,10 +22,10 @@ elevator:
   #              up   = 全速上行到上基站触限位 → 反向低速向下到 L1（不常见）
   # 比赛现场如有变动，改这里然后在 REPL 跑 /reload
   initialization_direction: down
-  # 站点吸附(station_hold)：到站停车后自动监测平层,偏离全速反冲回完美平层
-  # 默认关闭——只在需要时启用（/module station_hold on）。开了之后会保持
+  # 站点吸附(station_seek)：到站停车后自动监测平层,偏离全速反冲回完美平层
+  # 默认关闭——只在需要时启用（/module station_seek on）。开了之后会保持
   # 每部车在完美平层 ✓(↑1↓1),平层丢失立刻反冲。
-  station_hold: false
+  station_seek: false
 
 algorithm:
   # 首版只实现 simple_internal_call（响应内召，到目标层开门）

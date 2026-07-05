@@ -46,7 +46,7 @@ class ActionExecutor:
         on_action_done: Callable[[Action], Awaitable[None]] | None = None,
         on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
         io_write: IOClient | None = None,
-        station_hold_enabled: bool = False,
+        station_seek_enabled: bool = False,
         action_queue: ActionQueue | None = None,
     ) -> None:
         self.car = car
@@ -59,8 +59,8 @@ class ActionExecutor:
         self.bottom_base_floor = bottom_base_floor
         self.on_action_done = on_action_done
         self.on_emergency_stop = on_emergency_stop
-        # 站点吸附总开关（默认关，运行时由 app.set_station_hold 切换）
-        self._station_hold_enabled: bool = station_hold_enabled
+        # 站点吸附总开关（默认关，运行时由 app.set_station_seek 切换）
+        self._station_seek_enabled: bool = station_seek_enabled
         # ActionQueue 引用:auto-seek 撞 1 限位 fallback 入队 INITIALIZE 用
         self.action_queue = action_queue
 
@@ -120,10 +120,10 @@ class ActionExecutor:
         self.debug = False
         self.exec_log_enabled = False  # 是否打印 [exec] 执行日志（/debug show exec_trace 控制）
         # 停车保持模式:到站后持续监听平层信号,偏离就反冲刹回
-        self._level_hold_active: bool = False
+        self._level_seek_active: bool = False
         # 激活跳过一次:刚 _arrive_and_brake 激活后,跳过同 IO event 的 3d 检查,
         # 避免与 on_action_done 推入的下一个 MOVE 冲突（race condition）
-        self._level_hold_skip_next: bool = False
+        self._level_seek_skip_next: bool = False
         # 保持模式反冲中(防止重入)
         self._level_correct_in_progress: bool = False
         # 微调 Events
@@ -208,7 +208,7 @@ class ActionExecutor:
                     and self._relevel_future is not None):
                 self._relevel_future.set_result(True)
             # 事件驱动平层检测:level_up/level_down 变化 → 检查偏离启动反冲
-            await self._level_hold_check()
+            await self._level_seek_check()
             return
 
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
@@ -359,7 +359,7 @@ class ActionExecutor:
 
         # 3d. 保持模式:每个 IO 事件(不只是 level)都检查平层偏离,
         # 发现信号偏了立刻反冲刹回,不会因为没有 level 事件而"睡觉"。
-        await self._level_hold_check()
+        await self._level_seek_check()
 
         # 4. 等待特定传感器的动作（OPEN/CLOSE_DOOR 等）
         if self.waiting_sensor is None:
@@ -387,8 +387,8 @@ class ActionExecutor:
         self.current_action = None
         self.waiting_sensor = None
         # 站点吸附同步清场:否则下一次 IO event 还会触发 hold 反冲,电机重启撞限位
-        self._level_hold_active = False
-        self._level_hold_skip_next = False
+        self._level_seek_active = False
+        self._level_seek_skip_next = False
         self._level_correct_in_progress = False
         if self._relevel_future is not None and not self._relevel_future.done():
             self._relevel_future.cancel()
@@ -421,7 +421,7 @@ class ActionExecutor:
         MOVE 和 INIT 路径共用到站逻辑（消除三处重复代码）：
         1. hold_stop 单笔 HTTP POST 同时全刹+断电机（防止惯性过冲）
         2. 灭方向灯 + 100ms 等车停稳
-        3. 站点吸附使能则激活 level_hold,后续 _level_hold_check 持续监测平层
+        3. 站点吸附使能则激活 level_seek,后续 _level_seek_check 持续监测平层
         4. _complete_action 通知 app 层
 
         必须在 motor 接触器/刹车已经稳定后再调 _complete_action，
@@ -431,11 +431,11 @@ class ActionExecutor:
         self.car.direction = Direction.IDLE
         await self.motor.set_direction_indicator(None)
         await asyncio.sleep(0.1)
-        if self._station_hold_enabled:
-            self._level_hold_active = True
-            # 跳过激活后第一次 IO event 的 _level_hold_check,
+        if self._station_seek_enabled:
+            self._level_seek_active = True
+            # 跳过激活后第一次 IO event 的 _level_seek_check,
             # 避免与 _complete_action → on_action_done 推入的下一个 MOVE 冲突
-            self._level_hold_skip_next = True
+            self._level_seek_skip_next = True
         await self._complete_action()
 
     async def _apply_init_decel(self, remaining: int) -> None:
@@ -500,18 +500,18 @@ class ActionExecutor:
                 await self.motor.set_speed(high_speed=False)
                 self.decel_state = 'decel'
 
-    async def _level_hold_check(self) -> None:
+    async def _level_seek_check(self) -> None:
         """保持模式:检查平层信号,偏离就反冲刹回（纯事件驱动，无轮询）
 
-        在 _level_hold_active 时,每次 IO 事件后调用。
+        在 _level_seek_active 时,每次 IO 事件后调用。
         如果检测到偏离✓(↑1↓1),立刻释放刹车、向偏离反方向微动、
         等待信号恢复后刹停。不 sleep / 无心跳定时器。
         """
-        if self._level_correct_in_progress or not self._level_hold_active:
+        if self._level_correct_in_progress or not self._level_seek_active:
             return
         # 刚激活 hold 时跳过第一次检查,避免与 _complete_action 推入的下一个 MOVE 冲突
-        if self._level_hold_skip_next:
-            self._level_hold_skip_next = False
+        if self._level_seek_skip_next:
+            self._level_seek_skip_next = False
             return
 
         up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
@@ -540,25 +540,25 @@ class ActionExecutor:
             self._relevel_future = None
             self._level_correct_in_progress = False
 
-    def set_station_hold(self, enabled: bool) -> None:
+    def set_station_seek(self, enabled: bool) -> None:
         """切换站点吸附总开关（不影响正在运行的车）
 
         开启只改 flag,实际激活由 _arrive_and_brake 在车空闲时点开。
         关闭则立即卸载:清 hold_active + 取消任何反冲中的 future。
 
-        注意:auto-seek 逻辑由 app.set_station_hold 负责,本方法只管 flag。
+        注意:auto-seek 逻辑由 app.set_station_seek 负责,本方法只管 flag。
         """
-        self._station_hold_enabled = enabled
+        self._station_seek_enabled = enabled
         if not enabled:
             # 关闭:清当前活跃 + 取消反冲
-            self._level_hold_active = False
+            self._level_seek_active = False
             if self._relevel_future is not None and not self._relevel_future.done():
                 self._relevel_future.cancel()
             self._relevel_future = None
             self._level_correct_in_progress = False
 
-    def is_station_hold_enabled(self) -> bool:
-        return self._station_hold_enabled
+    def is_station_seek_enabled(self) -> bool:
+        return self._station_seek_enabled
 
     async def start_auto_seek_down(self) -> None:
         """Auto-seek 启动:低俗下跑找最近一个 (↑1↓1),找到了就停 + 激活 hold
@@ -583,7 +583,7 @@ class ActionExecutor:
     async def _start_action(self, action: Action) -> None:
         """展开 Action 为 IO 序列，设置等待传感器"""
         # 有新动作 → 退出保持模式,取消任何正在进行的反冲
-        self._level_hold_active = False
+        self._level_seek_active = False
         if self._relevel_future is not None and not self._relevel_future.done():
             self._relevel_future.cancel()
         self._relevel_future = None
