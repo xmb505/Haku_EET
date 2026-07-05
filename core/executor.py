@@ -176,8 +176,9 @@ class ActionExecutor:
             # 对 init up：触顶后反向往下，每层 --position 到 target
             # 对 init down：触底后反向往上，每层 ++position 到 target
             was_up = self.init_direction == 'up'
-            await self.motor.start(high_speed=True,
-                                   direction='down' if was_up else 'up')
+            reverse_dir = 'down' if was_up else 'up'
+            await self.motor.start(high_speed=True, direction=reverse_dir)
+            await self.motor.set_direction_indicator(reverse_dir)
             self.car.position = self._init_base_floor  # 基站位（11 或 -1）
             self._init_reverse_mode = True
             self._init_last_reverse_pos = None
@@ -235,12 +236,15 @@ class ActionExecutor:
                     new_pos = pos + step
                     self._log(f'[exec] 平层 L{pos} → L{new_pos} (目标 L{self._init_target_floor})')
                     self.car.position = new_pos
+                    # 实时更新 7 段显示
+                    await self.display.show_number(new_pos, self.car_id)
+                    self.car.display = new_pos
                     # 到达目标 → 完成
                     if new_pos == self._init_target_floor:
                         await self._stop_motion()
                         self.car.direction = Direction.IDLE
-                        await self.display.show_number(new_pos, self.car_id)
-                        self.car.display = new_pos
+                        # 灭方向灯
+                        await self.motor.set_direction_indicator(None)
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
@@ -293,6 +297,7 @@ class ActionExecutor:
         if self.car.position == self._init_target_floor:
             await self._stop_motion()
             self.car.direction = Direction.IDLE
+            await self.motor.set_direction_indicator(None)
             await self.display.show_number(self.car.position, self.car_id)
             self.car.display = self.car.position
             self._init_reverse_mode = False
@@ -320,6 +325,10 @@ class ActionExecutor:
         new_pos = self.car.position
         remaining = target - new_pos  # 还差几层（正数=还需上行，负数=还需下行）
 
+        # 实时更新 7 段显示：每经过一层就刷新(中间层也显示)
+        await self.display.show_number(new_pos, self.car_id)
+        self.car.display = new_pos
+
         if self.debug:
             print(f'[exec] level reached: pos={new_pos} target={target} remaining={remaining} decel_state={self.decel_state}')
 
@@ -328,9 +337,8 @@ class ActionExecutor:
             await self._stop_motion()
             self.decel_state = ''
             self.car.direction = Direction.IDLE
-            # 更新 7 段显示
-            await self.display.show_number(target, self.car_id)
-            self.car.display = target
+            # 灭方向灯
+            await self.motor.set_direction_indicator(None)
             await self._complete_action()
             return
 
@@ -430,6 +438,7 @@ class ActionExecutor:
             top_addr = self.mapper.db_to_i(self.mapper.addr_input('top_limit_1', self.car_id))
             at_limit = self.io.get_input(top_addr) == 1
             if not at_limit:
+                await self.motor.set_direction_indicator('up')
                 await self.motor.start(high_speed=True, direction='up')
                 self.waiting_sensor = ('top_limit_1', 1)
                 self.car.direction = Direction.UP
@@ -441,6 +450,7 @@ class ActionExecutor:
             self._init_last_reverse_pos = None
             self.waiting_sensor = None
             self.car.direction = Direction.UP
+            await self.motor.set_direction_indicator('down')
             if await self._try_complete_init_if_at_target():
                 return
             self._log(f'[exec] 初始化: 已在顶站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
@@ -448,6 +458,7 @@ class ActionExecutor:
             bot_addr = self.mapper.db_to_i(self.mapper.addr_input('bottom_limit_1', self.car_id))
             at_limit = self.io.get_input(bot_addr) == 1
             if not at_limit:
+                await self.motor.set_direction_indicator('down')
                 await self.motor.start(high_speed=True, direction='down')
                 self.waiting_sensor = ('bottom_limit_1', 1)
                 self.car.direction = Direction.DOWN
@@ -458,24 +469,27 @@ class ActionExecutor:
             self._init_last_reverse_pos = None
             self.waiting_sensor = None
             self.car.direction = Direction.DOWN
+            await self.motor.set_direction_indicator('up')
             if await self._try_complete_init_if_at_target():
                 return
             self._log(f'[exec] 初始化: 已在底站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
 
     async def _start_move_up(self) -> None:
-        """上行启动：释放刹车 + 高速 + 上 + 电机（之后靠 _on_level_reached 减速）"""
+        """上行启动：释放刹车 + 点亮上行灯 + 高速 + 上 + 电机（之后靠 _on_level_reached 减速）"""
         self.decel_state = 'high_speed'
         self._last_level_up = 0
         await self.motor.release_brakes()
+        await self.motor.set_direction_indicator('up')
         await self.motor.start(high_speed=True, direction='up')
         self.car.direction = Direction.UP
         self.waiting_sensor = None  # 不等特定传感器，靠 level_up 边沿推进
 
     async def _start_move_down(self) -> None:
-        """下行启动：释放刹车 + 高速 + 下 + 电机"""
+        """下行启动：释放刹车 + 点亮下行灯 + 高速 + 下 + 电机"""
         self.decel_state = 'high_speed'
         self._last_level_down = 0
         await self.motor.release_brakes()
+        await self.motor.set_direction_indicator('down')
         await self.motor.start(high_speed=True, direction='down')
         self.car.direction = Direction.DOWN
         self.waiting_sensor = None

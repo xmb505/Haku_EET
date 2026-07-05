@@ -390,3 +390,96 @@ async def test_release_brakes_called_on_move_start(setup):
         await task
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_direction_indicator_during_move(setup):
+    """验证上下行启动时点亮对应方向灯,中间层更新显示,到达 target 后灭灯
+
+    /car 1 call 4 场景:1→2→3→4
+    - 启动:up_indicator=1, down_indicator=0
+    - 经过 2 楼:display 应显示 2
+    - 经过 3 楼:display 应显示 3
+    - 到达 4 楼:up_indicator=0, down_indicator=0
+    """
+    car, io, mapper, display, executor = setup
+    queue = ActionQueue()
+    car.state = CarState.READY
+    car.position = 1
+    car.target_floor = 4
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    await queue.put(Action(ActionKind.MOVE_UP))
+    await asyncio.sleep(0.02)
+
+    # 启动:上行灯亮,下行灯灭
+    assert io.get_output(mapper.addr_output('up_indicator', 1)) == 1
+    assert io.get_output(mapper.addr_output('down_indicator', 1)) == 0
+    assert car.display == 1  # 启动时还没移动,显示原位置
+
+    # 经过 2 楼:display 应更新到 2 (中间层)
+    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await asyncio.sleep(0.02)
+    assert car.position == 2
+    assert car.display == 2  # ← 关键:中间层也要更新
+    # 灯保持
+    assert io.get_output(mapper.addr_output('up_indicator', 1)) == 1
+
+    # 经过 3 楼:display 应更新到 3
+    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await asyncio.sleep(0.02)
+    assert car.position == 3
+    assert car.display == 3
+
+    # 到达 4 楼 (target):display=4 + 两个灯都清
+    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await asyncio.sleep(0.02)
+    assert car.position == 4
+    assert car.display == 4
+    assert car.state == CarState.READY
+    assert car.direction == Direction.IDLE
+    assert io.get_output(mapper.addr_output('up_indicator', 1)) == 0
+    assert io.get_output(mapper.addr_output('down_indicator', 1)) == 0
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_direction_indicator_during_move_down(setup):
+    """下行方向灯验证:MOVE_DOWN 后 down_indicator=1"""
+    car, io, mapper, display, executor = setup
+    queue = ActionQueue()
+    car.state = CarState.READY
+    car.position = 5
+    car.target_floor = 2
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    await queue.put(Action(ActionKind.MOVE_DOWN))
+    await asyncio.sleep(0.02)
+
+    assert io.get_output(mapper.addr_output('up_indicator', 1)) == 0
+    assert io.get_output(mapper.addr_output('down_indicator', 1)) == 1
+
+    # 经过 4 楼
+    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    await asyncio.sleep(0.02)
+    assert car.position == 4
+    assert car.display == 4
+
+    # 到达 2 楼,两个灯都清
+    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    await asyncio.sleep(0.02)
+    assert car.position == 2
+    assert io.get_output(mapper.addr_output('up_indicator', 1)) == 0
+    assert io.get_output(mapper.addr_output('down_indicator', 1)) == 0
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

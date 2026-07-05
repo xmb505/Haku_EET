@@ -75,6 +75,21 @@ class MotorController:
         """
         await self.set_brakes(0, 0, 0)
 
+    async def set_direction_indicator(self, direction: str | None) -> None:
+        """设置上下行方向指示灯
+
+        direction:
+            'up'   → 上行灯亮,下行灯灭
+            'down' → 下行灯亮,上行灯灭
+            None   → 两个灯都灭(默认状态)
+        """
+        up = 1 if direction == 'up' else 0
+        down = 1 if direction == 'down' else 0
+        await self.io.set_many({
+            self.mapper.addr_output('up_indicator', self.car_id): up,
+            self.mapper.addr_output('down_indicator', self.car_id): down,
+        })
+
     async def set_speed(self, high_speed: bool) -> None:
         """切换速度接触器（运行时）"""
         await self.io.set_many({
