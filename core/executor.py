@@ -164,8 +164,6 @@ class ActionExecutor:
                     and sig2[1] in ('level_up', 'level_down') and event.bit == 1
                     and self._relevel_future is not None):
                 self._relevel_future.set_result(True)
-            # 即使没有当前动作也要检查平层偏离（停车后被偷摸拉走）
-            await self._level_hold_check()
             return
 
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
