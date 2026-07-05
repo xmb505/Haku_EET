@@ -1123,7 +1123,7 @@ class Console:
         # 触发车没有任何 seek 活跃状态:不刷
         if cid and cid in self.app.executors:
             exe = self.app.executors[cid]
-            if not exe._level_seek_active and not exe._level_seek_correct_in_progress and not exe._auto_seek_active:
+            if not exe._level_seek_active and not exe._level_correct_in_progress and not exe._auto_seek_active:
                 return
         self._dump_level_seek_status()
 
