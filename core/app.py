@@ -254,6 +254,10 @@ class App:
         cid = car_id if car_id is not None else self.current_car_id
         if floor in self.pending_calls[cid]:
             return
+        # 车已经在目标层 → 不残留 stale 条目（否则 call 当前层再 call 别层
+        # 会留下 pending=[当前层],到达别层后被 algoritm 拉回去）
+        if self.cars[cid].position == floor:
+            return
         self.pending_calls[cid].append(floor)
         self.cars[cid].target_floor = floor
         await self._tick(cid)
