@@ -202,11 +202,19 @@ class ActionExecutor:
                             await self.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
                         return
 
-            # 站点吸附反冲中:level_up/down=1 → 通知等待协程(即使 current_action=None)
+            # 站点吸附反冲中:level_up/down=1 → 只在 (↑1↓1) 时通知等待协程
             if (sig2 is not None and sig2[0] == self.car_id
                     and sig2[1] in ('level_up', 'level_down') and event.bit == 1
                     and self._relevel_future is not None):
-                self._relevel_future.set_result(True)
+                try:
+                    up = self.io.get_input(self.mapper.db_to_i(
+                        self.mapper.addr_input('level_up', self.car_id)))
+                    dn = self.io.get_input(self.mapper.db_to_i(
+                        self.mapper.addr_input('level_down', self.car_id)))
+                    if up == 1 and dn == 1:
+                        self._relevel_future.set_result(True)
+                except KeyError:
+                    pass
             # 事件驱动平层检测:level_up/level_down 变化 → 检查偏离启动反冲
             await self._level_seek_check()
             return
@@ -350,11 +358,17 @@ class ActionExecutor:
                     await self._on_level_reached(direction=Direction.UP)
                 elif name == 'level_down' and self.current_action.kind == ActionKind.MOVE_DOWN:
                     await self._on_level_reached(direction=Direction.DOWN)
-            # 3c. 停车微调:上/下平层触发 → 通知等待协程(事件驱动,不 sleep)
-            # 反冲方向: 上行偏了用 high_speed down correction,等 level_down=1
-            #           下行偏了用 high_speed up correction,等 level_up=1
+            # 3c. 停车反冲中:只在两个平层信号同时=1时通知等待协程,不在任何 level=1 就停
             if name in ('level_up', 'level_down') and event.bit == 1 and self._relevel_future is not None:
-                self._relevel_future.set_result(True)
+                try:
+                    up = self.io.get_input(self.mapper.db_to_i(
+                        self.mapper.addr_input('level_up', self.car_id)))
+                    dn = self.io.get_input(self.mapper.db_to_i(
+                        self.mapper.addr_input('level_down', self.car_id)))
+                    if up == 1 and dn == 1:
+                        self._relevel_future.set_result(True)
+                except KeyError:
+                    pass
             return
 
         # 3d. 保持模式:每个 IO 事件(不只是 level)都检查平层偏离,
