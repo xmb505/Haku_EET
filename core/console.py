@@ -126,107 +126,180 @@ class Console:
 
         class HakuCompleter(Completer):
             cmds = sorted([f'/{c}' for c in self._commands])
-            # 有子命令的一级命令（输入完整名 + Tab 自动补空格进二级）
             commands_with_subs: dict[str, list[str]] = {
                 '/car': ['init', 'call', 'status', 'manual', 'auto'],
                 '/debug': ['show'],
             }
-            # 子命令的下级参数补全
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed'],
             }
 
+            # ===== 通用补全原语 =====
+
+            def _yield_options(self, options, word, append_space=False):
+                """从 options 匹配 word 前缀 → 生成 Completion"""
+                for opt in options:
+                    if word == '' or opt.startswith(word):
+                        yield Completion(
+                            opt + (' ' if append_space else ''),
+                            start_position=-len(word) if word else 0,
+                        )
+
+            # ===== 5 个补全函数 =====
+
+            def _complete_cmd(self, word):
+                """一级命令补全：完整匹配 + Tab 自动跟空格进二级"""
+                yield from self._yield_options(
+                    self.cmds, word,
+                    append_space=(word in self.commands_with_subs),
+                )
+
+            def _complete_car_id(self, word):
+                """car_id 补全：支持单数字、逗号列表、all、范围 1-6
+
+                解析 word 里已出现的车号，剩下未出现的作为候补。
+                例：
+                  ''      → 补 1,2,3,4,5,6
+                  '1,'    → 补 2,3,4,5,6
+                  '1,2,'  → 补 3,4,5,6
+                  '1,2'   → 补 3,4,5,6（last_token='2' 不匹配任何剩余前缀时跳过）
+                """
+                if word == '':
+                    yield from self._yield_options(
+                        [str(c) for c in CAR_IDS], word)
+                    return
+
+                # 解析已输入的车号
+                used = self._parse_used_car_ids(word)
+                remaining = [c for c in CAR_IDS if c not in used]
+
+                # word 以 ',' 结尾 → 补剩余车号(单数字)
+                if word.endswith(','):
+                    yield from self._yield_options(
+                        [str(c) for c in remaining], '')
+                    return
+
+                # 中间状态(如 '1,2') → 按最后一个 token 前缀匹配
+                last_token = word.rsplit(',', 1)[-1]
+                yield from self._yield_options(
+                    [str(c) for c in remaining], last_token)
+
+            def _parse_used_car_ids(self, word):
+                """从 '1,2,3-5,all,6,' 之类的字符串解析已出现的车号集合
+
+                只接受 _parse_car_list 能解析的形态。
+                异常 token 忽略（不抛，补全不应让用户输入崩）。
+                """
+                used: set[int] = set()
+                for token in word.split(','):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    if token == 'all':
+                        used.update(CAR_IDS)
+                    elif '-' in token:
+                        try:
+                            lo_s, hi_s = token.split('-', 1)
+                            lo, hi = int(lo_s), int(hi_s)
+                            used.update(range(lo, hi + 1))
+                        except ValueError:
+                            pass
+                    elif token.isdigit():
+                        used.add(int(token))
+                return used
+
+            def _complete_sub_cmd(self, word, subs):
+                """二级子命令补全（如 /car 后 init/call/...）"""
+                yield from self._yield_options(subs, word)
+
+            def _complete_sub_arg(self, word, sub_cmd):
+                """三级参数补全（init→up/down, call→1-10, show→monitor 名）"""
+                if sub_cmd in self.sub_sub_args:
+                    yield from self._yield_options(
+                        self.sub_sub_args[sub_cmd], word)
+                    return
+                # 未知子命令 → 不补全
+                return
+
+            def _complete_init_floor(self, word):
+                """四级：/car N init up/down → 楼层号 1-10"""
+                yield from self._yield_options(
+                    [str(i) for i in range(1, 11)], word)
+
+            # ===== 主调度器 =====
+
             def get_completions(self, document, complete_event):
                 text = document.text_before_cursor
                 if not text.startswith('/'):
                     return
 
-                # 找到光标前最近一个空格，把输入分成"前缀"+"当前单词"
+                # 按最后一个空格切: prefix_text + current_word
                 last_space = text.rfind(' ')
                 prefix_text = text[:last_space + 1] if last_space >= 0 else ''
                 current_word = text[last_space + 1:] if last_space >= 0 else text
 
-                # 一级命令补全：还没输空格
+                # 1. 一级命令（还没输空格）
                 if not prefix_text.strip():
-                    matches = [c for c in self.cmds if c.startswith(current_word)]
-                    for m in matches:
-                        # 如果用户已经输完整的一级命令，且这个命令有子命令，
-                        # 自动补空格进二级（如 /car + Tab → /car _）
-                        is_exact_sub = current_word == m and m in self.commands_with_subs
-                        append = ' ' if is_exact_sub else ''
-                        yield Completion(m + append, start_position=-len(current_word))
+                    yield from self._complete_cmd(current_word)
                     return
 
-                # 二级子命令补全（/car 后）
                 parts = prefix_text.split()
-                if not parts:
-                    return
                 cmd = parts[0]
-                if cmd in self.commands_with_subs:
-                    subs = self.commands_with_subs[cmd]
-                    # /car 特殊处理：先补 car_id（数字或逗号列表），再补子命令
-                    if cmd == '/car':
-                        # 已经输入了 car_id（数字或逗号列表）→ 补子命令
-                        if len(parts) >= 2:
-                            raw = parts[1]
-                            if raw.isdigit() or ',' in raw or raw == 'all' or '-' in raw:
-                                # 落到下面普通子命令补全
-                                pass
-                            else:
-                                # 还没输 car_id → 补 car_id
-                                for cid in ('1', '2', '3', '4', '5', '6'):
-                                    if cid.startswith(current_word):
-                                        yield Completion(cid, start_position=-len(current_word))
-                                return
-                        else:
-                            # 还没输 car_id → 补 car_id
-                            for cid in ('1', '2', '3', '4', '5', '6'):
-                                if cid.startswith(current_word):
-                                    yield Completion(cid, start_position=-len(current_word))
-                            return
-                    # 普通子命令补全
-                    # /car:       parts = ['/car', '1', 'init']      → sub_cmd=parts[2]
-                    # /debug:     parts = ['/debug', 'show']          → sub_cmd=parts[1]
-                    sub_cmd_idx = 2 if cmd == '/car' else 1
 
-                    if len(parts) > sub_cmd_idx:
-                        # 已输入子命令 → 补子命令参数（sub_sub_args）
-                        sub_cmd = parts[sub_cmd_idx]
-                        if sub_cmd in self.sub_sub_args:
-                            sub_subs = self.sub_sub_args[sub_cmd]
-                            if current_word == '':
-                                for s in sub_subs:
-                                    yield Completion(s, start_position=0)
-                            else:
-                                for s in sub_subs:
-                                    if s.startswith(current_word):
-                                        yield Completion(s, start_position=-len(current_word))
-                            return
-                        # /car 四级补全：/car N init up/down → 楼层号
-                        if cmd == '/car' and len(parts) >= 4:
-                            sub_param = parts[3]
-                            if sub_cmd == 'init' and sub_param in ('up', 'down'):
-                                floors = [str(i) for i in range(1, 11)]
-                                if current_word == '':
-                                    for f in floors:
-                                        yield Completion(f, start_position=0)
-                                else:
-                                    for f in floors:
-                                        if f.startswith(current_word):
-                                            yield Completion(f, start_position=-len(current_word))
-                                return
+                # 2. 未知命令 = 不补
+                if cmd not in self.commands_with_subs:
+                    return
+
+                # 3. /car 路径：car_id → 子命令 → 三级参数 → 四级楼层
+                if cmd == '/car':
+                    # 3a. 还没 car_id → 补数字
+                    if len(parts) < 2:
+                        yield from self._complete_car_id(current_word)
                         return
+                    # 3b. car_id 还没输完整（不是数字/all/范围/逗号列表）
+                    raw = parts[1]
+                    if not self._looks_like_car_id(raw):
+                        yield from self._complete_car_id(current_word)
+                        return
+                    # 3c. car_id 已输完 → 补子命令
+                    if len(parts) < 3:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    sub_cmd = parts[2]
+                    # 3d. 子命令已输 → 补三级参数
+                    if len(parts) < 4:
+                        yield from self._complete_sub_arg(current_word, sub_cmd)
+                        return
+                    # 3e. /car init up/down → 四级楼层
+                    if (sub_cmd == 'init'
+                            and parts[3] in ('up', 'down')
+                            and len(parts) < 5):
+                        yield from self._complete_init_floor(current_word)
+                        return
+                    return
 
-                    # 还没输子命令：补子命令名
-                    if current_word == '':
-                        for s in subs:
-                            yield Completion(s, start_position=0)
-                    else:
-                        for s in subs:
-                            if s.startswith(current_word):
-                                yield Completion(s, start_position=-len(current_word))
+                # 4. /debug 路径：子命令 → 子命令参数
+                if cmd == '/debug':
+                    if len(parts) < 2:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    yield from self._complete_sub_arg(current_word, parts[1])
+                    return
+
+            @staticmethod
+            def _looks_like_car_id(raw: str) -> bool:
+                """判断 raw 是否像 car_id：纯数字 / all / 含 - / 含 , 且除 ,外都是数字"""
+                if raw == 'all' or raw.isdigit() or '-' in raw:
+                    return True
+                if ',' in raw:
+                    # '1,2,3' / '1,' / ',2' 之类
+                    stripped = raw.replace(',', '').replace(' ', '')
+                    return stripped.isdigit()
+                return False
 
         session = PromptSession(
             completer=HakuCompleter(),
@@ -900,10 +973,16 @@ class Console:
             pass
 
     def _toggle_exec_trace(self) -> None:
+        """toggle exec_trace：遍历全部 6 部电梯（和 elevator_speed 对齐）
+
+        早期版本只设 self.app.executor（=current_car_id 的 executor），
+        切换 /car N 后旧车会被静默禁掉。新行为：所有车同步切换。
+        """
         self.exec_trace_enabled = not self.exec_trace_enabled
-        self.app.executor.exec_log_enabled = self.exec_trace_enabled
+        for cid in CAR_IDS:
+            self.app.executors[cid].exec_log_enabled = self.exec_trace_enabled
         status = '启用' if self.exec_trace_enabled else '禁用'
-        print(f'[debug] exec_trace 监视已{status}')
+        print(f'[debug] exec_trace 监视已{status}（全部 {len(CAR_IDS)} 部轿厢）')
 
     def _toggle_elevator_speed(self) -> None:
         if self.elevator_speed_enabled:
