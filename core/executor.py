@@ -17,6 +17,7 @@ import sys
 from typing import Awaitable, Callable
 
 from .actions import Action, ActionKind, ActionQueue
+from .controllers import DoorController, MotorController
 from .display import DisplayEncoder
 from .io_client import IOClient, IOEvent
 from .io_mapper import IOMapper
@@ -55,6 +56,10 @@ class ActionExecutor:
         self.bottom_base_floor = bottom_base_floor
         self.on_action_done = on_action_done
         self.on_emergency_stop = on_emergency_stop
+
+        # 控制器（不直接摸 IO）
+        self.motor = MotorController(io, mapper, car_id)
+        self.door = DoorController(io, mapper, car_id)
 
         # 日志回调（外部可注入，让 REPL 能正确显示后台任务的 print）
         # 默认走 stderr（不会被 prompt_toolkit 吞掉）
@@ -171,13 +176,8 @@ class ActionExecutor:
             # 对 init up：触顶后反向往下，每层 --position 到 target
             # 对 init down：触底后反向往上，每层 ++position 到 target
             was_up = self.init_direction == 'up'
-            await self._set_outputs({
-                'up_contactor': 0 if was_up else 1,
-                'down_contactor': 1 if was_up else 0,
-                'high_speed_contactor': 1,
-                'low_speed_contactor': 0,
-                'motor_start': 1,
-            })
+            await self.motor.start(high_speed=True,
+                                   direction='down' if was_up else 'up')
             self.car.position = self._init_base_floor  # 基站位（11 或 -1）
             self._init_reverse_mode = True
             self._init_last_reverse_pos = None
@@ -338,23 +338,11 @@ class ActionExecutor:
         dist = abs(remaining)  # 距目标还有几层
         if dist >= 2:
             if self.decel_state != 'high_speed':
-                await self._set_outputs({
-                    'high_speed_contactor': 1,
-                    'low_speed_contactor': 0,
-                    'brake_1': 0,
-                    'brake_2': 0,
-                    'brake_3': 0,
-                })
+                await self.motor.set_speed(high_speed=True)
                 self.decel_state = 'high_speed'
         elif dist == 1:
             if self.decel_state != 'decel':
-                await self._set_outputs({
-                    'high_speed_contactor': 0,
-                    'low_speed_contactor': 1,
-                    'brake_1': 0,
-                    'brake_2': 0,
-                    'brake_3': 0,
-                })
+                await self.motor.set_speed(high_speed=False)
                 self.decel_state = 'decel'
 
     # ===== Action 展开 =====
@@ -388,18 +376,12 @@ class ActionExecutor:
                 await self._start_move_down()
 
             case ActionKind.OPEN_DOOR:
-                await self._set_outputs({
-                    'door_open_relay': 1,
-                    'door_close_relay': 0,
-                })
+                await self.door.open()
                 self.car.door_state = DoorState.OPENING
                 self.waiting_sensor = ('door_open_done', 1)
 
             case ActionKind.CLOSE_DOOR:
-                await self._set_outputs({
-                    'door_open_relay': 0,
-                    'door_close_relay': 1,
-                })
+                await self.door.close()
                 self.car.door_state = DoorState.CLOSING
                 self.waiting_sensor = ('door_close_done', 1)
 
@@ -448,11 +430,7 @@ class ActionExecutor:
             top_addr = self.mapper.db_to_i(self.mapper.addr_input('top_limit_1', self.car_id))
             at_limit = self.io.get_input(top_addr) == 1
             if not at_limit:
-                await self._set_outputs({
-                    'up_contactor': 1, 'down_contactor': 0,
-                    'high_speed_contactor': 1, 'low_speed_contactor': 0,
-                    'motor_start': 1,
-                })
+                await self.motor.start(high_speed=True, direction='up')
                 self.waiting_sensor = ('top_limit_1', 1)
                 self.car.direction = Direction.UP
                 self._log(f'[exec] 初始化: 朝 ↑ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
@@ -470,11 +448,7 @@ class ActionExecutor:
             bot_addr = self.mapper.db_to_i(self.mapper.addr_input('bottom_limit_1', self.car_id))
             at_limit = self.io.get_input(bot_addr) == 1
             if not at_limit:
-                await self._set_outputs({
-                    'up_contactor': 0, 'down_contactor': 1,
-                    'high_speed_contactor': 1, 'low_speed_contactor': 0,
-                    'motor_start': 1,
-                })
+                await self.motor.start(high_speed=True, direction='down')
                 self.waiting_sensor = ('bottom_limit_1', 1)
                 self.car.direction = Direction.DOWN
                 self._log(f'[exec] 初始化: 朝 ↓ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
@@ -489,19 +463,11 @@ class ActionExecutor:
             self._log(f'[exec] 初始化: 已在底站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
 
     async def _start_move_up(self) -> None:
-        """上行启动：高速 + 上 + 电机（之后靠 _on_level_reached 多级减速）"""
+        """上行启动：高速 + 上 + 电机（之后靠 _on_level_reached 减速）"""
         self.decel_state = 'high_speed'
         self._last_level_up = 0
-        await self._set_outputs({
-            'up_contactor': 1,
-            'down_contactor': 0,
-            'high_speed_contactor': 1,
-            'low_speed_contactor': 0,
-            'motor_start': 1,
-            'brake_1': 0,
-            'brake_2': 0,
-            'brake_3': 0,
-        })
+        await self.motor.start(high_speed=True, direction='up')
+        await self.motor.set_brakes(0, 0, 0)
         self.car.direction = Direction.UP
         self.waiting_sensor = None  # 不等特定传感器，靠 level_up 边沿推进
 
@@ -509,31 +475,14 @@ class ActionExecutor:
         """下行启动：高速 + 下 + 电机"""
         self.decel_state = 'high_speed'
         self._last_level_down = 0
-        await self._set_outputs({
-            'up_contactor': 0,
-            'down_contactor': 1,
-            'high_speed_contactor': 1,
-            'low_speed_contactor': 0,
-            'motor_start': 1,
-            'brake_1': 0,
-            'brake_2': 0,
-            'brake_3': 0,
-        })
+        await self.motor.start(high_speed=True, direction='down')
+        await self.motor.set_brakes(0, 0, 0)
         self.car.direction = Direction.DOWN
         self.waiting_sensor = None
 
     async def _stop_motion(self) -> None:
         """完全停车：清所有电机/接触器/制动"""
-        await self._set_outputs({
-            'up_contactor': 0,
-            'down_contactor': 0,
-            'high_speed_contactor': 0,
-            'low_speed_contactor': 0,
-            'motor_start': 0,
-            'brake_1': 0,
-            'brake_2': 0,
-            'brake_3': 0,
-        })
+        await self.motor.stop()
 
     async def _complete_action(self) -> None:
         """动作完成：更新 Car 状态 + 清接触器 + 触发回调"""
@@ -580,14 +529,6 @@ class ActionExecutor:
             await self.on_action_done(action)
 
     # ===== 内部辅助 =====
-
-    async def _set_outputs(self, signals: dict[str, int]) -> None:
-        """逻辑信号名 + 值 → 写 IO"""
-        writes = {}
-        for sig, val in signals.items():
-            db_addr = self.mapper.addr_output(sig, self.car_id)
-            writes[db_addr] = val
-        await self.io.set_many(writes)
 
     async def _all_outputs_off(self) -> None:
         """清所有输出（除 ready 信号外）"""
