@@ -696,6 +696,13 @@ class Console:
             await self.app._tick()
         print('[manual] 已退出手动控制')
 
+    def _fault_cars(self, car_ids: list[int]) -> list[int]:
+        """返回 car_ids 中处于 FAULT 状态的（2 限位撞过的车锁定）"""
+        from .player import CarState
+        return [cid for cid in car_ids
+                if cid in self.app.cars
+                and self.app.cars[cid].state == CarState.FAULT]
+
     async def _do_init(self, args: list[str]) -> None:
         """
         用法:
@@ -706,6 +713,12 @@ class Console:
         导致 init 误判"没在限位上"往上跑撞 2 限位。
         必须在第一次手动操作（如按轿内按钮）收到 IO2HTTP bitmap 后才能初始化。
         """
+        # FAULT 锁:只有 manual 可退出 2 限位
+        fault = self._fault_cars([self.current_car_id])
+        if fault:
+            print(f'[init] 拒绝: car{fault[0]} 处于 FAULT 状态（撞过 2 限位）')
+            print('       请先 /car N manual 推出 2 限位,ESC 退 manual 后自动恢复')
+            return
         if not self.app.io._input_cache:
             print('[init] 错误：尚未收到 PLC IO 状态（bitmap 为空）。')
             print('       请先操作一个按钮（如轿内选层按钮），')
@@ -780,6 +793,13 @@ class Console:
             print(f'  用法: /car {",".join(map(str,car_ids))} init <dir> <floor1,floor2,...>')
             return
 
+        # FAULT 锁:整批拒绝,告诉用户哪些车被锁
+        fault = self._fault_cars(car_ids)
+        if fault:
+            print(f'[batch init] 拒绝: car{fault} 处于 FAULT 状态（撞过 2 限位）')
+            print('              请先 /car N manual 推出 2 限位,ESC 后自动恢复')
+            return
+
         # 执行
         parts: list[str] = []
         for cid, d, f in zip(car_ids, dirs, floors):
@@ -808,6 +828,13 @@ class Console:
             print(f'楼层数量 ({len(floors)}) 与轿厢数量 ({N}) 不匹配')
             return
 
+        # FAULT 锁:整批拒绝
+        fault = self._fault_cars(car_ids)
+        if fault:
+            print(f'[batch call] 拒绝: car{fault} 处于 FAULT 状态（撞过 2 限位）')
+            print('              请先 /car N manual 推出 2 限位,ESC 后自动恢复')
+            return
+
         parts: list[str] = []
         for cid, f in zip(car_ids, floors):
             if self.app.manual_mode.get(cid, False):
@@ -824,6 +851,12 @@ class Console:
             floor = int(args[0])
         except ValueError:
             print(f'楼层必须是整数: {args[0]}')
+            return
+        # FAULT 锁
+        fault = self._fault_cars([self.current_car_id])
+        if fault:
+            print(f'[call] 拒绝: car{fault[0]} 处于 FAULT 状态（撞过 2 限位）')
+            print('       请先 /car N manual 推出 2 限位,ESC 退 manual 后自动恢复')
             return
         # 手动模式下自动切回 auto 再发内召
         if self.app.manual_mode.get(self.current_car_id, False):

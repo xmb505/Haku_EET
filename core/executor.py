@@ -118,6 +118,9 @@ class ActionExecutor:
         self.exec_log_enabled = False  # 是否打印 [exec] 执行日志（/debug show exec_trace 控制）
         # 停车保持模式:到站后持续监听平层信号,偏离就反冲刹回
         self._level_hold_active: bool = False
+        # 激活跳过一次:刚 _arrive_and_brake 激活后,跳过同 IO event 的 3d 检查,
+        # 避免与 on_action_done 推入的下一个 MOVE 冲突（race condition）
+        self._level_hold_skip_next: bool = False
         # 保持模式反冲中(防止重入)
         self._level_correct_in_progress: bool = False
         # 微调 Events
@@ -162,8 +165,13 @@ class ActionExecutor:
             # 即使没有当前动作也要检查保护逻辑（如 2 限位）
             sig2 = self.mapper.lookup_signal_by_i(event.i_addr)
             if sig2 is not None and sig2[0] == self.car_id:
-                if sig2[1] in ('bottom_limit_2', 'top_limit_2') and event.bit == 1:
-                    await self._emergency_stop(reason='limit_2_touched')
+                if sig2[1] in ('bottom_limit_2', 'top_limit_2'):
+                    if event.bit == 1:
+                        await self._emergency_stop(reason='limit_2_touched')
+                    elif event.bit == 0 and self.car.state == CarState.FAULT:
+                        # 2 限位释放(manual 推出去了)→ 自动恢复 READY
+                        self.car.state = CarState.READY
+                        self._log(f'[exec] car{self.car_id} 2 限位释放 → 自动恢复 READY')
             # 站点吸附反冲中:level_up/down=1 → 通知等待协程(即使 current_action=None)
             if (sig2 is not None and sig2[0] == self.car_id
                     and sig2[1] in ('level_up', 'level_down') and event.bit == 1
@@ -348,6 +356,13 @@ class ActionExecutor:
         # 如果有当前动作也清掉（不再等传感器）
         self.current_action = None
         self.waiting_sensor = None
+        # 站点吸附同步清场:否则下一次 IO event 还会触发 hold 反冲,电机重启撞限位
+        self._level_hold_active = False
+        self._level_hold_skip_next = False
+        self._level_correct_in_progress = False
+        if self._relevel_future is not None and not self._relevel_future.done():
+            self._relevel_future.cancel()
+        self._relevel_future = None
         if self.on_emergency_stop is not None:
             await self.on_emergency_stop()
 
@@ -386,6 +401,9 @@ class ActionExecutor:
         await asyncio.sleep(0.1)
         if self._station_hold_enabled:
             self._level_hold_active = True
+            # 跳过激活后第一次 IO event 的 _level_hold_check,
+            # 避免与 _complete_action → on_action_done 推入的下一个 MOVE 冲突
+            self._level_hold_skip_next = True
         await self._complete_action()
 
     async def _apply_init_decel(self, remaining: int) -> None:
@@ -459,6 +477,10 @@ class ActionExecutor:
         """
         if self._level_correct_in_progress or not self._level_hold_active:
             return
+        # 刚激活 hold 时跳过第一次检查,避免与 _complete_action 推入的下一个 MOVE 冲突
+        if self._level_hold_skip_next:
+            self._level_hold_skip_next = False
+            return
 
         up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
         dn = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
@@ -475,7 +497,8 @@ class ActionExecutor:
         self._log(f'[exec] car{self.car_id} 保持: {missing_dir}反冲(✓→↑{up_now}↓{dn_now})')
         self._relevel_future = asyncio.get_running_loop().create_future()
         await self.motor.release_brakes()
-        await self.motor.start(high_speed=True, direction=missing_dir)
+        # 低速微调:高速反冲会过冲过头、低速洗 1 次就好
+        await self.motor.start(high_speed=False, direction=missing_dir)
         try:
             await asyncio.wait_for(self._relevel_future, timeout=3.0)
         except asyncio.TimeoutError:
