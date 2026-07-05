@@ -68,8 +68,10 @@ class VirtualPLC:
         self._running = False
         self._task: asyncio.Task | None = None
         # 已触过哪个限位（防止重复触发）
-        self._last_limit_1_fired: bool = False
-        self._last_limit_2_fired: bool = False
+        self._last_top_limit_1_fired: bool = False
+        self._last_bottom_limit_1_fired: bool = False
+        self._last_top_limit_2_fired: bool = False
+        self._last_bottom_limit_2_fired: bool = False
         # level 信号脉冲任务（fire 1 → 200ms → 0）
         self._level_pulses: dict[str, asyncio.Task] = {}
         # 虚拟电梯内部位置（不写到 car.position——executor 自己跟踪，
@@ -130,8 +132,10 @@ class VirtualPLC:
             # 电机停 → 不动
             if not motor or (not up and not down):
                 moving_dir = 0
-                self._last_limit_1_fired = False
-                self._last_limit_2_fired = False
+                self._last_top_limit_1_fired = False
+                self._last_bottom_limit_1_fired = False
+                self._last_top_limit_2_fired = False
+                self._last_bottom_limit_2_fired = False
                 continue
 
             # 决定本 tick 的方向
@@ -153,33 +157,33 @@ class VirtualPLC:
                 # 1. 先检查 2 限位（如果 new_pos 越过 2 限位，立即触发 2 限位）
                 if moving_dir == 1 and new_pos >= self.top_base + 1:
                     self._pos = self.top_base + 1
-                    if not self._last_limit_2_fired:
+                    if not self._last_top_limit_2_fired:
                         self._fire_limit('top_limit_2')
-                        self._last_limit_2_fired = True
+                        self._last_top_limit_2_fired = True
                     continue
                 if moving_dir == -1 and new_pos <= self.bottom_base - 1:
                     self._pos = self.bottom_base - 1
-                    if not self._last_limit_2_fired:
+                    if not self._last_bottom_limit_2_fired:
                         self._fire_limit('bottom_limit_2')
-                        self._last_limit_2_fired = True
+                        self._last_bottom_limit_2_fired = True
                     continue
 
                 # 2. 检查 1 限位（base）→ 触发后停在 base，不移动
                 if moving_dir == 1 and new_pos >= self.top_base:
-                    if not self._last_limit_1_fired:
+                    if not self._last_top_limit_1_fired:
                         self._pos = self.top_base
                         self._fire_limit('top_limit_1')
-                        self._last_limit_1_fired = True
+                        self._last_top_limit_1_fired = True
                         # 置 0 停止前进，等 executor 反转方向后重新计时；
-                        # 否则 moxing_dir 保持 +1，floor_travel_time 到期后
+                        # 否则 moving_dir 保持 +1，floor_travel_time 到期后
                         # new_pos = 11 + 1 = 12 → 触发 2 限位（executor 还没反转）
                         moving_dir = 0
                     continue
                 if moving_dir == -1 and new_pos <= self.bottom_base:
-                    if not self._last_limit_1_fired:
+                    if not self._last_bottom_limit_1_fired:
                         self._pos = self.bottom_base
                         self._fire_limit('bottom_limit_1')
-                        self._last_limit_1_fired = True
+                        self._last_bottom_limit_1_fired = True
                         moving_dir = 0
                     continue
 

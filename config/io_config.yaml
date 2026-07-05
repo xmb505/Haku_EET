@@ -304,19 +304,20 @@ output:
       cabin_button_led_8: DB11.DBX8.1
       cabin_button_led_9: DB11.DBX8.2
       cabin_button_led_10: DB11.DBX8.3
-      segment_a: DB11.DBX8.5
-      segment_b: DB11.DBX8.6
-      segment_c: DB11.DBX8.7
-      segment_d: DB11.DBX9.0
-      segment_e: DB11.DBX9.1
-      segment_f: DB11.DBX9.2
-      segment_g: DB11.DBX9.3
-      segment_h: DB11.DBX9.4
-      segment_i: DB11.DBX9.5
-      segment_j: DB11.DBX9.6
-      segment_k: DB11.DBX9.7
-      segment_l: DB11.DBX10.0
-      segment_m: DB11.DBX10.1
+      segment_a: DB11.DBX8.4
+      segment_b: DB11.DBX8.5
+      segment_c: DB11.DBX8.6
+      segment_d: DB11.DBX8.7
+      segment_e: DB11.DBX9.0
+      segment_f: DB11.DBX9.1
+      segment_g: DB11.DBX9.2
+      segment_h: DB11.DBX9.3
+      segment_i: DB11.DBX9.4
+      segment_j: DB11.DBX9.5
+      segment_k: DB11.DBX9.6
+      segment_l: DB11.DBX9.7
+      segment_m: DB11.DBX10.0
+      segment_n: DB11.DBX10.1
       up_indicator: DB11.DBX10.2
       down_indicator: DB11.DBX10.3
       fault_indicator: DB11.DBX10.4
@@ -344,19 +345,20 @@ output:
       cabin_button_led_8: DB11.DBX13.1
       cabin_button_led_9: DB11.DBX13.2
       cabin_button_led_10: DB11.DBX13.3
-      segment_a: DB11.DBX13.5
-      segment_b: DB11.DBX13.6
-      segment_c: DB11.DBX13.7
-      segment_d: DB11.DBX14.0
-      segment_e: DB11.DBX14.1
-      segment_f: DB11.DBX14.2
-      segment_g: DB11.DBX14.3
-      segment_h: DB11.DBX14.4
-      segment_i: DB11.DBX14.5
-      segment_j: DB11.DBX14.6
-      segment_k: DB11.DBX14.7
-      segment_l: DB11.DBX15.0
-      segment_m: DB11.DBX15.1
+      segment_a: DB11.DBX13.4
+      segment_b: DB11.DBX13.5
+      segment_c: DB11.DBX13.6
+      segment_d: DB11.DBX13.7
+      segment_e: DB11.DBX14.0
+      segment_f: DB11.DBX14.1
+      segment_g: DB11.DBX14.2
+      segment_h: DB11.DBX14.3
+      segment_i: DB11.DBX14.4
+      segment_j: DB11.DBX14.5
+      segment_k: DB11.DBX14.6
+      segment_l: DB11.DBX14.7
+      segment_m: DB11.DBX15.0
+      segment_n: DB11.DBX15.1
       up_indicator: DB11.DBX15.2
       down_indicator: DB11.DBX15.3
       fault_indicator: DB11.DBX15.4
@@ -384,19 +386,20 @@ output:
       cabin_button_led_8: DB11.DBX18.1
       cabin_button_led_9: DB11.DBX18.2
       cabin_button_led_10: DB11.DBX18.3
-      segment_a: DB11.DBX18.5
-      segment_b: DB11.DBX18.6
-      segment_c: DB11.DBX18.7
-      segment_d: DB11.DBX19.0
-      segment_e: DB11.DBX19.1
-      segment_f: DB11.DBX19.2
-      segment_g: DB11.DBX19.3
-      segment_h: DB11.DBX19.4
-      segment_i: DB11.DBX19.5
-      segment_j: DB11.DBX19.6
-      segment_k: DB11.DBX19.7
-      segment_l: DB11.DBX20.0
-      segment_m: DB11.DBX20.1
+      segment_a: DB11.DBX18.4
+      segment_b: DB11.DBX18.5
+      segment_c: DB11.DBX18.6
+      segment_d: DB11.DBX18.7
+      segment_e: DB11.DBX19.0
+      segment_f: DB11.DBX19.1
+      segment_g: DB11.DBX19.2
+      segment_h: DB11.DBX19.3
+      segment_i: DB11.DBX19.4
+      segment_j: DB11.DBX19.5
+      segment_k: DB11.DBX19.6
+      segment_l: DB11.DBX19.7
+      segment_m: DB11.DBX20.0
+      segment_n: DB11.DBX20.1
       up_indicator: DB11.DBX20.2
       down_indicator: DB11.DBX20.3
       fault_indicator: DB11.DBX20.4
@@ -424,19 +427,20 @@ output:
       cabin_button_led_8: DB11.DBX23.1
       cabin_button_led_9: DB11.DBX23.2
       cabin_button_led_10: DB11.DBX23.3
-      segment_a: DB11.DBX23.5
-      segment_b: DB11.DBX23.6
-      segment_c: DB11.DBX23.7
-      segment_d: DB11.DBX24.0
-      segment_e: DB11.DBX24.1
-      segment_f: DB11.DBX24.2
-      segment_g: DB11.DBX24.3
-      segment_h: DB11.DBX24.4
-      segment_i: DB11.DBX24.5
-      segment_j: DB11.DBX24.6
-      segment_k: DB11.DBX24.7
-      segment_l: DB11.DBX25.0
-      segment_m: DB11.DBX25.1
+      segment_a: DB11.DBX23.4
+      segment_b: DB11.DBX23.5
+      segment_c: DB11.DBX23.6
+      segment_d: DB11.DBX23.7
+      segment_e: DB11.DBX24.0
+      segment_f: DB11.DBX24.1
+      segment_g: DB11.DBX24.2
+      segment_h: DB11.DBX24.3
+      segment_i: DB11.DBX24.4
+      segment_j: DB11.DBX24.5
+      segment_k: DB11.DBX24.6
+      segment_l: DB11.DBX24.7
+      segment_m: DB11.DBX25.0
+      segment_n: DB11.DBX25.1
       up_indicator: DB11.DBX25.2
       down_indicator: DB11.DBX25.3
       fault_indicator: DB11.DBX25.4
@@ -464,19 +468,20 @@ output:
       cabin_button_led_8: DB11.DBX28.1
       cabin_button_led_9: DB11.DBX28.2
       cabin_button_led_10: DB11.DBX28.3
-      segment_a: DB11.DBX28.5
-      segment_b: DB11.DBX28.6
-      segment_c: DB11.DBX28.7
-      segment_d: DB11.DBX29.0
-      segment_e: DB11.DBX29.1
-      segment_f: DB11.DBX29.2
-      segment_g: DB11.DBX29.3
-      segment_h: DB11.DBX29.4
-      segment_i: DB11.DBX29.5
-      segment_j: DB11.DBX29.6
-      segment_k: DB11.DBX29.7
-      segment_l: DB11.DBX30.0
-      segment_m: DB11.DBX30.1
+      segment_a: DB11.DBX28.4
+      segment_b: DB11.DBX28.5
+      segment_c: DB11.DBX28.6
+      segment_d: DB11.DBX28.7
+      segment_e: DB11.DBX29.0
+      segment_f: DB11.DBX29.1
+      segment_g: DB11.DBX29.2
+      segment_h: DB11.DBX29.3
+      segment_i: DB11.DBX29.4
+      segment_j: DB11.DBX29.5
+      segment_k: DB11.DBX29.6
+      segment_l: DB11.DBX29.7
+      segment_m: DB11.DBX30.0
+      segment_n: DB11.DBX30.1
       up_indicator: DB11.DBX30.2
       down_indicator: DB11.DBX30.3
       fault_indicator: DB11.DBX30.4

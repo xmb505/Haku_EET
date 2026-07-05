@@ -11,7 +11,7 @@ import tty
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .app import App
+from .app import CAR_IDS, App
 from .io_client import IOEvent
 
 
@@ -67,7 +67,7 @@ class Console:
         }
         # debug 监视项状态
         self.pass_floor_monitor_enabled: bool = False
-        self._pass_floor_last_perfect: bool = False
+        self._pass_floor_last_perfect: dict[int, bool] = {}
         self._pass_floor_listener_ref = None
         self.input_change_monitor_enabled: bool = False
         self._input_change_listener_ref = None
@@ -77,7 +77,7 @@ class Console:
         self.exec_trace_enabled: bool = False
         self.elevator_speed_enabled: bool = False
         self._elevator_speed_task: asyncio.Task | None = None
-        self._last_speed_state: str = ''
+        self._last_speed_state: dict[int, str] = {}
 
     def _resolve_car_id(self, args: list[str]) -> int:
         """从参数里提取 car_id（如果有），否则用当前选中的"""
@@ -267,13 +267,9 @@ class Console:
         print(HELP_TEXT)
 
     async def _do_status(self, args: list[str]) -> None:
-        snap = self.app.status_snapshot()
-        car = snap['car']
-        # 检查参数是否指定了 car_id
         requested = self._resolve_car_id(args)
-        if requested != self.app.car.car_id:
-            print(f'轿厢 {requested} 未启用（当前只实例化了 car {self.app.car.car_id}）')
-            return
+        snap = self.app.status_snapshot(car_id=requested)
+        car = snap['car']
         print(f'算法:        {snap["algorithm"]}')
         print(f'模拟模式:    {snap["simulate"]}')
         print(f'初始化方向:  {snap["init_direction"]}')
@@ -304,7 +300,8 @@ class Console:
 
     async def cmd_cars(self, args: list[str]) -> None:
         print('已启用的轿厢:')
-        print(f'  - car {self.app.car.car_id}')
+        for cid in CAR_IDS:
+            print(f'  - car {cid}')
 
     async def cmd_car(self, args: list[str]) -> None:
         """
@@ -312,7 +309,7 @@ class Console:
         /car <id>                     切换当前选中的 car（影响后续命令默认值）
         """
         if not args:
-            print('用法: /car <id> [init|call|status] [...]')
+            print('用法: /car <id> [init|call|status|manual|auto] [...]')
             return
         try:
             car_id = int(args[0])
@@ -322,12 +319,11 @@ class Console:
         sub_action = args[1] if len(args) > 1 else None
         sub_args = args[2:]
 
-        if car_id != self.app.car.car_id:
-            print(f'轿厢 {car_id} 未启用（当前只实例化了 car {self.app.car.car_id}）')
-            print(f'提示: 修改 config.yaml 的 elevator.car_id 可启用其他轿厢')
+        if car_id not in set(CAR_IDS):
+            print(f'无效轿厢 ID: {car_id}（有效值: {CAR_IDS}）')
             return
 
-        # 切换当前选中的 car
+        # 切换当前选中的 car（让 self.app.car / executor / action_queue 指向它）
         self.current_car_id = car_id
 
         if sub_action is None:
@@ -344,7 +340,7 @@ class Console:
         elif sub_action == 'manual':
             await self._run_manual(car_id)
         elif sub_action == 'auto':
-            await self.app.manual_auto()
+            await self.app.manual_auto(car_id=car_id)
         elif sub_action == 'goto':
             await self._do_call(sub_args)
         else:
@@ -447,11 +443,11 @@ class Console:
                 return  # 幂等
             current_motion = target
             if direction == 'up':
-                await self.app.manual_up(high_speed=high_speed)
+                await self.app.manual_up(high_speed=high_speed, car_id=car_id)
             elif direction == 'down':
-                await self.app.manual_down(high_speed=high_speed)
+                await self.app.manual_down(high_speed=high_speed, car_id=car_id)
             elif direction is None:
-                await self.app.manual_stop()
+                await self.app.manual_stop(car_id=car_id)
 
         # 非阻塞 stdin：select.select + os.read（不用线程泄漏，不用 ibuf）
         # + deadline 周期性检查（松开方向键立刻停电机）
@@ -516,7 +512,7 @@ class Console:
                         stop_deadline = None
                         await transition(None, False)
                         if brake_level > 0:
-                            await self.app.manual_brake(brake_level)
+                            await self.app.manual_brake(brake_level, car_id=car_id)
                     elif raw in (b'q', b'Q'):
                         break
                     elif raw == b'\x03':  # Ctrl-C
@@ -541,9 +537,9 @@ class Console:
             self.app.executor.paused = executor_was_paused
 
         # 释放刹车 + 停电机 + 切回 auto（不自动 tick，避免 UNKNOWN 状态触发 INITIALIZE）
-        await self.app.manual_brake(0)
-        await self.app.manual_stop()
-        self.app.manual_mode = False
+        await self.app.manual_brake(0, car_id=car_id)
+        await self.app.manual_stop(car_id=car_id)
+        self.app.manual_mode[car_id] = False
         # 只有已初始化的电梯才恢复自动调度（UNKNOWN 状态停在原地不动）
         if self.app.car.state == CarState.READY:
             await self.app._tick()
@@ -579,10 +575,11 @@ class Console:
                 print('参数错误: 第一个参数必须是 up 或 down')
                 print('用法: /car <id> init <up|down> [<floor>]')
                 return
-        await self.app.reset(direction=direction, target_floor=target_floor)
+        await self.app.reset(direction=direction, target_floor=target_floor,
+                             car_id=self.current_car_id)
         dir_str = direction or self.app.executor.init_direction
         floor_str = str(target_floor) if target_floor else '1（默认）'
-        print(f'car {self.app.car.car_id} 初始化: {dir_str} 目标楼层={floor_str}')
+        print(f'car {self.current_car_id} 初始化: {dir_str} 目标楼层={floor_str}')
 
     async def _do_call(self, args: list[str]) -> None:
         if not args:
@@ -594,10 +591,10 @@ class Console:
             print(f'楼层必须是整数: {args[0]}')
             return
         # 手动模式下自动切回 auto 再发内召
-        if self.app.manual_mode:
-            await self.app.manual_auto()
-        await self.app.call_internal(floor)
-        print(f'car {self.app.car.car_id} 已内召 L{floor}')
+        if self.app.manual_mode.get(self.current_car_id, False):
+            await self.app.manual_auto(car_id=self.current_car_id)
+        await self.app.call_internal(floor, car_id=self.current_car_id)
+        print(f'car {self.current_car_id} 已内召 L{floor}')
 
     async def cmd_clear(self, args: list[str]) -> None:
         await self.app.clear_outputs()
@@ -644,7 +641,19 @@ class Console:
 
     def _enable_pass_floor_monitor(self) -> None:
         self.pass_floor_monitor_enabled = True
-        self._pass_floor_last_perfect = self._check_perfect_leveling()
+        for cid in CAR_IDS:
+            try:
+                up_addr = self.app.mapper.db_to_i(
+                    self.app.mapper.addr_input('level_up', cid)
+                )
+                down_addr = self.app.mapper.db_to_i(
+                    self.app.mapper.addr_input('level_down', cid)
+                )
+            except KeyError:
+                continue
+            perfect = (self.app.io.get_input(up_addr) == 1
+                       and self.app.io.get_input(down_addr) == 1)
+            self._pass_floor_last_perfect[cid] = perfect
         # 存住 bound method 引用，禁用时按同一引用移除（每次访问 self._on_pass_floor_event
         # 会产生新的 bound method 对象，按 id/== 比对会失败）
         self._pass_floor_listener_ref = self._on_pass_floor_event
@@ -658,31 +667,30 @@ class Console:
             self._pass_floor_listener_ref = None
 
     def _check_perfect_leveling(self) -> bool:
-        car_id = self.app.car.car_id
-        mapper = self.app.mapper
-        io = self.app.io
-        up_addr = mapper.db_to_i(mapper.addr_input('level_up', car_id))
-        down_addr = mapper.db_to_i(mapper.addr_input('level_down', car_id))
-        return io.get_input(up_addr) == 1 and io.get_input(down_addr) == 1
+        """仅保留签名兼容性（实际未使用，多车检测在 _on_pass_floor_event 内做）"""
+        return False
 
     async def _on_pass_floor_event(self, event: IOEvent) -> None:
-        """IO listener：每次 level_up/level_down 变化检查完美平层上升沿"""
-        car_id = self.app.car.car_id
-        up_addr = self.app.mapper.db_to_i(
-            self.app.mapper.addr_input('level_up', car_id)
-        )
-        down_addr = self.app.mapper.db_to_i(
-            self.app.mapper.addr_input('level_down', car_id)
-        )
-        if event.i_addr not in (up_addr, down_addr):
-            return
-        perfect_now = self._check_perfect_leveling()
-        if perfect_now and not self._pass_floor_last_perfect:
-            pos = self.app.car.position
-            pos_str = f'L{pos}' if pos is not None else 'N/A'
-            print(f'[DEBUG] pass_floor {pos_str}', file=sys.stderr)
-            sys.stderr.flush()
-        self._pass_floor_last_perfect = perfect_now
+        """IO listener：扫描所有车的 level_up & level_down，detect 完美平层上升沿"""
+        for cid in CAR_IDS:
+            try:
+                up_addr = self.app.mapper.db_to_i(
+                    self.app.mapper.addr_input('level_up', cid)
+                )
+                down_addr = self.app.mapper.db_to_i(
+                    self.app.mapper.addr_input('level_down', cid)
+                )
+            except KeyError:
+                continue
+            up_now = self.app.io.get_input(up_addr)
+            down_now = self.app.io.get_input(down_addr)
+            perfect_now = (up_now == 1 and down_now == 1)
+            if perfect_now and not self._pass_floor_last_perfect.get(cid, False):
+                pos = self.app.cars[cid].position
+                pos_str = f'L{pos}' if pos is not None else 'N/A'
+                print(f'[DEBUG] car{cid} pass_floor {pos_str}', file=sys.stderr)
+                sys.stderr.flush()
+            self._pass_floor_last_perfect[cid] = perfect_now
 
     def _toggle_input_change_monitor(self) -> None:
         if self.input_change_monitor_enabled:
@@ -715,7 +723,10 @@ class Console:
         sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
         if sig is not None:
             car_id, name = sig
-            label = f'car{car_id}.{name}' if car_id else name
+            if car_id:
+                label = f'car{car_id}.{name}'
+            else:
+                label = f'hall.{name}'
         else:
             label = '?'
         print(f'[DEBUG] input {event.i_addr} {label} -> {event.bit}', file=sys.stderr)
@@ -771,9 +782,10 @@ class Console:
     def _enable_elevator_speed(self) -> None:
         self.elevator_speed_enabled = True
         speed_map = {'high_speed': '高速', 'decel': '减速', '': '停止'}
-        self._last_speed_state = self.app.executor.decel_state
-        label = speed_map.get(self._last_speed_state, '?')
-        print(f'[debug] 当前速度: {label}')
+        print('[debug] elevator_speed 已启用（监视 6 部电梯档位变化）')
+        for cid in CAR_IDS:
+            label = speed_map.get(self.app.executors[cid].decel_state, '?')
+            print(f'[debug] car{cid} 当前: {label}')
         self._elevator_speed_task = asyncio.create_task(self._poll_elevator_speed())
 
     def _disable_elevator_speed(self) -> None:
@@ -785,15 +797,19 @@ class Console:
 
     async def _poll_elevator_speed(self) -> None:
         speed_map = {'high_speed': '高速', 'decel': '减速', '': '停止'}
+        last_states: dict[int, str] = {}
+        for cid in CAR_IDS:
+            last_states[cid] = self.app.executors[cid].decel_state
         try:
             while self.elevator_speed_enabled:
                 await asyncio.sleep(0.2)
-                current = self.app.executor.decel_state
-                if current != self._last_speed_state:
-                    self._last_speed_state = current
-                    label = speed_map.get(current, '?')
-                    print(f'[DEBUG] speed {label}', file=sys.stderr)
-                    sys.stderr.flush()
+                for cid in CAR_IDS:
+                    current = self.app.executors[cid].decel_state
+                    if current != last_states.get(cid):
+                        last_states[cid] = current
+                        label = speed_map.get(current, '?')
+                        print(f'[DEBUG] car{cid} speed {label}', file=sys.stderr)
+                        sys.stderr.flush()
         except asyncio.CancelledError:
             pass
 

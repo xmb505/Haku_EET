@@ -3,8 +3,9 @@ app.py —— 异步装配与主循环
 
 职责:
     - 加载所有 config
-    - 装配 IOClient / IOMapper / DisplayEncoder / Car / Executor / Algorithm
-    - 启动后台任务（executor 循环 + IO 事件监听）
+    - 装配多轿厢（6 部）：每部拥有独立的 Car / Executor / ActionQueue / VirtualPLC
+    - 共享 IOClient / IOMapper / DisplayEncoder / Algorithm
+    - IO 事件按 car_id 路由到对应的 executor
     - 暴露高层 API 给 console 调用（call / reset / status / etc.）
 """
 
@@ -23,6 +24,9 @@ from .io_mapper import IOMapper
 from .player import Car, CarState, Direction
 from .virtual_plc import VirtualPLC
 
+# 支持的轿厢范围
+CAR_IDS = [1, 2, 3, 4, 5, 6]
+
 
 class App:
     def __init__(
@@ -40,7 +44,7 @@ class App:
         self.config: dict[str, Any] = {}
         self._load_config()
 
-        # ===== 装配 =====
+        # ===== 共享组件 =====
         io2http = self.config['io2http']
         self.io = IOClient(
             http_url=io2http['http_url'],
@@ -50,30 +54,55 @@ class App:
         )
         self.mapper = IOMapper(io_config_path)
         self.display = DisplayEncoder(display_config_path)
-        self.car = Car(car_id=int(self.config['elevator']['car_id']))
-        self.action_queue = ActionQueue()
-
-        algo_name = self.config['algorithm']['name']
-        self.algorithm: ElevatorAlgorithm = get_algorithm(algo_name)
-
-        self.executor = ActionExecutor(
-            car=self.car,
-            io=self.io,
-            mapper=self.mapper,
-            display=self.display,
-            car_id=int(self.config['elevator']['car_id']),
-            init_direction=self.config['elevator']['initialization_direction'],
-            top_base_floor=self.config['building']['top_base_floor'],
-            bottom_base_floor=self.config['building']['bottom_base_floor'],
-            on_action_done=self._on_action_done,
-            on_emergency_stop=self._on_emergency_stop,
+        self.algorithm: ElevatorAlgorithm = get_algorithm(
+            self.config['algorithm']['name']
         )
 
-        # 内部状态
-        self.pending_calls: list[int] = []
-        self.manual_mode: bool = False       # True=手动控制，False=算法自动
+        # ===== 多轿厢 =====
+        self.current_car_id: int = 1
+        self.cars: dict[int, Car] = {}
+        self.executors: dict[int, ActionExecutor] = {}
+        self.action_queues: dict[int, ActionQueue] = {}
+        self.pending_calls: dict[int, list[int]] = {}
+        self.manual_mode: dict[int, bool] = {}
+        self._executor_tasks: dict[int, asyncio.Task] = {}
+
+        building = self.config['building']
+        for cid in CAR_IDS:
+            self.cars[cid] = Car(car_id=cid)
+            self.action_queues[cid] = ActionQueue()
+            self.pending_calls[cid] = []
+            self.manual_mode[cid] = False
+            self.executors[cid] = ActionExecutor(
+                car=self.cars[cid],
+                io=self.io,
+                mapper=self.mapper,
+                display=self.display,
+                car_id=cid,
+                init_direction=self.config['elevator']['initialization_direction'],
+                top_base_floor=building['top_base_floor'],
+                bottom_base_floor=building['bottom_base_floor'],
+                on_action_done=self._make_on_action_done(cid),
+                on_emergency_stop=self._make_on_emergency_stop(cid),
+            )
+
         self._executor_task: asyncio.Task | None = None
         self.debug = False
+
+    @property
+    def car(self) -> Car:
+        """当前选中的轿厢（console 兼容）"""
+        return self.cars[self.current_car_id]
+
+    @property
+    def executor(self) -> ActionExecutor:
+        """当前选中的 executor（console 兼容）"""
+        return self.executors[self.current_car_id]
+
+    @property
+    def action_queue(self) -> ActionQueue:
+        """当前选中的 action queue（console 兼容）"""
+        return self.action_queues[self.current_car_id]
 
     def _load_config(self) -> None:
         with self.config_path.open('r', encoding='utf-8') as f:
@@ -83,243 +112,251 @@ class App:
 
     async def start(self) -> None:
         await self.io.start()
-        # 把 IOMapper 已知的 I 地址告诉 IOClient，bitmap 派发事件时只针对这些
-        # （避免 800 位全 dispatch；listener 自己也会过滤，提前过滤更省）
         if hasattr(self.io, 'set_known_i_addresses'):
             self.io.set_known_i_addresses(set(self.mapper.lookup_all_i_addresses()))
         self.io.add_listener(self._on_io_event)
-        # 后台跑 executor 主循环
-        self._executor_task = asyncio.create_task(
-            self.executor.run_loop(self.action_queue)
-        )
-        # 不自动 INITIALIZE——让用户手动发 /car N init <dir> <floor>
-        # 避免电梯在端站时自动启动撞上 2 限位（坠机限位）
-        # simulate 模式：启动虚拟 PLC，自动驱动 position + 触发平层/限位
-        if self.simulate:
-            building = self.config.get('building', {})
-            self.virtual_plc = VirtualPLC(
-                io=self.io,
-                mapper=self.mapper,
-                car=self.car,
-                car_id=int(self.config['elevator']['car_id']),
-                top_base=building.get('top_base_floor', 11),
-                bottom_base=building.get('bottom_base_floor', -1),
-                top_floor=building.get('max_floor', 10),
-                bottom_floor=building.get('min_floor', 1),
+
+        building = self.config.get('building', {})
+        for cid in CAR_IDS:
+            task = asyncio.create_task(
+                self.executors[cid].run_loop(self.action_queues[cid])
             )
-            self.virtual_plc.start()
-            print('[vplc] 虚拟 PLC 已启动：写接触器后会自动驱动 position 变化')
+            self._executor_tasks[cid] = task
+
+        if self.simulate:
+            self.virtual_plcs: dict[int, VirtualPLC] = {}
+            for cid in CAR_IDS:
+                vplc = VirtualPLC(
+                    io=self.io,
+                    mapper=self.mapper,
+                    car=self.cars[cid],
+                    car_id=cid,
+                    top_base=building.get('top_base_floor', 11),
+                    bottom_base=building.get('bottom_base_floor', 0),
+                    top_floor=building.get('max_floor', 10),
+                    bottom_floor=building.get('min_floor', 1),
+                )
+                self.virtual_plcs[cid] = vplc
+                vplc.start()
+            print(f'[vplc] 已启动 {len(CAR_IDS)} 部虚拟 PLC')
 
     async def stop(self) -> None:
-        if self.simulate and getattr(self, 'virtual_plc', None):
-            await self.virtual_plc.stop()
-        if self._executor_task and not self._executor_task.done():
-            self._executor_task.cancel()
-            try:
-                await self._executor_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if self.simulate:
+            for vplc in getattr(self, 'virtual_plcs', {}).values():
+                await vplc.stop()
+        for task in self._executor_tasks.values():
+            if task and not task.done():
+                task.cancel()
         await self.io.stop()
 
-    # ===== 协调 =====
+    # ===== IO 事件路由（按 car_id） =====
 
-    async def _tick(self) -> None:
-        """让算法根据当前状态决定下一步动作，推入队列"""
+    async def _on_io_event(self, event: IOEvent) -> None:
+        """IO 变化事件 → 查找归属轿厢 → 交给对应 executor"""
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        cid = sig[0] if sig and sig[0] else self.current_car_id
+        if cid in self.executors:
+            await self.executors[cid].on_io_event(event)
+
+    # ===== 协调（按轿厢） =====
+
+    async def _tick(self, car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
         if self.debug:
-            print(f'[tick] car={self.car} pending={self.pending_calls}')
-        actions = self.algorithm.decide(self.car, self.pending_calls)
+            print(f'[tick] car={cid} pos={self.cars[cid].position} '
+                  f'pending={self.pending_calls[cid]}')
+        actions = self.algorithm.decide(self.cars[cid], self.pending_calls[cid])
         for action in actions:
             if self.debug:
                 print(f'[tick]   → {action}')
-            await self.action_queue.put(action)
+            await self.action_queues[cid].put(action)
 
-    async def _on_action_done(self, last_action: Action) -> None:
-        """执行器完成一个动作后回调，重新 tick 并在合适时清理 pending_calls"""
-        # MOVE 完成 = 已到目标层，清理 pending + target_floor
-        # （call 命令直接 MOVE 不开门，这里是清理 pending 的唯一入口）
+    def _make_on_action_done(self, car_id: int):
+        async def _on_action_done(last_action: Action) -> None:
+            await self._on_action_done(car_id, last_action)
+        return _on_action_done
+
+    async def _on_action_done(self, car_id: int, last_action: Action) -> None:
         if last_action is not None and last_action.kind in (
             ActionKind.MOVE_UP, ActionKind.MOVE_DOWN
         ):
-            if (self.car.target_floor is not None
-                    and self.car.position == self.car.target_floor):
-                self.pending_calls = [
-                    c for c in self.pending_calls if c != self.car.target_floor
+            pos = self.cars[car_id].position
+            target = self.cars[car_id].target_floor
+            if target is not None and pos == target:
+                self.pending_calls[car_id] = [
+                    c for c in self.pending_calls[car_id] if c != target
                 ]
-                self.car.target_floor = None
-            # 该换目标时，算法决定下一步（可能是 NOOP 或下一 MOVE）
+                self.cars[car_id].target_floor = None
 
-        # INITIALIZE 完成后，如果目标楼层 != 当前位置，自动 MOVE 过去
         if last_action is not None and last_action.kind == ActionKind.INITIALIZE:
             target = last_action.floor
-            if target is not None and target != self.car.position:
-                self.car.target_floor = target
+            if target is not None and target != self.cars[car_id].position:
+                self.cars[car_id].target_floor = target
                 dir_action = Action(
-                    ActionKind.MOVE_UP if target > self.car.position else ActionKind.MOVE_DOWN
+                    ActionKind.MOVE_UP if target > self.cars[car_id].position
+                    else ActionKind.MOVE_DOWN
                 )
-                await self.action_queue.put(dir_action)
-                return  # 不调 tick（MOVE 完成后会再回调）
-        await self._tick()
+                await self.action_queues[car_id].put(dir_action)
+                return
+        await self._tick(car_id)
 
-    async def _on_io_event(self, event: IOEvent) -> None:
-        """IO 变化事件 → executor 推进 + 故障标志更新"""
-        await self.executor.on_io_event(event)
-        # IO 事件也可能需要重新 tick（比如门开了、关到位了）
-        # 但动作 done 已经会 tick，简化：IO 事件不主动 tick
-
-    async def _on_emergency_stop(self) -> None:
-        """紧急停止回调：清 pending，清 manual_mode，让算法进入故障冻结"""
-        self.pending_calls.clear()
-        self.car.target_floor = None
-        self.manual_mode = False
-        print('[emergency] 紧急停止：清空 pending，切回 auto（不可调度）')
+    def _make_on_emergency_stop(self, car_id: int):
+        async def on_emergency():
+            self.pending_calls[car_id].clear()
+            self.cars[car_id].target_floor = None
+            self.manual_mode[car_id] = False
+            print(f'[emergency] car {car_id} 紧急停止')
+        return on_emergency
 
     # ===== 高层 API（给 console 用） =====
 
-    async def call_internal(self, floor: int) -> None:
-        """内召：到目标楼层"""
-        if floor in self.pending_calls:
+    async def call_internal(self, floor: int, car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
+        if floor in self.pending_calls[cid]:
             return
-        self.pending_calls.append(floor)
-        self.car.target_floor = floor
-        await self._tick()
+        self.pending_calls[cid].append(floor)
+        self.cars[cid].target_floor = floor
+        await self._tick(cid)
 
     async def reset(self, direction: str | None = None,
-                    target_floor: int | None = None) -> None:
-        """手动触发初始化（/car N init <dir> <floor>）
-
-        直接推 INITIALIZE action 到队列（跳过算法层），
-        方向 = direction 或 config 默认，目标楼层 = target_floor 或 1
-        """
+                    target_floor: int | None = None,
+                    car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
         from .player import FaultFlags
-        self.car.state = CarState.UNKNOWN
-        self.car.position = None
-        self.car.target_floor = None
-        self.car.fault = FaultFlags()
-        self.pending_calls.clear()
+        self.cars[cid].state = CarState.UNKNOWN
+        self.cars[cid].position = None
+        self.cars[cid].target_floor = None
+        self.cars[cid].fault = FaultFlags()
+        self.pending_calls[cid].clear()
+        # 同步清 executor 的 init 残留（双重保险：_start_action 也清了）
+        self.executors[cid]._init_reverse_mode = False
+        self.executors[cid]._init_perfect_leveling_active = False
+        self.executors[cid]._init_last_reverse_pos = None
         if direction:
-            self.executor.init_direction = direction
+            self.executors[cid].init_direction = direction
         tf = target_floor if target_floor is not None else 1
         action = Action(ActionKind.INITIALIZE, floor=tf)
-        await self.action_queue.put(action)
+        await self.action_queues[cid].put(action)
 
     async def reload(self) -> None:
-        """重新读 config + io_config + display_config"""
         self._load_config()
         self.mapper.reload()
         self.display.reload()
-        self.executor.init_direction = self.config['elevator']['initialization_direction']
-        print(f'[reload] config reloaded: '
-              f'init_dir={self.executor.init_direction}')
+        building = self.config['building']
+        for cid in CAR_IDS:
+            self.executors[cid].top_base_floor = building['top_base_floor']
+            self.executors[cid].bottom_base_floor = building['bottom_base_floor']
+            self.executors[cid].init_direction = self.config['elevator']['initialization_direction']
+        print(f'[reload] config reloaded: init_dir={self.config["elevator"]["initialization_direction"]}')
 
-    async def manual_up(self, high_speed: bool = True) -> None:
-        """手动上行（幂等：重复调用安全，已在向上+同速度时跳过 IO 写）"""
-        self.manual_mode = True
-        if self.car.direction == Direction.UP and self.car.manual_speed == high_speed:
-            return  # 已在向上同速，不重复写
-        self.car.direction = Direction.UP
-        self.car.manual_speed = high_speed
-        car_id = self.car.car_id
-        await self.io.set_many({
-            self.mapper.addr_output('up_contactor', car_id): 1,
-            self.mapper.addr_output('down_contactor', car_id): 0,
-            self.mapper.addr_output('high_speed_contactor', car_id): 1 if high_speed else 0,
-            self.mapper.addr_output('low_speed_contactor', car_id): 0 if high_speed else 1,
-            self.mapper.addr_output('motor_start', car_id): 1,
-        })
-
-    async def manual_down(self, high_speed: bool = True) -> None:
-        """手动下行（幂等）"""
-        self.manual_mode = True
-        if self.car.direction == Direction.DOWN and self.car.manual_speed == high_speed:
+    async def manual_up(self, high_speed: bool = True,
+                        car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
+        self.manual_mode[cid] = True
+        car = self.cars[cid]
+        if car.direction == Direction.UP and car.manual_speed == high_speed:
             return
-        self.car.direction = Direction.DOWN
-        self.car.manual_speed = high_speed
-        car_id = self.car.car_id
+        car.direction = Direction.UP
+        car.manual_speed = high_speed
         await self.io.set_many({
-            self.mapper.addr_output('up_contactor', car_id): 0,
-            self.mapper.addr_output('down_contactor', car_id): 1,
-            self.mapper.addr_output('high_speed_contactor', car_id): 1 if high_speed else 0,
-            self.mapper.addr_output('low_speed_contactor', car_id): 0 if high_speed else 1,
-            self.mapper.addr_output('motor_start', car_id): 1,
+            self.mapper.addr_output('up_contactor', cid): 1,
+            self.mapper.addr_output('down_contactor', cid): 0,
+            self.mapper.addr_output('high_speed_contactor', cid): 1 if high_speed else 0,
+            self.mapper.addr_output('low_speed_contactor', cid): 0 if high_speed else 1,
+            self.mapper.addr_output('motor_start', cid): 1,
         })
 
-    async def manual_stop(self) -> None:
-        """停电机（幂等，松开方向键时调用）"""
-        if self.car.direction == Direction.IDLE and self.car.manual_speed is False:
+    async def manual_down(self, high_speed: bool = True,
+                          car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
+        self.manual_mode[cid] = True
+        car = self.cars[cid]
+        if car.direction == Direction.DOWN and car.manual_speed == high_speed:
             return
-        car_id = self.car.car_id
+        car.direction = Direction.DOWN
+        car.manual_speed = high_speed
         await self.io.set_many({
-            self.mapper.addr_output('up_contactor', car_id): 0,
-            self.mapper.addr_output('down_contactor', car_id): 0,
-            self.mapper.addr_output('high_speed_contactor', car_id): 0,
-            self.mapper.addr_output('low_speed_contactor', car_id): 0,
-            self.mapper.addr_output('motor_start', car_id): 0,
+            self.mapper.addr_output('up_contactor', cid): 0,
+            self.mapper.addr_output('down_contactor', cid): 1,
+            self.mapper.addr_output('high_speed_contactor', cid): 1 if high_speed else 0,
+            self.mapper.addr_output('low_speed_contactor', cid): 0 if high_speed else 1,
+            self.mapper.addr_output('motor_start', cid): 1,
         })
-        self.car.direction = Direction.IDLE
-        self.car.manual_speed = False
 
-    async def manual_brake(self, level: int | None = None) -> None:
-        """手动刹车（幂等：相同档位不重复写）
+    async def manual_stop(self, car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
+        car = self.cars[cid]
+        if car.direction == Direction.IDLE and car.manual_speed is False:
+            return
+        await self.io.set_many({
+            self.mapper.addr_output('up_contactor', cid): 0,
+            self.mapper.addr_output('down_contactor', cid): 0,
+            self.mapper.addr_output('high_speed_contactor', cid): 0,
+            self.mapper.addr_output('low_speed_contactor', cid): 0,
+            self.mapper.addr_output('motor_start', cid): 0,
+        })
+        car.direction = Direction.IDLE
+        car.manual_speed = False
 
-        8 档含义: 0=释放, 1=1级, 2=2级, 3=1+2, 4=3级, 5=1+3, 6=2+3, 7=全刹
-        """
+    async def manual_brake(self, level: int | None = None,
+                           car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
+        exe = self.executors[cid]
         if level is None:
-            level = self.executor.manual_brake_level
+            level = exe.manual_brake_level
         else:
-            self.executor.manual_brake_level = level
-        if self.executor.manual_current_brake_state == level:
-            return  # 已经是这档
-        self.executor.manual_current_brake_state = level
+            exe.manual_brake_level = level
+        if exe.manual_current_brake_state == level:
+            return
+        exe.manual_current_brake_state = level
         b1 = 1 if (level & 0b001) else 0
         b2 = 1 if (level & 0b010) else 0
         b3 = 1 if (level & 0b100) else 0
-        car_id = self.car.car_id
         await self.io.set_many({
-            self.mapper.addr_output('brake_1', car_id): b1,
-            self.mapper.addr_output('brake_2', car_id): b2,
-            self.mapper.addr_output('brake_3', car_id): b3,
+            self.mapper.addr_output('brake_1', cid): b1,
+            self.mapper.addr_output('brake_2', cid): b2,
+            self.mapper.addr_output('brake_3', cid): b3,
         })
 
-    async def manual_emergency_stop(self) -> None:
-        """紧急停止 —— 清所有输出 + 状态置 FAULT"""
-        self.manual_mode = False
-        await self.executor._emergency_stop(reason='manual_e_stop')
+    async def manual_emergency_stop(self, car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
+        self.manual_mode[cid] = False
+        await self.executors[cid]._emergency_stop(reason='manual_e_stop')
 
-    async def manual_auto(self) -> None:
-        """切回自动控制：释放刹车、停电机、清 manual_mode、算法接管"""
-        await self.manual_brake(0)
-        await self.manual_stop()
-        self.manual_mode = False
+    async def manual_auto(self, car_id: int | None = None) -> None:
+        cid = car_id if car_id is not None else self.current_car_id
+        await self.manual_brake(0, car_id=cid)
+        await self.manual_stop(car_id=cid)
+        self.manual_mode[cid] = False
 
     async def clear_outputs(self) -> None:
-        """将所有输出位置零（清 DB11 所有信号，不含 ready 信号）"""
-        car_id = int(self.config['elevator']['car_id'])
-        writes: dict[str, int] = {}
-        for sig in self.mapper.all_output_signals(car_id):
-            if sig == 'ready':
-                continue  # 保留准备就绪信号
-            try:
-                db_addr = self.mapper.addr_output(sig, car_id)
-                writes[db_addr] = 0
-            except KeyError:
-                continue
-        # 也清全局输出（hall_indicator）
-        for sig in self.mapper.all_output_signals(0):
-            try:
-                db_addr = self.mapper.addr_output(sig, 0)
-                writes[db_addr] = 0
-            except KeyError:
-                continue
-        await self.io.set_many(writes)
+        for cid in CAR_IDS:
+            writes: dict[str, int] = {}
+            for sig in self.mapper.all_output_signals(cid):
+                if sig == 'ready':
+                    continue
+                try:
+                    db_addr = self.mapper.addr_output(sig, cid)
+                    writes[db_addr] = 0
+                except KeyError:
+                    continue
+            for sig in self.mapper.all_output_signals(0):
+                try:
+                    db_addr = self.mapper.addr_output(sig, 0)
+                    writes[db_addr] = 0
+                except KeyError:
+                    continue
+            await self.io.set_many(writes)
         print(f'[clear] 所有输出已置零')
 
-    def status_snapshot(self) -> dict[str, Any]:
+    def status_snapshot(self, car_id: int | None = None) -> dict[str, Any]:
+        cid = car_id if car_id is not None else self.current_car_id
         return {
-            'car': self.car.snapshot(),
+            'car': self.cars[cid].snapshot(),
             'algorithm': self.algorithm.name,
-            'pending_calls': list(self.pending_calls),
-            'action_queue_size': self.action_queue.qsize(),
-            'init_direction': self.executor.init_direction,
+            'pending_calls': list(self.pending_calls[cid]),
+            'action_queue_size': self.action_queues[cid].qsize(),
+            'init_direction': self.executors[cid].init_direction,
             'simulate': self.simulate,
-            'manual_mode': self.manual_mode,
+            'manual_mode': self.manual_mode[cid],
         }

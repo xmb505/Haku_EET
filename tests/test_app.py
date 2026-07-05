@@ -133,7 +133,7 @@ async def test_move_to_5_floor_open_door(app: App):
 
     assert app.car.position == 5
     # MOVE_UP 到目标 → 算法发 NOOP → executor 完成 → _on_action_done 清理 pending
-    assert 5 not in app.pending_calls
+    assert 5 not in app.pending_calls[app.current_car_id]
     assert app.car.target_floor is None
 
 
@@ -149,6 +149,8 @@ io2http:
 building:
   min_floor: 1
   max_floor: 10
+  top_base_floor: 11
+  bottom_base_floor: 0
 elevator:
   car_id: 1
   initialization_direction: up
@@ -183,3 +185,19 @@ async def test_status_snapshot(app: App):
     assert 'pending_calls' in snap
     assert snap['simulate'] is True
     assert snap['algorithm'] == 'simple_internal_call'
+
+
+@pytest.mark.asyncio
+async def test_multi_init_no_emergency(app: App):
+    """连续两次 init 不触发 emergency：模拟用户在第一次 init 途中敲第二次 init"""
+    app.executor.init_direction = 'up'
+    # 第一次 init up 7（目标 7 楼）
+    await app.reset(direction='up', target_floor=7, car_id=1)
+    await asyncio.sleep(0.05)
+    # 还没完成（VPLC 正在往上跑），立刻再 init down 1
+    await app.reset(direction='down', target_floor=1, car_id=1)
+    # 等完整走完：down→底限位→反转→up→1 楼（2 层 × 0.4s + 余量）
+    await asyncio.sleep(2.0)
+    # 不应该触发 emergency（状态是 READY 而不是 FAULT）
+    assert app.cars[1].state != CarState.FAULT, f'emergency: {app.cars[1].fault}'
+    assert app.cars[1].position == 1, f'预期 L1 实际 L{app.cars[1].position}'

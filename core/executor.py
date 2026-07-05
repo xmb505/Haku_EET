@@ -227,6 +227,8 @@ class ActionExecutor:
                 if up_now == 1 and down_now == 1 and not self._init_perfect_leveling_active:
                     # 上升沿：刚进入完美平层区 = 过了一层
                     self._init_perfect_leveling_active = True
+                    if self.car.position is None:
+                        return  # reset() 后 position 还没恢复，跳过这层计数
                     pos = self.car.position
                     was_up = self.init_direction == 'up'
                     step = -1 if was_up else 1
@@ -375,6 +377,12 @@ class ActionExecutor:
                     self.bottom_base_floor if self.init_direction == 'down'
                     else self.top_base_floor
                 )
+                # 重置残留状态（防止旧 init 的 reverse 状态污染新动作：
+                # 否则 _init_reverse_mode=True + car.position=旧 base +
+                # VPLC 跑上去会撞 top_limit_2 触发 emergency）
+                self._init_reverse_mode = False
+                self._init_perfect_leveling_active = False
+                self._init_last_reverse_pos = None
                 await self._execute_initialize()
 
             case ActionKind.MOVE_UP:
@@ -598,9 +606,13 @@ class ActionExecutor:
         all_segs = set(self.display.segments)
         writes = {}
         for seg in all_segs:
-            db_addr = self.mapper.addr_output(f'segment_{seg}', self.car_id)
-            writes[db_addr] = 1 if seg in segments else 0
-        await self.io.set_many(writes)
+            try:
+                db_addr = self.mapper.addr_output(f'segment_{seg}', self.car_id)
+                writes[db_addr] = 1 if seg in segments else 0
+            except KeyError:
+                continue
+        if writes:
+            await self.io.set_many(writes)
 
     async def _all_outputs_off(self) -> None:
         """清所有输出（除 ready 信号外）"""

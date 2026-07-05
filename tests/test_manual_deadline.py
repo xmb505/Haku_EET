@@ -23,7 +23,7 @@ async def test_deadline_expiration_triggers_stop():
         display_config_path='config/display_config.yaml',
         simulate=True,
     )
-    a.manual_mode = True
+    a.manual_mode[1] = True
 
     # 上行
     await a.manual_up(high_speed=False)
