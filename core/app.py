@@ -122,6 +122,9 @@ class App:
         self._executor_task: asyncio.Task | None = None
         self.debug = False
 
+        # bitmap 触发自动寻站
+        self._auto_seek_started: bool = False
+
     @property
     def car(self) -> Car:
         """当前选中的轿厢（console 兼容）"""
@@ -191,6 +194,15 @@ class App:
 
     async def _on_io_event(self, event: IOEvent) -> None:
         """IO 变化事件 → 查找归属轿厢 → 交给对应 executor"""
+        # 首次 bitmap 到达:自动寻站——每部 UNKNOWN 车启动 INIT
+        if not self._auto_seek_started and self.io._input_cache and not self.simulate:
+            self._auto_seek_started = True
+            for cid in self.car_ids:
+                if self.cars[cid].state == CarState.UNKNOWN:
+                    direction = self.config.get('elevator', {}).get('initialization_direction', 'up')
+                    print(f'[auto_seek] car{cid} {direction}, 目标 L1')
+                    await self.reset(direction=direction, target_floor=1, car_id=cid)
+
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
         cid = sig[0] if sig and sig[0] else self.current_car_id
         if cid in self.executors:
