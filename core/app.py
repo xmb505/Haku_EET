@@ -198,7 +198,7 @@ class App:
         if not self._auto_seek_started and self.io._input_cache and not self.simulate:
             self._auto_seek_started = True
             for cid in self.car_ids:
-                if self.cars[cid].state == CarState.UNKNOWN:
+                if self.cars[cid].state == CarState.UNKNOWN and not self.executors[cid].paused:
                     direction = self.config.get('elevator', {}).get('initialization_direction', 'up')
                     print(f'[auto_seek] car{cid} {direction}, 目标 L1')
                     await self.reset(direction=direction, target_floor=1, car_id=cid)

@@ -1012,6 +1012,10 @@ class Console:
         sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
         if sig is None or sig[1] not in ('level_up', 'level_down'):
             return
+        cid = sig[0]
+        # 手动模式(paused)下别刷屏
+        if cid and cid in self.app.executors and self.app.executors[cid].paused:
+            return
         self._dump_level_hold_status()
 
     def _dump_level_hold_status(self) -> None:
