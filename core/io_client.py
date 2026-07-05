@@ -54,11 +54,15 @@ class IOClient:
         self._output_cache: dict[str, int] = {}    # db_addr → value
         self._running = False
         self.ws_connected: bool = False
+        # 写合并缓冲区：累积同一 tick 内的所有写，定期批量 flush
+        self._write_buffer: dict[str, int] = {}
+        self._flush_task: asyncio.Task | None = None
+        self._tick_interval: float = 0.05  # 50ms tick
 
     # ===== 生命周期 =====
 
     async def start(self) -> None:
-        """启动 WS 订阅循环（simulate 模式跳过）"""
+        """启动 WS 订阅循环 + flush 任务（simulate 模式跳过）"""
         self._running = True
         if self.simulate:
             if self.debug:
@@ -66,10 +70,20 @@ class IOClient:
             return
         self._session = aiohttp.ClientSession()
         self._ws_task = asyncio.create_task(self._ws_loop())
+        self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def stop(self) -> None:
         """停止并清理"""
         self._running = False
+        # flush remaining writes before shutdown
+        if not self.simulate:
+            await self._flush_now()
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -102,30 +116,52 @@ class IOClient:
     # ===== 写输出 =====
 
     async def set(self, db_addr: str, value: int) -> None:
-        """主动写一个 DB 输出位"""
+        """写一个 DB 输出位（加入写缓冲区，下一个 tick 批量 flush）"""
         bit = 1 if value else 0
         self._output_cache[db_addr] = bit
         if self.simulate:
             if self.debug:
                 print(f'[io:sim] SET {db_addr} = {bit}')
             return
+        self._write_buffer[db_addr] = bit
+
+    async def set_many(self, writes: dict[str, int]) -> None:
+        """批量写多个 DB 输出位（加入写缓冲区，下一个 tick 批量 flush）"""
+        for addr, val in writes.items():
+            bit = 1 if val else 0
+            self._output_cache[addr] = bit
+            if not self.simulate:
+                self._write_buffer[addr] = bit
+
+    # ===== 写合并定时 flush =====
+
+    async def _flush_loop(self) -> None:
+        """每 tick 刷一次写缓冲区"""
+        try:
+            while self._running:
+                await asyncio.sleep(self._tick_interval)
+                if self._write_buffer:
+                    await self._flush_now()
+        except asyncio.CancelledError:
+            pass
+
+    async def _flush_now(self) -> None:
+        """立即将缓冲区内容通过单次 HTTP POST 批量发送"""
+        if not self._write_buffer:
+            return
+        buf = dict(self._write_buffer)
+        self._write_buffer.clear()
         assert self._session is not None
         payload = {
             'alias': self.alias,
             'mode': 'seter',
-            'gpio': db_addr,
-            'value': bit,
+            'gpios': list(buf.keys()),
+            'values': list(buf.values()),
         }
         async with self._session.post(self.http_url, json=payload) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                raise IOError(f'set {db_addr} 失败: HTTP {resp.status} {body}')
-
-    async def set_many(self, writes: dict[str, int]) -> None:
-        """批量写多个 DB 输出位（同一字节的会被 IO2HTTP 自动合并）"""
-        # IO2HTTP 的 /gpio 接口每次只接受一条命令，所以这里并发发请求
-        # 同字节合并是 IO2HTTP 内部做的（一次 read-modify-write）
-        await asyncio.gather(*(self.set(addr, val) for addr, val in writes.items()))
+                raise IOError(f'flush {len(buf)} writes 失败: HTTP {resp.status} {body}')
 
     def observe_input(self, i_addr: str, bit: int) -> None:
         """观察性更新输入缓存（不影响 IO state，但让 cache 与 event 同步）
