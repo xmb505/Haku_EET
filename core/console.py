@@ -681,6 +681,20 @@ class Console:
             # 恢复所有 target executor 的 paused 状态
             for cid in car_ids:
                 self.app.executors[cid].paused = exec_was_paused.get(cid, False)
+            # FAULT 自动恢复:manual 期间可能推出 2 限位但 IO edge 被 pause 跳过,
+            # 退出时显式查 cache,两个 2 限位都是 0 就清 FAULT
+            for cid in car_ids:
+                if self.app.cars[cid].state == CarState.FAULT:
+                    try:
+                        bl2 = self.app.mapper.db_to_i(
+                            self.app.mapper.addr_input('bottom_limit_2', cid))
+                        tl2 = self.app.mapper.db_to_i(
+                            self.app.mapper.addr_input('top_limit_2', cid))
+                        if self.app.io.get_input(bl2) == 0 and self.app.io.get_input(tl2) == 0:
+                            self.app.cars[cid].state = CarState.READY
+                            print(f'[manual] car{cid} FAULT 自动恢复（2 限位已释放）')
+                    except KeyError:
+                        pass
 
         # 释放刹车 + 停电机 + 切回 auto（不自动 tick，避免 UNKNOWN 状态触发 INITIALIZE）
         if len(car_ids) == 1:
