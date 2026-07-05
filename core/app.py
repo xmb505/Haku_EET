@@ -117,6 +117,7 @@ class App:
                 bottom_base_floor=building['bottom_base_floor'],
                 on_action_done=self._make_on_action_done(cid),
                 on_emergency_stop=self._make_on_emergency_stop(cid),
+                station_hold_enabled=self.config['elevator'].get('station_hold', False),
             )
 
         self._executor_task: asyncio.Task | None = None
@@ -301,7 +302,86 @@ class App:
             self.executors[cid].top_base_floor = building['top_base_floor']
             self.executors[cid].bottom_base_floor = building['bottom_base_floor']
             self.executors[cid].init_direction = self.config['elevator']['initialization_direction']
-        print(f'[reload] config reloaded: init_dir={self.config["elevator"]["initialization_direction"]}')
+        # 站点吸附开关 reload 同步
+        station_hold_enabled = self.config['elevator'].get('station_hold', False)
+        for cid in self.car_ids:
+            self.executors[cid].set_station_hold(station_hold_enabled)
+        print(f'[reload] config reloaded: init_dir={self.config["elevator"]["initialization_direction"]}, '
+              f'station_hold={station_hold_enabled}')
+
+    async def set_station_hold(self, enabled: bool) -> dict[str, int]:
+        """切换站点吸附开关（高层 API，console 用）
+
+        对所有轿厢:打开 flag。
+        开启时,空闲且传感器在 (0,0) 的车入队 INITIALIZE down 1(自动寻站);
+        空闲且在平层位的车立即激活 hold。
+        忙车只 set flag,等下次 _arrive_and_brake 兜底。
+
+        返回:{auto_seek_count, activate_count, skipped_count} 给 console 展示。
+        """
+        auto_seek_count = 0
+        activate_count = 0
+        skipped_count = 0
+
+        for cid in self.car_ids:
+            exe = self.executors[cid]
+            # 先设置 flag（executor 内部清/保留激活态）
+            exe.set_station_hold(enabled)
+
+            if not enabled:
+                continue
+
+            # 跳过手动模式(executor.paused=True)的车
+            if exe.paused:
+                skipped_count += 1
+                continue
+
+            # 正在跑的车:只 set flag,等 _arrive_and_brake
+            if exe.current_action is not None:
+                skipped_count += 1
+                continue
+
+            # 空闲车:读 level 传感器判断是否需要 auto-seek
+            try:
+                up_addr = self.mapper.db_to_i(
+                    self.mapper.addr_input('level_up', cid)
+                )
+                dn_addr = self.mapper.db_to_i(
+                    self.mapper.addr_input('level_down', cid)
+                )
+            except KeyError:
+                # 没有 level 信号（异常配置）→ 仅激活 hold,让下次 IO 事件触发检查
+                exe._level_hold_active = True
+                await exe._level_hold_check()
+                activate_count += 1
+                continue
+
+            up_now = self.io.get_input(up_addr)
+            dn_now = self.io.get_input(dn_addr)
+
+            if up_now == 0 and dn_now == 0:
+                # 车散在楼层之间,自动寻站:入队 INITIALIZE（默认方向走 config/down）
+                action = Action(ActionKind.INITIALIZE, floor=1)
+                await self.action_queues[cid].put(action)
+                auto_seek_count += 1
+            else:
+                # 已在平层区(含偏离 1,0 / 0,1),立即激活 hold
+                exe._level_hold_active = True
+                await exe._level_hold_check()
+                activate_count += 1
+
+        return {
+            'auto_seek_count': auto_seek_count,
+            'activate_count': activate_count,
+            'skipped_count': skipped_count,
+        }
+
+    def station_hold_enabled(self) -> bool:
+        """是否有任意一部车的吸附开启"""
+        return any(
+            self.executors[cid].is_station_hold_enabled()
+            for cid in self.car_ids
+        )
 
     async def manual_batch(self, direction: Direction | None,
                            high_speed: bool, car_ids: list[int]) -> None:

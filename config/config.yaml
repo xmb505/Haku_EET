@@ -18,10 +18,14 @@ elevator:
   # 现场只接了 N 部时改这里：单部调试 [3] / 跑 3 部 [1,2,3] / 全跑 [1,2,3,4,5,6]
   # 改完需重启程序生效（启动时确定，不支持 /reload 动态增删）
   car_ids: [1, 2, 3, 4, 5, 6]
-  # 初始化方向：up = 从 1 楼基站段向上回到 1 楼（全速→触底限位→减速→完美平层）
-  #              down = 从 10 楼顶部向下回到 1 楼（不常见）
+  # 初始化方向：down = 全速下行到下基站触限位 → 反向低速向上到 L1
+  #              up   = 全速上行到上基站触限位 → 反向低速向下到 L1（不常见）
   # 比赛现场如有变动，改这里然后在 REPL 跑 /reload
-  initialization_direction: up
+  initialization_direction: down
+  # 站点吸附(station_hold)：到站停车后自动监测平层,偏离全速反冲回完美平层
+  # 默认关闭——只在需要时启用（/module station_hold on）。开了之后会保持
+  # 每部车在完美平层 ✓(↑1↓1),平层丢失立刻反冲。
+  station_hold: false
 
 algorithm:
   # 首版只实现 simple_internal_call（响应内召，到目标层开门）

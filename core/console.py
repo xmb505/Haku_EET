@@ -27,6 +27,8 @@ HELP_TEXT = """
   /debug show elevator_speed      toggle 速度档位监视（高速/减速/刹车）
   /debug show level_check        toggle 平层检测（每次 level 翻转打印所有车 ↑↓）
   /debug show station_hold       toggle 站点吸附（吸附状态 / 反冲中 / 平层信号）
+  /module <name> [on|off]        切换功能模块（默认关）
+    模块: station_hold  站点吸附——到站后保持完美平层,偏离全速反冲
   /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
@@ -64,6 +66,7 @@ class Console:
             'clear': self.cmd_clear,
             'debug': self.cmd_debug,
             'help': self.cmd_help,
+            'module': self.cmd_module,
             'reload': self.cmd_reload,
             'quit': self.cmd_quit,
         }
@@ -139,11 +142,13 @@ class Console:
             commands_with_subs: dict[str, list[str]] = {
                 '/car': ['init', 'call', 'status', 'manual', 'auto'],
                 '/debug': ['show'],
+                '/module': ['station_hold'],
             }
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_hold'],
+                'station_hold': ['on', 'off'],
             }
 
             # ===== 通用补全原语 =====
@@ -299,6 +304,15 @@ class Console:
 
                 # 4. /debug 路径：子命令 → 子命令参数
                 if cmd == '/debug':
+                    if len(parts) < 2:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    yield from self._complete_sub_arg(current_word, parts[1])
+                    return
+
+                # 5. /module 路径：子命令 → on/off
+                if cmd == '/module':
                     if len(parts) < 2:
                         yield from self._complete_sub_cmd(
                             current_word, self.commands_with_subs[cmd])
@@ -819,6 +833,49 @@ class Console:
 
     async def cmd_clear(self, args: list[str]) -> None:
         await self.app.clear_outputs()
+
+    async def cmd_module(self, args: list[str]) -> None:
+        """切换功能模块开关
+
+        用法:
+          /module                       显示所有模块当前状态
+          /module station_hold          显示当前状态
+          /module station_hold on|off   切换
+        """
+        if not args:
+            self._show_module_status()
+            return
+
+        name = args[0]
+        if name in ('station_hold', '拉扯'):
+            if len(args) < 2:
+                # 显示 station_hold 当前状态
+                enabled = self.app.station_hold_enabled()
+                print(f'station_hold(站点吸附): {"启用" if enabled else "禁用"}')
+                return
+            arg = args[1].lower()
+            if arg == 'on':
+                result = await self.app.set_station_hold(True)
+                print('[module] station_hold 已启用')
+                if result['auto_seek_count'] > 0:
+                    print(f'  → 自动寻站入队: {result["auto_seek_count"]} 部车(INIT down 1)')
+                if result['activate_count'] > 0:
+                    print(f'  → 立即激活吸附: {result["activate_count"]} 部车')
+                if result['skipped_count'] > 0:
+                    print(f'  → 忙车/手动模式跳过: {result["skipped_count"]} 部(等到站后激活)')
+            elif arg == 'off':
+                await self.app.set_station_hold(False)
+                print('[module] station_hold 已禁用(清 hold + 取消反冲)')
+            else:
+                print(f'未知开关: {args[1]}（要 on 或 off）')
+        else:
+            print(f'未知模块: {name}')
+            print('当前支持: station_hold')
+
+    def _show_module_status(self) -> None:
+        """打印所有模块当前状态"""
+        enabled = self.app.station_hold_enabled()
+        print(f'station_hold(站点吸附): {"启用" if enabled else "禁用"}')
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':

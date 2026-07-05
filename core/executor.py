@@ -46,6 +46,7 @@ class ActionExecutor:
         on_action_done: Callable[[Action], Awaitable[None]] | None = None,
         on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
         io_write: IOClient | None = None,
+        station_hold_enabled: bool = False,
     ) -> None:
         self.car = car
         self.io = io
@@ -57,6 +58,8 @@ class ActionExecutor:
         self.bottom_base_floor = bottom_base_floor
         self.on_action_done = on_action_done
         self.on_emergency_stop = on_emergency_stop
+        # 站点吸附总开关（默认关，运行时由 app.set_station_hold 切换）
+        self._station_hold_enabled: bool = station_hold_enabled
 
         # 控制器(不直接摸 IO)。
         # io_write:多车场景下 App 给每部电梯独立的写 IOClient,避免 6 部车
@@ -115,8 +118,6 @@ class ActionExecutor:
         self.exec_log_enabled = False  # 是否打印 [exec] 执行日志（/debug show exec_trace 控制）
         # 停车保持模式:到站后持续监听平层信号,偏离就反冲刹回
         self._level_hold_active: bool = False
-        # 保持模式稳定窗口:进入后等两个平层信号归零(0,0)才允许反冲
-        self._level_hold_settling: bool = False
         # 保持模式反冲中(防止重入)
         self._level_correct_in_progress: bool = False
         # 微调 Events
@@ -163,16 +164,6 @@ class ActionExecutor:
             if sig2 is not None and sig2[0] == self.car_id:
                 if sig2[1] in ('bottom_limit_2', 'top_limit_2') and event.bit == 1:
                     await self._emergency_stop(reason='limit_2_touched')
-            # 稳定窗口:进入保持模式后,等两个平层信号都归零才允许反冲
-            if self._level_hold_settling and sig2 is not None and sig2[0] == self.car_id and sig2[1] in ('level_up', 'level_down'):
-                try:
-                    up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
-                    dn = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
-                    if self.io.get_input(up) == 0 and self.io.get_input(dn) == 0:
-                        self._level_hold_settling = False
-                        self._log(f'[exec] car{self.car_id} 稳定窗口结束,吸附就绪')
-                except KeyError:
-                    pass
             # 站点吸附反冲中:level_up/down=1 → 通知等待协程(即使 current_action=None)
             if (sig2 is not None and sig2[0] == self.car_id
                     and sig2[1] in ('level_up', 'level_down') and event.bit == 1
@@ -383,7 +374,7 @@ class ActionExecutor:
         MOVE 和 INIT 路径共用到站逻辑（消除三处重复代码）：
         1. hold_stop 单笔 HTTP POST 同时全刹+断电机（防止惯性过冲）
         2. 灭方向灯 + 100ms 等车停稳
-        3. 激活 level_hold，后续 _level_hold_check 持续监测平层
+        3. 站点吸附使能则激活 level_hold,后续 _level_hold_check 持续监测平层
         4. _complete_action 通知 app 层
 
         必须在 motor 接触器/刹车已经稳定后再调 _complete_action，
@@ -393,8 +384,8 @@ class ActionExecutor:
         self.car.direction = Direction.IDLE
         await self.motor.set_direction_indicator(None)
         await asyncio.sleep(0.1)
-        self._level_hold_active = True
-        self._level_hold_settling = True
+        if self._station_hold_enabled:
+            self._level_hold_active = True
         await self._complete_action()
 
     async def _apply_init_decel(self, remaining: int) -> None:
@@ -468,8 +459,6 @@ class ActionExecutor:
         """
         if self._level_correct_in_progress or not self._level_hold_active:
             return
-        if self._level_hold_settling:
-            return  # 稳定窗口中,等两个平层信号归零
 
         up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
         dn = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
@@ -495,6 +484,26 @@ class ActionExecutor:
             await self.motor.hold_stop()
             self._relevel_future = None
             self._level_correct_in_progress = False
+
+    def set_station_hold(self, enabled: bool) -> None:
+        """切换站点吸附总开关（不影响正在运行的车）
+
+        开启只改 flag,实际激活由 _arrive_and_brake 在车空闲时点开。
+        关闭则立即卸载:清 hold_active + 取消任何反冲中的 future。
+
+        注意:auto-seek 逻辑由 app.set_station_hold 负责,本方法只管 flag。
+        """
+        self._station_hold_enabled = enabled
+        if not enabled:
+            # 关闭:清当前活跃 + 取消反冲
+            self._level_hold_active = False
+            if self._relevel_future is not None and not self._relevel_future.done():
+                self._relevel_future.cancel()
+            self._relevel_future = None
+            self._level_correct_in_progress = False
+
+    def is_station_hold_enabled(self) -> bool:
+        return self._station_hold_enabled
 
     # ===== Action 展开 =====
 
