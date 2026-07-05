@@ -65,8 +65,8 @@ class TestFloorDisplay:
         assert encoder.get_segments_for_floor(1) == {'b', 'c'}
         # 5 楼 → 字符 '5' → 笔画 a, c, d, f, g
         assert encoder.get_segments_for_floor(5) == {'a', 'c', 'd', 'f', 'g'}
-        # 10 楼 → 字符 '0' → 笔画 a, b, c, d, e, f
-        assert encoder.get_segments_for_floor(10) == {'a', 'b', 'c', 'd', 'e', 'f'}
+        # 10 楼 → 十位 '1'(i,j) + 个位 '0'(a,b,c,d,e,f)
+        assert encoder.get_segments_for_floor(10) == {'a', 'b', 'c', 'd', 'e', 'f', 'i', 'j'}
 
     def test_undefined_floor_raises(self, encoder):
         with pytest.raises(ValueError, match='楼层'):
@@ -81,6 +81,7 @@ class TestReload:
 segments: [a, b, c, d, e, f, g]
 glyphs:
   '0': [a, b, c, d, e, f]
+  '1': [b, c]
   'A': [a, b, c, e, f, g]
 floor_display:
   10: 'A'
@@ -90,4 +91,5 @@ floor_display:
         encoder.reload()
 
         assert encoder.get_glyph_for_floor(10) == 'A'
-        assert encoder.get_segments_for_floor(10) == {'a', 'b', 'c', 'e', 'f', 'g'}
+        # 'A' 走 a-g + 十位 '1' 走 i,j
+        assert encoder.get_segments_for_floor(10) == {'a', 'b', 'c', 'e', 'f', 'g', 'i', 'j'}
