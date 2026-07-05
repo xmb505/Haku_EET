@@ -54,7 +54,6 @@ class App:
             tick_interval_ms=io2http.get('tick_interval_ms', 100),
         )
         self.mapper = IOMapper(io_config_path)
-        self.display = DisplayEncoder(display_config_path, io=self.io, mapper=self.mapper)
         self.algorithm: ElevatorAlgorithm = get_algorithm(
             self.config['algorithm']['name']
         )
@@ -74,6 +73,33 @@ class App:
         self.car_ids: list[int] = list(
             self.config.get('elevator', {}).get('car_ids', DEFAULT_CAR_IDS)
         )
+
+        # 关键:每部电梯独立的 io_write(写通道),避免 6 部车共享一个
+        # write_buffer + 一次 tick flush 出 30+ 个地址,S7 read-modify-write
+        # 顺序就是车号顺序,各车接触器实际建立时间错开("偏了但没偏太多")。
+        # 共享 self.io 的 input/output cache(读)让"只写"实例也能看到最新 IO 状态。
+        io2http_cfg = self.config['io2http']
+        self._shared_caches = {
+            'input': self.io._input_cache,
+            'output': self.io._output_cache,
+        }
+        self.io_write: dict[int, IOClient] = {}
+        for cid in self.car_ids:
+            self.io_write[cid] = IOClient(
+                http_url=io2http_cfg['http_url'],
+                ws_url=None,  # 不连 WS,bitmap 由 self.io 负责
+                alias=io2http_cfg.get('alias', 'plc'),
+                simulate=simulate,
+                debug=False,
+                tick_interval_ms=io2http_cfg.get('tick_interval_ms', 100),
+                shared_input_cache=self._shared_caches,
+            )
+
+        # display 也用 per-car io,避免 6 部车同时更新显示也拥堵
+        # 但 display 写入不紧急(异步 tick 合并即可),共享 self.io 也行
+        # 这里为了简单,display 仍用 self.io(只影响 tick 自动 flush,不拥堵 critical 操作)
+        self.display = DisplayEncoder(display_config_path, io=self.io, mapper=self.mapper)
+
         for cid in self.car_ids:
             self.cars[cid] = Car(car_id=cid)
             self.action_queues[cid] = ActionQueue()
@@ -82,6 +108,7 @@ class App:
             self.executors[cid] = ActionExecutor(
                 car=self.cars[cid],
                 io=self.io,
+                io_write=self.io_write[cid],
                 mapper=self.mapper,
                 display=self.display,
                 car_id=cid,
@@ -121,6 +148,9 @@ class App:
         if hasattr(self.io, 'set_known_i_addresses'):
             self.io.set_known_i_addresses(set(self.mapper.lookup_all_i_addresses()))
         self.io.add_listener(self._on_io_event)
+        # 起 6 部电梯各自的写 IOClient(共享 input_cache,各自独立 flush)
+        for io_w in self.io_write.values():
+            await io_w.start()
 
         building = self.config.get('building', {})
         for cid in self.car_ids:
@@ -153,6 +183,8 @@ class App:
         for task in self._executor_tasks.values():
             if task and not task.done():
                 task.cancel()
+        for io_w in self.io_write.values():
+            await io_w.stop()
         await self.io.stop()
 
     # ===== IO 事件路由（按 car_id） =====
@@ -354,13 +386,17 @@ class App:
                     writes[db_addr] = 0
                 except KeyError:
                     continue
-            for sig in self.mapper.all_output_signals(0):
-                try:
-                    db_addr = self.mapper.addr_output(sig, 0)
-                    writes[db_addr] = 0
-                except KeyError:
-                    continue
-            await self.io.set_many(writes)
+            await self.io_write[cid].set_many(writes)
+        # 全局共享输出(ready 等)用 self.io 清
+        global_writes: dict[str, int] = {}
+        for sig in self.mapper.all_output_signals(0):
+            try:
+                db_addr = self.mapper.addr_output(sig, 0)
+                global_writes[db_addr] = 0
+            except KeyError:
+                continue
+        if global_writes:
+            await self.io.set_many(global_writes)
         print(f'[clear] 所有输出已置零')
 
     def status_snapshot(self, car_id: int | None = None) -> dict[str, Any]:

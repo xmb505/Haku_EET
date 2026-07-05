@@ -257,3 +257,40 @@ def test_car_ids_partial(tmp_path):
     assert 4 in a.cars
     assert 1 not in a.cars
     assert 3 not in a.cars
+
+
+def test_per_car_io_write_isolation():
+    """验证每部电梯有自己的 io_write(独立 write_buffer + flush),避免 6 部共享拥堵
+
+    共享 self.io(只读 WS),写入走各自的 io_write[cid]。
+    """
+    a = App(
+        config_path=CONFIG_PATH,
+        io_config_path=IO_CONFIG_PATH,
+        display_config_path=DISPLAY_PATH,
+        simulate=True,
+    )
+    # 默认 6 部车都有 io_write
+    for cid in a.car_ids:
+        assert cid in a.io_write, f'car {cid} 缺少独立 io_write'
+        assert a.io_write[cid] is not a.io, f'car {cid} 的 io_write 应该是独立实例,不是 self.io'
+
+    # 各 io_write 的 write_buffer 独立(不是同一对象)
+    buf_ids = [id(a.io_write[cid]._write_buffer) for cid in a.car_ids]
+    assert len(set(buf_ids)) == len(a.car_ids), '各 io_write 的 _write_buffer 应独立'
+
+    # 各 io_write 不连 WS(只写模式)
+    for cid in a.car_ids:
+        assert a.io_write[cid].ws_url is None
+        assert a.io_write[cid]._ws_task is None
+
+    # 共享 input/output cache(self.io 的更新能被 io_write 看到)
+    for cid in a.car_ids:
+        assert a.io_write[cid]._input_cache is a.io._input_cache
+        assert a.io_write[cid]._output_cache is a.io._output_cache
+
+    # 写入通过 io_write[1] 后,self.io.get_output() 也能读到(共享 _output_cache)
+    import asyncio
+    addr = a.mapper.addr_output('up_contactor', 1)
+    asyncio.run(a.io_write[1].set_many({addr: 1}))
+    assert a.io.get_output(addr) == 1

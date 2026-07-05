@@ -27,8 +27,18 @@ if TYPE_CHECKING:
 class MotorController:
     """电机/接触器/刹车控制器"""
 
-    def __init__(self, io: IOClient, mapper: IOMapper, car_id: int) -> None:
+    def __init__(self, io: IOClient, mapper: IOMapper, car_id: int,
+                 io_write: IOClient | None = None) -> None:
+        """
+        Args:
+            io: 读取用的 IOClient(on_io_event / observe_input)
+            io_write: 写入用的 IOClient;默认用 io。
+                多车场景下 App 给每部电梯独立的 io_write,避免 6 部车共享一个
+                write_buffer 导致 tick flush 时一次 POST 30+ 个地址,S7 处理
+                顺序就是车号顺序,各车接触器实际建立时间错开("偏了但没偏太多")。
+        """
         self.io = io
+        self.io_write = io_write if io_write is not None else io
         self.mapper = mapper
         self.car_id = car_id
 
@@ -43,7 +53,7 @@ class MotorController:
             up, down = 0, 1
         elif direction is None:
             up = down = 0
-        await self.io.set_many({
+        await self.io_write.set_many({
             self.mapper.addr_output('up_contactor', self.car_id): up,
             self.mapper.addr_output('down_contactor', self.car_id): down,
             self.mapper.addr_output('high_speed_contactor', self.car_id): 1 if high_speed else 0,
@@ -58,7 +68,7 @@ class MotorController:
             - 自动模式：start 前 release_brakes，stop 后保持
             - 手动模式：用户设档位 set_brake_level，退出时 release_brakes
         """
-        await self.io.set_many({
+        await self.io_write.set_many({
             self.mapper.addr_output('up_contactor', self.car_id): 0,
             self.mapper.addr_output('down_contactor', self.car_id): 0,
             self.mapper.addr_output('high_speed_contactor', self.car_id): 0,
@@ -85,14 +95,14 @@ class MotorController:
         """
         up = 1 if direction == 'up' else 0
         down = 1 if direction == 'down' else 0
-        await self.io.set_many({
+        await self.io_write.set_many({
             self.mapper.addr_output('up_indicator', self.car_id): up,
             self.mapper.addr_output('down_indicator', self.car_id): down,
         })
 
     async def set_speed(self, high_speed: bool) -> None:
         """切换速度接触器（运行时）"""
-        await self.io.set_many({
+        await self.io_write.set_many({
             self.mapper.addr_output('high_speed_contactor', self.car_id): 1 if high_speed else 0,
             self.mapper.addr_output('low_speed_contactor', self.car_id): 0 if high_speed else 1,
             self.mapper.addr_output('motor_start', self.car_id): 1,
@@ -100,7 +110,7 @@ class MotorController:
 
     async def set_brakes(self, b1: int = 0, b2: int = 0, b3: int = 0) -> None:
         """设置刹车（运行时）"""
-        await self.io.set_many({
+        await self.io_write.set_many({
             self.mapper.addr_output('brake_1', self.car_id): b1,
             self.mapper.addr_output('brake_2', self.car_id): b2,
             self.mapper.addr_output('brake_3', self.car_id): b3,
@@ -117,28 +127,30 @@ class MotorController:
 class DoorController:
     """门继电器控制器"""
 
-    def __init__(self, io: IOClient, mapper: IOMapper, car_id: int) -> None:
+    def __init__(self, io: IOClient, mapper: IOMapper, car_id: int,
+                 io_write: IOClient | None = None) -> None:
         self.io = io
+        self.io_write = io_write if io_write is not None else io
         self.mapper = mapper
         self.car_id = car_id
 
     async def open(self) -> None:
         """开门继电器 ON，关门继电器 OFF"""
-        await self.io.set_many({
+        await self.io_write.set_many({
             self.mapper.addr_output('door_open_relay', self.car_id): 1,
             self.mapper.addr_output('door_close_relay', self.car_id): 0,
         })
 
     async def close(self) -> None:
         """关门继电器 ON，开门继电器 OFF"""
-        await self.io.set_many({
+        await self.io_write.set_many({
             self.mapper.addr_output('door_open_relay', self.car_id): 0,
             self.mapper.addr_output('door_close_relay', self.car_id): 1,
         })
 
     async def idle(self) -> None:
         """两个继电器都关"""
-        await self.io.set_many({
+        await self.io_write.set_many({
             self.mapper.addr_output('door_open_relay', self.car_id): 0,
             self.mapper.addr_output('door_close_relay', self.car_id): 0,
         })

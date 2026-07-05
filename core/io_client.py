@@ -40,7 +40,10 @@ class IOClient:
         debug: bool = False,
         reconnect_delay: float = 3.0,
         tick_interval_ms: float = 100,
+        shared_input_cache: dict | None = None,
     ) -> None:
+        """shared_input_cache: 多 IOClient 共享缓存容器(传入 {'input': {}, 'output': {}}
+        即跨实例共享输入/输出缓存;传 None 或纯 dict[str, int] 视为仅共享 input_cache)"""
         self.http_url = http_url
         self.ws_url = ws_url
         self.alias = alias
@@ -52,25 +55,44 @@ class IOClient:
         self._session: aiohttp.ClientSession | None = None
         self._ws_task: asyncio.Task | None = None
         self._listeners: list[Listener] = []
-        self._input_cache: dict[str, int] = {}     # i_addr → bit
-        self._output_cache: dict[str, int] = {}    # db_addr → value
+        # 输入/输出缓存:可通过 shared_caches 跨实例共享
+        # (让"只写"实例也能读到同一 I 区,且 app.io.get_output()
+        #  能看到 io_write[cid] 的写入,测试/调试/status_snapshot 正常。)
+        if shared_input_cache is not None and isinstance(shared_input_cache, dict):
+            # shared_input_cache 实际是一个 dict[str, dict],包含 'input' 和 'output' 子键
+            if 'input' in shared_input_cache and 'output' in shared_input_cache:
+                self._input_cache = shared_input_cache['input']
+                self._output_cache = shared_input_cache['output']
+            else:
+                # 兼容旧用法:直接当 input_cache 用
+                self._input_cache = shared_input_cache
+                self._output_cache = {}
+        else:
+            self._input_cache = {}
+            self._output_cache = {}
         self._running = False
         self.ws_connected: bool = False
-        # 写合并缓冲区：累积同一 tick 内的所有写，定期批量 flush
+        # 写合并缓冲区：每部电梯用自己的 buffer + flush,避免 6 部共享拥堵
         self._write_buffer: dict[str, int] = {}
         self._flush_task: asyncio.Task | None = None
 
     # ===== 生命周期 =====
 
     async def start(self) -> None:
-        """启动 WS 订阅循环 + flush 任务（simulate 模式跳过）"""
+        """启动 WS 订阅循环 + flush 任务（simulate 模式跳过）
+
+        ws_url=None 表示"只写"模式:不连 WS(bitmap 由别的实例负责),
+        但仍起 HTTP session + flush task。
+        """
         self._running = True
         if self.simulate:
             if self.debug:
                 print('[io] simulate 模式启动，跳过真实网络')
             return
         self._session = aiohttp.ClientSession()
-        self._ws_task = asyncio.create_task(self._ws_loop())
+        # 只起 WS 当显式给了 ws_url(否则是"只写"实例,bitmap 由其他实例负责)
+        if self.ws_url:
+            self._ws_task = asyncio.create_task(self._ws_loop())
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def stop(self) -> None:

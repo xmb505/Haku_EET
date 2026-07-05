@@ -45,6 +45,7 @@ class ActionExecutor:
         bottom_base_floor: int = -1,
         on_action_done: Callable[[Action], Awaitable[None]] | None = None,
         on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
+        io_write: IOClient | None = None,
     ) -> None:
         self.car = car
         self.io = io
@@ -57,9 +58,13 @@ class ActionExecutor:
         self.on_action_done = on_action_done
         self.on_emergency_stop = on_emergency_stop
 
-        # 控制器（不直接摸 IO）
-        self.motor = MotorController(io, mapper, car_id)
-        self.door = DoorController(io, mapper, car_id)
+        # 控制器(不直接摸 IO)。
+        # io_write:多车场景下 App 给每部电梯独立的写 IOClient,避免 6 部车
+        #   共享一个 write_buffer 导致 tick flush 时一次 POST 30+ 个地址,
+        #   S7 read-modify-write 顺序 = 车号顺序,接触器建立时间错开("偏了但没偏太多")。
+        # 单车 / 测试场景传 None,回退到 io。
+        self.motor = MotorController(io, mapper, car_id, io_write=io_write)
+        self.door = DoorController(io, mapper, car_id, io_write=io_write)
 
         # 日志回调（外部可注入，让 REPL 能正确显示后台任务的 print）
         # 默认走 stderr（不会被 prompt_toolkit 吞掉）
@@ -93,6 +98,10 @@ class ActionExecutor:
         # 上一次 level_up / level_down 值，用于检测上升沿（经过平层点）
         self._last_level_up: int = 0
         self._last_level_down: int = 0
+        # 平层信号防抖:记录 level_up/down 上次变 0 的时间戳
+        # 用于过滤电机启动瞬间的瞬态抖动(避免 1→0→1 误触发 _on_level_reached)
+        self._level_up_zero_time: float | None = None
+        self._level_down_zero_time: float | None = None
         # 调试输出
         self.debug = False
         self.exec_log_enabled = False  # 是否打印 [exec] 执行日志（/debug show exec_trace 控制）
