@@ -142,6 +142,19 @@ class MotorController:
         b3 = 1 if (level & 0b100) else 0
         await self.set_brakes(b1, b2, b3)
 
+    async def all_off(self) -> None:
+        """紧急清理：全体电机接触器+刹车+电机供电为 0"""
+        await self.io_write.set_many({
+            self.mapper.addr_output('up_contactor', self.car_id): 0,
+            self.mapper.addr_output('down_contactor', self.car_id): 0,
+            self.mapper.addr_output('high_speed_contactor', self.car_id): 0,
+            self.mapper.addr_output('low_speed_contactor', self.car_id): 0,
+            self.mapper.addr_output('motor_start', self.car_id): 0,
+            self.mapper.addr_output('brake_1', self.car_id): 0,
+            self.mapper.addr_output('brake_2', self.car_id): 0,
+            self.mapper.addr_output('brake_3', self.car_id): 0,
+        })
+
 
 class DoorController:
     """门继电器控制器"""
@@ -173,3 +186,7 @@ class DoorController:
             self.mapper.addr_output('door_open_relay', self.car_id): 0,
             self.mapper.addr_output('door_close_relay', self.car_id): 0,
         })
+
+    async def all_off(self) -> None:
+        """紧急清理：清所有门继电器"""
+        await self.idle()

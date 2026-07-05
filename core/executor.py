@@ -821,9 +821,20 @@ class ActionExecutor:
     # ===== 内部辅助 =====
 
     async def _all_outputs_off(self) -> None:
-        """清所有输出（除 ready 信号外）"""
+        """清所有输出（除 ready/指示灯/数码管外），motor/door 由控制器管理"""
+        # 电机 + 门走各自的控制器（不直接摸 mapper/io）
+        await self.motor.all_off()
+        await self.door.all_off()
+        # 其余非控制信号（指示灯、LED 等）在此逐一清零
         for sig in self.mapper.all_output_signals(self.car_id):
-            if sig in ('ready', 'segment_a', 'segment_b', 'segment_c', 'segment_d',
+            if sig in ('ready',
+                       # motor 信号已由 MotorController.all_off 处理
+                       'up_contactor', 'down_contactor',
+                       'high_speed_contactor', 'low_speed_contactor',
+                       'motor_start', 'brake_1', 'brake_2', 'brake_3',
+                       # door 信号已由 DoorController.all_off 处理
+                       'door_open_relay', 'door_close_relay',
+                       'segment_a', 'segment_b', 'segment_c', 'segment_d',
                        'segment_e', 'segment_f', 'segment_g', 'segment_h',
                        'segment_i', 'segment_j', 'segment_k', 'segment_l',
                        'segment_m', 'cabin_button_led_1', 'cabin_button_led_2',
