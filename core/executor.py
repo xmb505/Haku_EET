@@ -111,12 +111,12 @@ class ActionExecutor:
         self.exec_log_enabled = False  # 是否打印 [exec] 执行日志（/debug show exec_trace 控制）
         # 停车保持模式:到站后持续监听平层信号,偏离就反冲刹回
         self._level_hold_active: bool = False
+        # 保持模式稳定窗口:进入后等两个平层信号归零(0,0)才允许反冲
+        self._level_hold_settling: bool = False
         # 保持模式反冲中(防止重入)
         self._level_correct_in_progress: bool = False
         # 微调 Events
         self._relevel_future: asyncio.Future | None = None
-        # 站点吸附心跳任务(兜底:IO 事件稀疏时也检查保持状态)
-        self._hold_heartbeat_task: asyncio.Task | None = None
 
     # ===== 主循环 =====
 
@@ -159,11 +159,23 @@ class ActionExecutor:
             if sig2 is not None and sig2[0] == self.car_id:
                 if sig2[1] in ('bottom_limit_2', 'top_limit_2') and event.bit == 1:
                     await self._emergency_stop(reason='limit_2_touched')
+            # 稳定窗口:进入保持模式后,等两个平层信号都归零才允许反冲
+            if self._level_hold_settling and sig2 is not None and sig2[0] == self.car_id and sig2[1] in ('level_up', 'level_down'):
+                try:
+                    up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
+                    dn = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
+                    if self.io.get_input(up) == 0 and self.io.get_input(dn) == 0:
+                        self._level_hold_settling = False
+                        self._log(f'[exec] car{self.car_id} 稳定窗口结束,吸附就绪')
+                except KeyError:
+                    pass
             # 站点吸附反冲中:level_up/down=1 → 通知等待协程(即使 current_action=None)
             if (sig2 is not None and sig2[0] == self.car_id
                     and sig2[1] in ('level_up', 'level_down') and event.bit == 1
                     and self._relevel_future is not None):
                 self._relevel_future.set_result(True)
+            # 事件驱动平层检测:level_up/level_down 变化 → 检查偏离启动反冲
+            await self._level_hold_check()
             return
 
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
@@ -283,6 +295,7 @@ class ActionExecutor:
                         await self.motor.set_direction_indicator(None)
                         await asyncio.sleep(0.1)  # 等 100ms 停稳
                         self._level_hold_active = True
+                        self._level_hold_settling = True
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
@@ -347,6 +360,7 @@ class ActionExecutor:
             await self.motor.set_direction_indicator(None)
             await asyncio.sleep(0.1)  # 等 100ms 停稳
             self._level_hold_active = True
+            self._level_hold_settling = True
             await self.display.show_number(self.car.position, self.car_id)
             self.car.display = self.car.position
             self._init_reverse_mode = False
@@ -394,6 +408,7 @@ class ActionExecutor:
             await self.motor.set_direction_indicator(None)
             await asyncio.sleep(0.1)  # 等 100ms 停稳
             self._level_hold_active = True
+            self._level_hold_settling = True
             await self._complete_action()
             return
 
@@ -409,26 +424,25 @@ class ActionExecutor:
                 self.decel_state = 'decel'
 
     async def _level_hold_check(self) -> None:
-        """保持模式:检查平层信号,偏离就反冲刹回
+        """保持模式:检查平层信号,偏离就反冲刹回（纯事件驱动，无轮询）
 
         在 _level_hold_active 时,每次 IO 事件后调用。
         如果检测到偏离✓(↑1↓1),立刻释放刹车、向偏离反方向微动、
-        等待信号恢复后刹停。不 sleep 轮询,全事件驱动。
-
-        同时维护一个心跳定时器(2s),IO 事件稀疏时兜底检查。
+        等待信号恢复后刹停。不 sleep / 无心跳定时器。
         """
         if self._level_correct_in_progress or not self._level_hold_active:
             return
+        if self._level_hold_settling:
+            return  # 稳定窗口中,等两个平层信号归零
 
-        # 启动心跳兜底(首次进入保持模式时)
-        if self._hold_heartbeat_task is None:
-            self._hold_heartbeat_task = asyncio.create_task(self._hold_heartbeat_loop())
         up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
         dn = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
         up_now = self.io.get_input(up)
         dn_now = self.io.get_input(dn)
         if up_now == 1 and dn_now == 1:
             return  # 完美平层,不动
+        if up_now == 0 and dn_now == 0:
+            return  # 两层之间/停车后传感器驻留结束,不误反冲
 
         self._level_correct_in_progress = True
         missing_dir = 'up' if up_now == 0 else 'down'  # 缺上→往上,缺下→往下
@@ -446,27 +460,12 @@ class ActionExecutor:
             self._relevel_future = None
             self._level_correct_in_progress = False
 
-    async def _hold_heartbeat_loop(self) -> None:
-        """站点吸附心跳:每 2s 检查一次平层信号,IO 事件稀疏时兜底"""
-        try:
-            while self._level_hold_active:
-                await asyncio.sleep(2.0)
-                await self._level_hold_check()
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._hold_heartbeat_task = None
-
     # ===== Action 展开 =====
 
     async def _start_action(self, action: Action) -> None:
         """展开 Action 为 IO 序列，设置等待传感器"""
         # 有新动作 → 退出保持模式,取消任何正在进行的反冲
         self._level_hold_active = False
-        # 停掉心跳任务(有新动作,车要移动了)
-        if self._hold_heartbeat_task is not None and not self._hold_heartbeat_task.done():
-            self._hold_heartbeat_task.cancel()
-            self._hold_heartbeat_task = None
         if self._relevel_future is not None and not self._relevel_future.done():
             self._relevel_future.cancel()
         self._relevel_future = None
