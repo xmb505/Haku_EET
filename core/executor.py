@@ -269,6 +269,7 @@ class ActionExecutor:
                         # 灭方向灯
                         await self.motor.set_direction_indicator(None)
                         await asyncio.sleep(0.1)  # 等 100ms 停稳
+                        await self._relevel_if_needed()
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
@@ -323,6 +324,7 @@ class ActionExecutor:
             self.car.direction = Direction.IDLE
             await self.motor.set_direction_indicator(None)
             await asyncio.sleep(0.1)  # 等 100ms 停稳
+            await self._relevel_if_needed()
             await self.display.show_number(self.car.position, self.car_id)
             self.car.display = self.car.position
             self._init_reverse_mode = False
@@ -369,6 +371,7 @@ class ActionExecutor:
             # 灭方向灯
             await self.motor.set_direction_indicator(None)
             await asyncio.sleep(0.1)  # 等 100ms 停稳
+            await self._relevel_if_needed()
             await self._complete_action()
             return
 
@@ -382,6 +385,25 @@ class ActionExecutor:
             if self.decel_state != 'decel':
                 await self.motor.set_speed(high_speed=False)
                 self.decel_state = 'decel'
+
+    async def _relevel_if_needed(self) -> None:
+        """停车后微调:若下平层未触发,向下微动直到对齐
+
+        机电刹车停不准时(车偏上 ↑1↓0),发一个极短的下行脉冲,
+        把车拉回完美平层区后重新刹住。最多尝试 3 次。
+        """
+        dn = self.mapper.db_to_i(
+            self.mapper.addr_input('level_down', self.car_id)
+        )
+        for _ in range(3):
+            if self.io.get_input(dn) == 1:
+                self._log(f'[exec] car{self.car_id} 微调:下平层已触发 ✓')
+                return
+            self._log(f'[exec] car{self.car_id} 微调:往下蹭 30ms')
+            await self.motor.release_brakes()
+            await self.motor.start(high_speed=False, direction='down')
+            await asyncio.sleep(0.03)
+            await self.motor.hold_stop()
 
     # ===== Action 展开 =====
 
