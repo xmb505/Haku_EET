@@ -159,6 +159,13 @@ class ActionExecutor:
             if sig2 is not None and sig2[0] == self.car_id:
                 if sig2[1] in ('bottom_limit_2', 'top_limit_2') and event.bit == 1:
                     await self._emergency_stop(reason='limit_2_touched')
+            # 站点吸附反冲中:level_up/down=1 → 通知等待协程(即使 current_action=None)
+            if (sig2 is not None and sig2[0] == self.car_id
+                    and sig2[1] in ('level_up', 'level_down') and event.bit == 1
+                    and self._relevel_future is not None):
+                self._relevel_future.set_result(True)
+            # 即使没有当前动作也要检查平层偏离（停车后被偷摸拉走）
+            await self._level_hold_check()
             return
 
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
@@ -295,8 +302,10 @@ class ActionExecutor:
                     await self._on_level_reached(direction=Direction.UP)
                 elif name == 'level_down' and self.current_action.kind == ActionKind.MOVE_DOWN:
                     await self._on_level_reached(direction=Direction.DOWN)
-            # 3c. 停车微调:下平层触发 → 通知等待协程(事件驱动,不 sleep)
-            if name == 'level_down' and event.bit == 1 and self._relevel_future is not None:
+            # 3c. 停车微调:上/下平层触发 → 通知等待协程(事件驱动,不 sleep)
+            # 反冲方向: 上行偏了用 high_speed down correction,等 level_down=1
+            #           下行偏了用 high_speed up correction,等 level_up=1
+            if name in ('level_up', 'level_down') and event.bit == 1 and self._relevel_future is not None:
                 self._relevel_future.set_result(True)
             return
 
