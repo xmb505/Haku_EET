@@ -358,6 +358,7 @@ class ActionExecutor:
             # 先全刹(7档=三刹全开)再停电机,防止惯性滑过完美平层区。
             # 之前只调 _stop_motion()(断电机),车靠惯性滑到上平层区,
             # level_down 变 FALSE,导致 1/3/4 号车"没有完美平层"。
+            self._log(f'[exec] 到达 L{new_pos}, 全刹(7) motor=停 → 100ms → 释放刹车')
             await self.motor.set_brake_level(7)
             await self._stop_motion()
             self.decel_state = ''
