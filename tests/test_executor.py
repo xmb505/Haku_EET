@@ -76,13 +76,16 @@ async def test_initialize_down_triggers_bottom_limit(setup):
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 1
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
 
-    # 触发 bottom_limit_1（下行方向触底 → 反向全速上行）
+    # 触发 bottom_limit_1（下行方向触底 → 反向基站段低速上行）
     await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
     await asyncio.sleep(0.02)
-    # 反向：up_contactor=1, 高速保持, 电机保持
+    # 反向：up_contactor=1, 基站段低速, 电机保持
+    # 基-客分段：反冲后第一层(基站段) 全程低速
+    # 出临界点(L0)后再用客运段减速(≥2 高速，=1 低速)
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1  # 反向
     assert io.get_output(mapper.addr_output('down_contactor', 1)) == 0
-    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1  # 保持高速
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1  # 基站段低速
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 1  # 电机保持
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 0  # 不刹车
     assert car.position == -1  # 从底站开始
@@ -110,6 +113,118 @@ async def test_initialize_down_triggers_bottom_limit(setup):
 
 
 @pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_initialize_2_limit_triggers_emergency_stop(setup):
     """触到 2 限位（坠机限位）= 紧急停止 + 故障状态"""
     car, io, mapper, display, executor = setup
@@ -126,6 +241,118 @@ async def test_initialize_2_limit_triggers_emergency_stop(setup):
     # 所有输出应被清零
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 0
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     task.cancel()
     try:
@@ -182,6 +409,118 @@ async def test_move_up_completes_on_level_up(setup):
 
 
 @pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_open_door_completes_on_door_open_done(setup):
     car, io, mapper, display, executor = setup
     queue = ActionQueue()
@@ -210,6 +549,118 @@ async def test_open_door_completes_on_door_open_done(setup):
 
 
 @pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_set_display_immediate(setup):
     car, io, mapper, display, executor = setup
     queue = ActionQueue()
@@ -227,6 +678,118 @@ async def test_set_display_immediate(setup):
 
     # Car.display 更新
     assert car.display == 7
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     task.cancel()
     try:
@@ -287,6 +850,118 @@ async def test_action_done_callback(setup):
 
 
 @pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_initialize_up_triggers_top_limit(setup):
     """up 方向：全速上行 → 触 top_limit_1 → 反向全速下行 → 逐层计数→ READY"""
     car, io, mapper, display, executor = setup
@@ -303,11 +978,13 @@ async def test_initialize_up_triggers_top_limit(setup):
     # 全速上行
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
 
-    # 触 top_limit_1 → 反向全速下行（不刹车）
+    # 触 top_limit_1 → 反向基站段低速下行（不刹车）
+    # 基-客分段：反冲后第一层(基站段)全程低速
     await executor.on_io_event(i_to_event(mapper, 'top_limit_1', 1))
     await asyncio.sleep(0.02)
     assert io.get_output(mapper.addr_output('down_contactor', 1)) == 1  # 反向
-    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1  # 保持高速
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1  # 基站段低速
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 1  # 电机保持
 
     # 逆行计数：10→9→8→...→1（9 次完美平层，target=1）
@@ -318,6 +995,118 @@ async def test_initialize_up_triggers_top_limit(setup):
 
     assert car.state == CarState.READY
     assert car.position == 1  # 最终到 1 楼
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     task.cancel()
     try:
@@ -395,6 +1184,118 @@ async def test_release_brakes_called_on_move_start(setup):
 
 
 @pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_direction_indicator_during_move(setup):
     """验证上下行启动时点亮对应方向灯,中间层更新显示,到达 target 后灭灯
 
@@ -451,6 +1352,118 @@ async def test_direction_indicator_during_move(setup):
 
 
 @pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_direction_indicator_during_move_down(setup):
     """下行方向灯验证:MOVE_DOWN 后 down_indicator=1"""
     car, io, mapper, display, executor = setup
@@ -479,6 +1492,118 @@ async def test_direction_indicator_during_move_down(setup):
     assert car.position == 2
     assert io.get_output(mapper.addr_output('up_indicator', 1)) == 0
     assert io.get_output(mapper.addr_output('down_indicator', 1)) == 0
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_base_segment_keeps_low_speed_on_target_in_base(setup):
+    """基-客分段：target 落在基站段内（init down 1）→ 全程低速
+
+    配置：init_direction=down, bottom_base=0, target=1
+    路线：触底限位 → 反向低速上行 → L0+1 完美平层 = target=L1 → 完成
+    期望：reverse 后是低速；第一个平层脉冲(L0+1=target)直接完成
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=1, base=0 → 仅需一次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=1))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('up_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+
+    # 唯一一次完美平层（L0→L1=target）→ 应完成
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+
+    assert car.state == CarState.READY
+    assert car.position == 1
+    assert car.display == 1
+    # 刹车 7 档全开（到站刹车）
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_passenger_segment_uses_normal_decel(setup):
+    """基-客分段：target 落在客运段（init down 5）→ 基站段低速，客运段切高速再减速
+
+    配置：init_direction=down, bottom_base=0, target=5
+    路线：触底限位 → 反向低速到 L0（基站段）→ 临界点
+          L0→L4 高速（remaining≥2），L4→L5 低速（remaining=1）
+    """
+    car, io, mapper, display, executor = setup
+    executor.init_direction = 'down'
+    executor.bottom_base_floor = 0
+    executor.top_base_floor = 11
+    queue = ActionQueue()
+
+    task = asyncio.create_task(executor.run_loop(queue))
+    # target=5, base=0 → 5 次完美平层计数
+    await queue.put(Action(ActionKind.INITIALIZE, floor=5))
+    await asyncio.sleep(0.02)
+
+    # 触底限位 → 反向上行（基站段，低速）
+    await executor.on_io_event(i_to_event(mapper, 'bottom_limit_1', 1))
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+
+    # 第一个完美平层 = L0→L1 = 出基站段临界点
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    # 出基站段：应切高速（客运段 remaining=|5-1|=4 ≥ 2）
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 0
+    assert car.position == 1
+
+    # L1→L2 高速，remaining=3 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 2
+
+    # L2→L3 高速，remaining=2 ≥ 2，保持高速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert car.position == 3
+
+    # L3→L4 高速，remaining=1 → 客运段切低速
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
+    assert car.position == 4
+
+    # L4→L5 target, 完美平层停
+    await fire_perfect_level_pulse(executor, mapper)
+    await asyncio.sleep(0.02)
+    assert car.state == CarState.READY
+    assert car.position == 5
+    assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
+    assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     task.cancel()
     try:

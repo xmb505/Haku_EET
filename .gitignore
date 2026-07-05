@@ -17,3 +17,7 @@ Thumbs.db
 
 # history
 .haku_eet_history
+
+# External projects (symlinked, not tracked)
+IO2HTTP
+IO2HTTP/

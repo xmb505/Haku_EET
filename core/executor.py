@@ -95,6 +95,10 @@ class ActionExecutor:
         self._init_target_floor: int = 1
         # 上一次 perfection level 触发的 position 值（防止重复递减）
         self._init_last_reverse_pos: int | None = None
+        # 基站段完成标记：反冲后第一个完美平层上升沿 = 临界点
+        # 临界点前(基站段)全程低速；临界点后(客运段)用正常减速曲线
+        # 比赛不计时，所以"慢起步"换取"刹得住"比"高速过冲"更重要
+        self._init_base_segment_done: bool = False
         # 手动刹车档位（0=不刹, 1-7=不同组合）
         self.manual_brake_level: int = 0
         # 当前实际写出去的刹车组合（用于幂等性检查）
@@ -210,16 +214,19 @@ class ActionExecutor:
             # 不要再设一次输出 + 重置计数器（会让反向计数从 base 重新开始）
             if self._init_reverse_mode:
                 return
-            # 不停车！反向（方向接触器互换），高速保持，启动逐层计数
+            # 不停车！反向（方向接触器互换），低速启动基站段，启动逐层计数
             # 对 init up：触顶后反向往下，每层 --position 到 target
             # 对 init down：触底后反向往上，每层 ++position 到 target
+            # 反冲后第一段(基站段)走 _apply_init_decel 的低速分支；
+            # 出临界点后再切换到客运段减速曲线。
             was_up = self.init_direction == 'up'
             reverse_dir = 'down' if was_up else 'up'
             await self.motor.release_brakes()  # 释放前一次停车时保持的全刹
-            await self.motor.start(high_speed=True, direction=reverse_dir)
+            await self.motor.start(high_speed=False, direction=reverse_dir)
             await self.motor.set_direction_indicator(reverse_dir)
             self.car.position = self._init_base_floor  # 基站位（11 或 -1）
             self._init_reverse_mode = True
+            self._init_base_segment_done = False
             # 同步当前 cache 的 level 状态——DOWN 阶段的 level 脉冲(200ms)
             # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
             # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
@@ -286,21 +293,22 @@ class ActionExecutor:
                     # 实时更新 7 段显示
                     await self.display.show_number(new_pos, self.car_id)
                     self.car.display = new_pos
+                    # 标记基站段完成（首个完美平层上升沿 = 临界点）
+                    # _apply_init_decel 会根据这个标记切换基-客分段逻辑
+                    self._init_base_segment_done = True
                     # 到达目标 → 完成
                     if new_pos == self._init_target_floor:
                         self._log(f'[exec] car{self.car_id} INIT 到达 L{new_pos}, 全刹→停车→保持(7)')
-                        await self.motor.hold_stop()
-                        self.car.direction = Direction.IDLE
-                        # 灭方向灯
-                        await self.motor.set_direction_indicator(None)
-                        await asyncio.sleep(0.1)  # 等 100ms 停稳
-                        self._level_hold_active = True
-                        self._level_hold_settling = True
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
-                        self._log(f'[exec] car{self.car_id} ✓ INITIALIZE 完成，停在 L{new_pos}')
-                        await self._complete_action()
+                        await self._arrive_and_brake()
+                        return
+                    # 还在路上：根据基-客分段应用减速曲线
+                    # remaining > 0: 还需上行（init down 反冲 case）
+                    # remaining < 0: 还需下行（init up 反冲 case）
+                    remaining = self._init_target_floor - new_pos
+                    await self._apply_init_decel(remaining)
                     return
                 elif up_now == 0 and down_now == 0 and self._init_perfect_leveling_active:
                     # 下降沿：已离开完美平层区 → 重置，准备下一个上升沿
@@ -353,20 +361,58 @@ class ActionExecutor:
             await self.on_emergency_stop()
 
     async def _try_complete_init_if_at_target(self) -> bool:
-        """如果反向开始前 position == target，直接完成 INITIALIZE"""
+        """如果反向开始前 position == target，直接完成 INITIALIZE
+
+        上电时车已在基站（base == target）的特殊场景——根本不用动。
+        此时已经在极限位置（最高或最低基站），反冲也没意义。
+        """
         if self.car.position == self._init_target_floor:
-            await self.motor.hold_stop()
-            self.car.direction = Direction.IDLE
-            await self.motor.set_direction_indicator(None)
-            await asyncio.sleep(0.1)  # 等 100ms 停稳
-            self._level_hold_active = True
-            self._level_hold_settling = True
+            # 显示当前层（base==target，比如 init down 0 / init up 11）
             await self.display.show_number(self.car.position, self.car_id)
             self.car.display = self.car.position
+            # 清反冲相关状态（防止 _start_action 重置前已经标了 True）
             self._init_reverse_mode = False
-            await self._complete_action()
+            # 复用统一刹车：全刹+方向归零+100ms+站点吸附+complete
+            await self._arrive_and_brake()
             return True
         return False
+
+    async def _arrive_and_brake(self) -> None:
+        """到站统一刹车流程：全刹→方向归零→100ms 固位→激活站点吸附→完成动作
+
+        MOVE 和 INIT 路径共用到站逻辑（消除三处重复代码）：
+        1. hold_stop 单笔 HTTP POST 同时全刹+断电机（防止惯性过冲）
+        2. 灭方向灯 + 100ms 等车停稳
+        3. 激活 level_hold，后续 _level_hold_check 持续监测平层
+        4. _complete_action 通知 app 层
+
+        必须在 motor 接触器/刹车已经稳定后再调 _complete_action，
+        否则 app 的 _on_action_done 可能立刻发下一个动作抢占刹车。
+        """
+        await self.motor.hold_stop()
+        self.car.direction = Direction.IDLE
+        await self.motor.set_direction_indicator(None)
+        await asyncio.sleep(0.1)
+        self._level_hold_active = True
+        self._level_hold_settling = True
+        await self._complete_action()
+
+    async def _apply_init_decel(self, remaining: int) -> None:
+        """INIT 反向减速曲线：基站段全程低速，客运段复用正常减速逻辑
+
+        remaining = target - new_pos（正=还需上行，负=还需下行）
+        - 基站段（_init_base_segment_done=False）：全程低速
+          防"反冲第一层高速冲过平层区刹不住"
+        - 客运段：复用标准减速（≥2 层高速，=1 层低速）
+        """
+        if not self._init_base_segment_done:
+            await self.motor.set_speed(high_speed=False)
+            return
+        dist = abs(remaining)
+        if dist >= 2:
+            await self.motor.set_speed(high_speed=True)
+        elif dist == 1:
+            await self.motor.set_speed(high_speed=False)
 
     async def _on_level_reached(self, direction: Direction) -> None:
         """
@@ -395,21 +441,11 @@ class ActionExecutor:
         if self.debug:
             print(f'[exec] level reached: pos={new_pos} target={target} remaining={remaining} decel_state={self.decel_state}')
 
-        # 2. 到达目标层 → 完全停车
+        # 2. 到达目标层 → 完全停车（复用统一刹车 _arrive_and_brake）
         if new_pos == target:
-            # 先全刹(7档=三刹全开)再停电机,防止惯性滑过完美平层区。
-            # 之前只调 _stop_motion()(断电机),车靠惯性滑到上平层区,
-            # level_down 变 FALSE,导致 1/3/4 号车"没有完美平层"。
             self._log(f'[exec] car{self.car_id} 到 L{new_pos}, 全刹→停→保持(7)')
-            await self.motor.hold_stop()
             self.decel_state = ''
-            self.car.direction = Direction.IDLE
-            # 灭方向灯
-            await self.motor.set_direction_indicator(None)
-            await asyncio.sleep(0.1)  # 等 100ms 停稳
-            self._level_hold_active = True
-            self._level_hold_settling = True
-            await self._complete_action()
+            await self._arrive_and_brake()
             return
 
         # 3. 减速逻辑：距目标 ≥2 层高速，剩 1 层切低速，到目标刹车
@@ -489,6 +525,7 @@ class ActionExecutor:
                 self._init_perfect_leveling_active = False
                 self._init_last_reverse_pos = None
                 self._init_reverse_start_time = None
+                self._init_base_segment_done = False
                 await self._execute_initialize()
 
             case ActionKind.MOVE_UP:
@@ -562,6 +599,7 @@ class ActionExecutor:
             # 已在限位 → 直接进入反向计数模式
             self.car.position = self._init_base_floor
             self._init_reverse_mode = True
+            self._init_base_segment_done = False
             # 同步当前 cache 的 level 状态——DOWN 阶段的 level 脉冲(200ms)
             # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
             # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
@@ -574,6 +612,10 @@ class ActionExecutor:
             self.waiting_sensor = None
             self.car.direction = Direction.UP
             await self.motor.set_direction_indicator('down')
+            # 修复：上电时已在限位的情况下之前没启动电机，直接反向往下推不会动
+            # 用低速启动基站段，与运行时触限位反冲行为一致
+            await self.motor.release_brakes()
+            await self.motor.start(high_speed=False, direction='down')
             if await self._try_complete_init_if_at_target():
                 return
             self._log(f'[exec] 初始化: 已在顶站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
@@ -590,6 +632,7 @@ class ActionExecutor:
                 return
             self.car.position = self._init_base_floor
             self._init_reverse_mode = True
+            self._init_base_segment_done = False
             # 同步当前 cache 的 level 状态——DOWN 阶段的 level 脉冲(200ms)
             # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
             # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
@@ -602,6 +645,9 @@ class ActionExecutor:
             self.waiting_sensor = None
             self.car.direction = Direction.DOWN
             await self.motor.set_direction_indicator('up')
+            # 修复：上电时已在底限位的情况下启动电机+低速反向往上
+            await self.motor.release_brakes()
+            await self.motor.start(high_speed=False, direction='up')
             if await self._try_complete_init_if_at_target():
                 return
             self._log(f'[exec] 初始化: 已在底站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
