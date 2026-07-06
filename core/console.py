@@ -63,6 +63,8 @@ HELP_TEXT = """
 class Console:
     def __init__(self, app: App) -> None:
         self.app = app
+        # REPL 提示符（config.console.prompt 可配置，/reload 热加载）
+        self.prompt: str = app.config.get('console', {}).get('prompt', 'haku> ')
         # 当前选中的 car_id（/car <id> 切换）
         self.current_car_id: int = app.car.car_id
         self._commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
@@ -347,7 +349,7 @@ class Console:
 
         while True:
             try:
-                line = (await session.prompt_async('haku> ')).strip()
+                line = (await session.prompt_async(self.prompt)).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -377,7 +379,7 @@ class Console:
         loop = asyncio.get_running_loop()
         while True:
             try:
-                print('haku> ', end='', flush=True)
+                print(self.prompt, end='', flush=True)
                 line = await loop.run_in_executor(None, sys.stdin.readline)
             except (KeyboardInterrupt, EOFError):
                 print()
@@ -1395,6 +1397,8 @@ class Console:
 
     async def cmd_reload(self, args: list[str]) -> None:
         await self.app.reload()
+        # 同步 prompt 等 console 自身配置
+        self.prompt = self.app.config.get('console', {}).get('prompt', 'haku> ')
         print('已重载 config / io_config / display_config')
 
     async def cmd_quit(self, args: list[str]) -> None:

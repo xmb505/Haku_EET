@@ -35,6 +35,10 @@ algorithm:
   # 首版只实现 simple_internal_call（响应内召，到目标层开门）
   name: simple_internal_call
 
+console:
+  # REPL 提示符。比赛现场想换风格时改这里 + /reload，无需重启。
+  prompt: 'haku> '
+
 logging:
   level: INFO
   # debug 时改为 DEBUG，看 IO 事件、动作队列、状态机迁移全过程
