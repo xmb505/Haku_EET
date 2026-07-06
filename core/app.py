@@ -258,9 +258,11 @@ class App:
         cid = car_id if car_id is not None else self.current_car_id
         if floor in self.pending_calls[cid]:
             return
-        # 车已经在目标层 → 不残留 stale 条目（否则 call 当前层再 call 别层
+        # 车空闲时已在目标层 → 不残留 stale 条目（否则 call 当前层再 call 别层
         # 会留下 pending=[当前层],到达别层后被 algoritm 拉回去）
-        if self.cars[cid].position == floor:
+        # 注意:车有未完成召唤时（pending 非空）即使 pos==floor 也要记录,
+        # 否则车移动中经过目标层时 call 会被静默丢弃。
+        if self.cars[cid].position == floor and not self.pending_calls[cid]:
             return
         self.pending_calls[cid].append(floor)
         # 只有空闲时才立即设目标（否则等当前任务完成后再从 pending[0] 取）
@@ -284,6 +286,27 @@ class App:
         self.executors[cid]._init_last_reverse_pos = None
         self.executors[cid]._init_reverse_start_time = None
         self.executors[cid]._init_base_segment_done = False
+        # 清 executor 瞬态状态(复用 _emergency_stop 的清理模式,executor.py:401-411)
+        # 不清 paused / _station_seek_enabled / manual_mode —— 这些是用户状态
+        exe = self.executors[cid]
+        exe.current_action = None
+        exe.waiting_sensor = None
+        exe.decel_state = ''
+        exe._last_level_up = 0
+        exe._last_level_down = 0
+        exe._level_seek_active = False
+        exe._level_seek_skip_next = False
+        exe._level_correct_in_progress = False
+        if exe._relevel_future is not None and not exe._relevel_future.done():
+            exe._relevel_future.cancel()
+        exe._relevel_future = None
+        exe._auto_seek_active = False
+        # 清空动作队列:避免旧 MOVE 在新 INITIALIZE _start_action 覆盖前污染状态
+        while not self.action_queues[cid].empty():
+            try:
+                self.action_queues[cid].get_nowait()
+            except asyncio.QueueEmpty:
+                break
         if direction:
             self.executors[cid].init_direction = direction
         tf = target_floor if target_floor is not None else 1

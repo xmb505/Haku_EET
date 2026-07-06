@@ -294,3 +294,92 @@ def test_per_car_io_write_isolation():
     addr = a.mapper.addr_output('up_contactor', 1)
     asyncio.run(a.io_write[1].set_many({addr: 1}))
     assert a.io.get_output(addr) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_internal_while_passing_floor(app: App):
+    """call_internal 在车移动中经过目标楼层时不应静默丢弃合法召唤
+
+    复现 car2 bug：车正在从 L8 下行到 L2 时 call_internal(5)，
+    旧代码会因 position==5 拦截，新代码应记录 5（因为 pending 非空）。
+    """
+    from core.player import CarState
+
+    # 场景 A：车正在从 L8 下行到 L2（pending=[2]），call_internal(5)
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 8
+    app.cars[1].target_floor = 2
+    app.pending_calls[1] = [2]
+
+    # 模拟车经过 L5（在这一瞬时 call_internal(5)）
+    app.cars[1].position = 5
+    await app.call_internal(5, car_id=1)
+
+    # 修复后：5 必须进入 pending（因为车有未完成任务，position==floor 不应拦截）
+    assert 5 in app.pending_calls[1], \
+        f'修复后期望 pending 含 5，实际 {app.pending_calls[1]}'
+    assert app.pending_calls[1] == [2, 5]
+
+    # 场景 B：车空闲在 L5（pending=[]），call_internal(5) — 应被拦截避免 stale
+    app.cars[1].position = 5
+    app.pending_calls[1] = []
+    app.cars[1].target_floor = None
+    await app.call_internal(5, car_id=1)
+
+    # 验证：5 没被加入 pending（空闲时拦截仍然有效）
+    assert 5 not in app.pending_calls[1], \
+        f'空闲时 call_internal(5) 应被拦截，实际 pending={app.pending_calls[1]}'
+
+    # 场景 C：车 idle 但 pending 非空（例如上一次 call 已完成在 pending 中残留），
+    # 应仍记录新 call，避免重复拦截
+    app.cars[1].position = 5
+    app.pending_calls[1] = [8]
+    app.cars[1].target_floor = 8
+    await app.call_internal(5, car_id=1)
+    assert 5 in app.pending_calls[1], \
+        f'pending 非空时 call_internal(5) 应记录，实际 {app.pending_calls[1]}'
+
+
+@pytest.mark.asyncio
+async def test_batch_call_scenario_replays_user_bug(app: App):
+    """端到端复现：car2 在批量 init+call 场景下应正确停在 L5
+
+    用户报告场景（car2）：
+        /car all init down 2
+        /car all call 9,8,7,6,5,4  → car2 → 8
+        /car all call 1,2,3,4,5,6  → car2 → 2
+        /car all call 6,5,4,3,2,1  → car2 → 5
+
+    旧代码：call 5 在车经过 L5 时被 position==floor 拦截，car2 最终停在 L2。
+    修复后：call 5 进入 pending，car2 完成 8→2→5 序列，最终停在 L5。
+    """
+    # 1. /car all init down 2（对 car2 单独做 init，其他车无关）
+    await app.reset(direction='down', target_floor=2, car_id=2)
+    await asyncio.sleep(2.0)
+    assert app.cars[2].state == CarState.READY
+    assert app.cars[2].position == 2
+
+    # 2. /car all call 9,8,7,6,5,4 → car2 → call_internal(8)
+    await app.call_internal(8, car_id=2)
+
+    # 等车启动离开 L2（VPLC floor_travel_time=0.4s，留 0.5s 余量）
+    await asyncio.sleep(0.5)
+
+    # 3. /car all call 1,2,3,4,5,6 → car2 → call_internal(2)
+    await app.call_internal(2, car_id=2)
+
+    # 4. /car all call 6,5,4,3,2,1 → car2 → call_internal(5)
+    # 此调用可能在车下行经过 L5 时执行。修复后 5 应进入 pending。
+    await app.call_internal(5, car_id=2)
+
+    # 等所有任务完成：8→2→5 共 9 楼层 × 0.4s = 3.6s，再加 4s 余量
+    await asyncio.sleep(8.0)
+
+    # 验证 car2 最终在 L5，pending 清空，未触发 FAULT
+    assert app.cars[2].state != CarState.FAULT, \
+        f'不应触发 emergency，但 car2 FAULT: {app.cars[2].fault}'
+    assert app.cars[2].position == 5, \
+        f'修复后期望 car2 在 L5，实际 L{app.cars[2].position}（旧 bug 表现为 L2）'
+    assert app.pending_calls[2] == [], \
+        f'期望 pending 清空，实际 {app.pending_calls[2]}'
+    assert app.cars[2].target_floor is None
