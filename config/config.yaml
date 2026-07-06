@@ -26,6 +26,10 @@ elevator:
   # 默认关闭——只在需要时启用（/module station_seek on）。开了之后会保持
   # 每部车在完美平层 ✓(↑1↓1),平层丢失立刻反冲。
   station_seek: false
+  # 关门延时（秒）：开门后等待多久自动关门
+  door_close_delay: 10
+  # 熄灯节能延时（秒）：关门后等待多久自动熄灯
+  light_off_delay: 600
 
 algorithm:
   # 首版只实现 simple_internal_call（响应内召，到目标层开门）

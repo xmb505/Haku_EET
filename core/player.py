@@ -66,6 +66,7 @@ class Car:
     fault: FaultFlags = field(default_factory=FaultFlags)
     display: int = 1                         # 7 段显示的楼层数字
     manual_speed: bool | None = None         # 手动模式当前速度档 (True=高速, False=低速, None=未在动)
+    human_presence: int = -1                 # -1=确定无人, 0=不确定, 1=确定有人
 
     def is_ready(self) -> bool:
         return self.state == CarState.READY and not self.fault.service_mode
@@ -80,6 +81,7 @@ class Car:
             'door_state': self.door_state.value,
             'target_floor': self.target_floor,
             'display': self.display,
+            'human_presence': self.human_presence,
             'fault': {
                 'overload': self.fault.overload,
                 'service_mode': self.fault.service_mode,

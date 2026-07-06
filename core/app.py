@@ -10,6 +10,7 @@ app.py —— 异步装配与主循环
 """
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import yaml
 
 from .actions import Action, ActionKind, ActionQueue
 from .algorithm import ElevatorAlgorithm, get_algorithm
+from .cron import Cron, CronJob, EventRule
 from .display import DisplayEncoder
 from .executor import ActionExecutor
 from .io_client import IOClient, IOEvent
@@ -123,6 +125,11 @@ class App:
 
         self._executor_task: asyncio.Task | None = None
         self.debug = False
+        self._usermode = False
+        self.cron = Cron()
+        self.pending_call_origin: dict[int, dict[int, str]] = {}
+        for cid in self.car_ids:
+            self.pending_call_origin[cid] = {}
 
     @property
     def car(self) -> Car:
@@ -150,6 +157,10 @@ class App:
         if hasattr(self.io, 'set_known_i_addresses'):
             self.io.set_known_i_addresses(set(self.mapper.lookup_all_i_addresses()))
         self.io.add_listener(self._on_io_event)
+        self.io.add_listener(self._on_hall_call_event)
+        self.io.add_listener(self._on_cabin_button_event)
+        self.cron.register(self.io, self.mapper)
+        await self.cron.start()
         # 起 6 部电梯各自的写 IOClient(共享 input_cache,各自独立 flush)
         for io_w in self.io_write.values():
             await io_w.start()
@@ -179,6 +190,7 @@ class App:
             print(f'[vplc] 已启动 {len(self.car_ids)} 部虚拟 PLC')
 
     async def stop(self) -> None:
+        await self.cron.stop()
         if self.simulate:
             for vplc in getattr(self, 'virtual_plcs', {}).values():
                 await vplc.stop()
@@ -197,6 +209,132 @@ class App:
         cid = sig[0] if sig and sig[0] else self.current_car_id
         if cid in self.executors:
             await self.executors[cid].on_io_event(event)
+
+    async def _on_hall_call_event(self, event: IOEvent) -> None:
+        """IO 监听器: hall_call_up_X / hall_call_down_X 上升沿 → 派车
+
+        只在 usermode 启用时响应（外召按钮按下 = 客人按 = 系统接客）。
+        按下 (bit=1) 派车；松开门 (bit=0) 忽略——外召是锁存的，
+        由 PLC/算法完成召唤后自行熄灭指示灯。
+        """
+        if not self._usermode:
+            return
+        if event.bit != 1:
+            return
+
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None:
+            return
+        car_id, signal_name = sig
+        if car_id != 0:
+            return  # hall_call 是全局信号（car_id=0）
+
+        direction: str | None = None
+        floor: int | None = None
+        if signal_name.startswith('hall_call_up_'):
+            direction = 'up'
+            try:
+                floor = int(signal_name[len('hall_call_up_'):])
+            except ValueError:
+                return
+        elif signal_name.startswith('hall_call_down_'):
+            direction = 'down'
+            try:
+                floor = int(signal_name[len('hall_call_down_'):])
+            except ValueError:
+                return
+        else:
+            return
+
+        target_cid = self._dispatch_hall_call(floor, direction)
+        if target_cid is None:
+            print(f'[hall_call] {direction}@L{floor} 无可用轿厢')
+            return
+
+        await self.call_internal(floor, car_id=target_cid, origin='hall')
+        print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
+
+    def _dispatch_hall_call(self, floor: int, direction: str) -> int | None:
+        """派车算法：顺向优先 + 空闲最近
+
+        优先级：
+            0. 顺向经过（car moving dir == call dir，且 position → target_floor 之间会经过 floor）
+            1. 空闲（direction == IDLE，无当前任务）
+            其他：跳过（方向相反 / 同向但 target 已过 floor / 在忙）
+
+        同优先级按距离升序；距离相同取小 car_id。
+
+        Returns:
+            选中的 car_id，或 None（无可用轿厢）
+        """
+        candidates: list[tuple[int, int, int]] = []  # (priority, distance, car_id)
+
+        for cid in self.car_ids:
+            car = self.cars[cid]
+
+            if car.state != CarState.READY or car.position is None:
+                continue
+            if self.manual_mode.get(cid, False):
+                continue
+
+            pos = car.position
+            moving_dir = car.direction
+            target = car.target_floor
+
+            # 顺向且会经过该层
+            same_dir_pass = False
+            if direction == 'up' and moving_dir == Direction.UP and target is not None:
+                if pos < floor <= target:
+                    same_dir_pass = True
+            elif direction == 'down' and moving_dir == Direction.DOWN and target is not None:
+                if pos > floor >= target:
+                    same_dir_pass = True
+
+            if same_dir_pass:
+                candidates.append((0, abs(floor - pos), cid))
+            elif moving_dir == Direction.IDLE:
+                candidates.append((1, abs(floor - pos), cid))
+
+        if not candidates:
+            return None
+
+        candidates.sort()
+        return candidates[0][2]
+
+    async def _on_cabin_button_event(self, event: IOEvent) -> None:
+        """IO 监听器: cabin_button_X 上升沿 → 内召 + human_presence
+
+        只在 usermode 启用时响应。
+        按下 (bit=1) 认为有人在轿厢内，自毁熄灯 cron。
+        """
+        if not self._usermode:
+            return
+        if event.bit != 1:
+            return
+
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None:
+            return
+        cid, signal_name = sig
+        if cid == 0 or cid not in self.car_ids:
+            return
+        if not signal_name.startswith('cabin_button_'):
+            return
+
+        try:
+            floor = int(signal_name[len('cabin_button_'):])
+        except ValueError:
+            return
+
+        # 有人
+        car = self.cars[cid]
+        car.human_presence = 1
+
+        # 自毁熄灯 cron
+        await self.cron.cancel(f'car{cid}_lights_off')
+
+        # 内召
+        await self.call_internal(floor, car_id=cid)
 
     # ===== 协调（按轿厢） =====
 
@@ -221,18 +359,32 @@ class App:
         return _on_action_done
 
     async def _on_action_done(self, car_id: int, last_action: Action) -> None:
-        if last_action is not None and last_action.kind in (
-            ActionKind.MOVE_UP, ActionKind.MOVE_DOWN
-        ):
+        if last_action is None:
+            await self._tick(car_id)
+            return
+
+        kind = last_action.kind
+
+        # 1. MOVE 完成
+        if kind in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN):
             pos = self.cars[car_id].position
             target = self.cars[car_id].target_floor
             if target is not None and pos == target:
                 self.pending_calls[car_id] = [
                     c for c in self.pending_calls[car_id] if c != target
                 ]
+                origin = self.pending_call_origin[car_id].pop(target, 'internal')
                 self.cars[car_id].target_floor = None
+                # 外召到站 → 开门（内召不碰门）
+                if origin == 'hall':
+                    await self.action_queues[car_id].put(
+                        Action(ActionKind.OPEN_DOOR))
+                    return
+            await self._tick(car_id)
+            return
 
-        if last_action is not None and last_action.kind == ActionKind.INITIALIZE:
+        # 2. INITIALIZE 完成
+        if kind == ActionKind.INITIALIZE:
             target = last_action.floor
             if target is not None and target != self.cars[car_id].position:
                 self.cars[car_id].target_floor = target
@@ -242,7 +394,75 @@ class App:
                 )
                 await self.action_queues[car_id].put(dir_action)
                 return
+            await self._tick(car_id)
+            return
+
+        # 3. OPEN_DOOR 完成 → 关门倒计时
+        if kind == ActionKind.OPEN_DOOR:
+            await self._schedule_close_door(car_id)
+            return
+
+        # 4. CLOSE_DOOR 完成 → human_presence + 熄灯倒计时 + _tick
+        if kind == ActionKind.CLOSE_DOOR:
+            car = self.cars[car_id]
+            if car.human_presence == 1:
+                car.human_presence = 0
+            if car.human_presence == 0:
+                await self._schedule_lights_off(car_id)
+            await self._tick(car_id)
+            return
+
+        # 5. LIGHT_OFF/LIGHT_ON 完成
+        if kind == ActionKind.LIGHT_OFF:
+            self.cars[car_id].human_presence = -1
+            return
+        if kind == ActionKind.LIGHT_ON:
+            self.cars[car_id].human_presence = 1
+            return
+
         await self._tick(car_id)
+
+    async def _schedule_close_door(self, car_id: int) -> None:
+        """关门倒计时：开门后 delay 秒自动关门，光幕可推迟"""
+        delay = self.config.get('elevator', {}).get('door_close_delay', 10)
+        job = CronJob(
+            name=f'car{car_id}_close_door',
+            trigger_time=time.monotonic() + delay,
+            delay=delay,
+            action=self._make_push_action(car_id, ActionKind.CLOSE_DOOR),
+            event_rules=[
+                EventRule('light_curtain', car_id, 'reschedule', delay),
+            ],
+        )
+        await self.cron.schedule(job)
+
+    async def _schedule_lights_off(self, car_id: int) -> None:
+        """熄灯倒计时：关门后 delay 秒熄灯，内部按钮/开门自毁"""
+        delay = self.config.get('elevator', {}).get('light_off_delay', 600)
+        building = self.config.get('building', {})
+        min_f = building.get('min_floor', 1)
+        max_f = building.get('max_floor', 10)
+
+        rules = [
+            EventRule('door_open_done', car_id, 'cancel'),
+        ]
+        for floor in range(min_f, max_f + 1):
+            rules.append(EventRule(f'cabin_button_{floor}', car_id, 'cancel'))
+
+        job = CronJob(
+            name=f'car{car_id}_lights_off',
+            trigger_time=time.monotonic() + delay,
+            delay=delay,
+            action=self._make_push_action(car_id, ActionKind.LIGHT_OFF),
+            event_rules=rules,
+        )
+        await self.cron.schedule(job)
+
+    def _make_push_action(self, car_id: int, kind: ActionKind):
+        """创建推送指定 Action 到队列的回调（供 cron 使用）"""
+        async def _push():
+            await self.action_queues[car_id].put(Action(kind))
+        return _push
 
     def _make_on_emergency_stop(self, car_id: int):
         async def on_emergency():
@@ -254,7 +474,8 @@ class App:
 
     # ===== 高层 API（给 console 用） =====
 
-    async def call_internal(self, floor: int, car_id: int | None = None) -> None:
+    async def call_internal(self, floor: int, car_id: int | None = None,
+                            origin: str = 'internal') -> None:
         cid = car_id if car_id is not None else self.current_car_id
         if floor in self.pending_calls[cid]:
             return
@@ -265,6 +486,7 @@ class App:
         if self.cars[cid].position == floor and not self.pending_calls[cid]:
             return
         self.pending_calls[cid].append(floor)
+        self.pending_call_origin[cid][floor] = origin
         # 只有空闲时才立即设目标（否则等当前任务完成后再从 pending[0] 取）
         if self.cars[cid].target_floor is None:
             self.cars[cid].target_floor = floor
@@ -420,6 +642,10 @@ class App:
             exe._relevel_future.cancel()
         exe._relevel_future = None
         exe._auto_seek_active = False
+        await self.cron.cancel(f'car{cid}_close_door')
+        await self.cron.cancel(f'car{cid}_lights_off')
+        self.pending_call_origin[cid].clear()
+        self.cars[cid].human_presence = -1
         # 清空动作队列:避免旧 MOVE 在新 INITIALIZE _start_action 覆盖前污染状态
         while not self.action_queues[cid].empty():
             try:
@@ -523,6 +749,51 @@ class App:
             self.executors[cid].is_station_seek_enabled()
             for cid in self.car_ids
         )
+
+    # ===== 用户模式（usermode） =====
+
+    @property
+    def usermode_enabled(self) -> bool:
+        return self._usermode
+
+    async def set_usermode(self, enabled: bool) -> dict:
+        """切换用户模式
+
+        启用时：验证所有轿厢已初始化（state=READY + position 非空）
+               → 设置 ready 信号为 1，PLC 认为电梯准备就绪
+        禁用时：设置 ready 信号为 0
+
+        Returns:
+            {'enabled': bool, 'blocked': list[int]}
+            blocked 列出未就绪的轿厢 ID（空列表 = 全部就绪）
+        """
+        result: dict[str, object] = {'enabled': enabled, 'blocked': []}
+
+        if enabled:
+            blocked: list[int] = []
+            for cid in self.car_ids:
+                car = self.cars[cid]
+                if car.state != CarState.READY or car.position is None:
+                    blocked.append(cid)
+            if blocked:
+                result['blocked'] = blocked
+                return result  # 拒绝启用，不设 ready
+
+            self._usermode = True
+            try:
+                ready_addr = self.mapper.addr_output('ready', 0)
+                await self.io.set(ready_addr, 1)
+            except KeyError:
+                pass
+        else:
+            self._usermode = False
+            try:
+                ready_addr = self.mapper.addr_output('ready', 0)
+                await self.io.set(ready_addr, 0)
+            except KeyError:
+                pass
+
+        return result
 
     async def manual_batch(self, direction: Direction | None,
                            high_speed: bool, car_ids: list[int]) -> None:
@@ -644,4 +915,5 @@ class App:
             'init_direction': self.executors[cid].init_direction,
             'simulate': self.simulate,
             'manual_mode': self.manual_mode[cid],
+            'usermode': self._usermode,
         }

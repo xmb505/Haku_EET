@@ -665,6 +665,16 @@ class ActionExecutor:
             case ActionKind.NOOP:
                 await self._complete_action()
 
+            case ActionKind.LIGHT_OFF:
+                await self.io.set(
+                    self.mapper.addr_output('light_indicator', self.car_id), 0)
+                await self._complete_action()
+
+            case ActionKind.LIGHT_ON:
+                await self.io.set(
+                    self.mapper.addr_output('light_indicator', self.car_id), 1)
+                await self._complete_action()
+
     async def _execute_initialize(self) -> None:
         """
         初始化子状态机：

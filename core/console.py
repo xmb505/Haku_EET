@@ -32,6 +32,8 @@ HELP_TEXT = """
   /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
+  /usermode [true|false]          用户模式——开启前需所有轿厢已初始化
+                                  开启后 ready 信号置 1，可正常接客
 
 示例:
   /car 1 init                    1 号梯初始化（完整流程：全速→触 1 限位→减速→完美平层）
@@ -71,6 +73,7 @@ class Console:
             'module': self.cmd_module,
             'reload': self.cmd_reload,
             'quit': self.cmd_quit,
+            'usermode': self.cmd_usermode,
         }
         # debug 监视项状态
         self.pass_floor_monitor_enabled: bool = False
@@ -145,6 +148,7 @@ class Console:
                 '/car': ['init', 'call', 'change', 'fireman', 'status', 'manual', 'auto'],
                 '/debug': ['show'],
                 '/module': ['station_seek'],
+                '/usermode': ['true', 'false'],
             }
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
@@ -981,6 +985,39 @@ class Console:
         """打印所有模块当前状态"""
         enabled = self.app.station_seek_enabled()
         print(f'station_seek(站点吸附): {"启用" if enabled else "禁用"}')
+        usermode = self.app.usermode_enabled
+        print(f'usermode(用户模式):    {"启用" if usermode else "禁用"}')
+
+    async def cmd_usermode(self, args: list[str]) -> None:
+        """切换用户模式
+
+        /usermode          → 显示当前状态
+        /usermode true     → 开启（需所有轿厢已初始化）
+        /usermode false    → 关闭
+        """
+        if not args:
+            enabled = self.app.usermode_enabled
+            print(f'usermode(用户模式): {"启用" if enabled else "禁用"}')
+            return
+
+        arg = args[0].lower()
+        if arg == 'true':
+            result = await self.app.set_usermode(True)
+            blocked = result.get('blocked', [])
+            if blocked and isinstance(blocked, list) and len(blocked) > 0:
+                print(f'[usermode] 拒绝：以下轿厢未初始化（需先 /car N init）：')
+                for cid in blocked:
+                    car = self.app.cars[cid]
+                    state = car.state.value
+                    pos = f'L{car.position}' if car.position is not None else '?'
+                    print(f'  car {cid}: state={state} pos={pos}')
+            else:
+                print('[usermode] 用户模式已启用（ready=1，正常接客）')
+        elif arg == 'false':
+            await self.app.set_usermode(False)
+            print('[usermode] 用户模式已关闭（ready=0）')
+        else:
+            print(f'未知参数: {args[0]}（要 true 或 false）')
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':

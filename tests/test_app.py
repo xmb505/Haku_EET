@@ -35,6 +35,12 @@ def i_event(mapper, signal: str, bit: int, car_id: int = 1) -> IOEvent:
     return IOEvent(i_addr=mapper.db_to_i(db), bit=bit)
 
 
+def hall_call_i_addr(app, signal: str) -> str:
+    """hall_call 信号是 car_id=0 的全局信号，转成 I 地址"""
+    db = app.mapper.addr_input(signal, 0)
+    return app.mapper.db_to_i(db)
+
+
 @pytest.mark.asyncio
 async def test_app_starts_idle_without_init(app: App):
     """启动后不自动 INITIALIZE（避免撞 2 限位），等待用户手动命令"""
@@ -567,3 +573,483 @@ async def test_fireman_same_target(app: App):
     # 一切不变
     assert app.cars[1].target_floor == 6
     assert app.pending_calls[1] == [6]
+
+
+# ===== usermode 测试 =====
+
+
+@pytest.mark.asyncio
+async def test_usermode_default_disabled(app: App):
+    """启动时 usermode 默认关闭"""
+    assert app.usermode_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_usermode_enable_all_ready(app: App):
+    """所有轿厢已初始化 → /usermode true 成功，ready=1"""
+    # 把所有车设为 READY（模拟已 init）
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = 1
+
+    result = await app.set_usermode(True)
+    assert result['enabled'] is True
+    assert result['blocked'] == []
+    assert app.usermode_enabled is True
+    # ready 信号应置 1
+    ready_addr = app.mapper.addr_output('ready', 0)
+    assert app.io.get_output(ready_addr) == 1
+
+
+@pytest.mark.asyncio
+async def test_usermode_reject_uninitialized(app: App):
+    """有轿厢未初始化 → /usermode true 拒绝，ready 不变"""
+    # car 1 READY, car 2 UNKNOWN
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    # car 2-6 保持 UNKNOWN / position=None
+
+    result = await app.set_usermode(True)
+    assert result['enabled'] is True
+    assert len(result['blocked']) > 0  # car 2-6 被阻塞
+    assert app.usermode_enabled is False
+    # ready 信号不应被设
+    ready_addr = app.mapper.addr_output('ready', 0)
+    assert app.io.get_output(ready_addr) == 0
+
+
+@pytest.mark.asyncio
+async def test_usermode_reject_none_position(app: App):
+    """position=None（即使 state=READY）也拒绝"""
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = cid
+    # 把 car 3 的 position 置 None
+    app.cars[3].position = None
+
+    result = await app.set_usermode(True)
+    assert 3 in result['blocked']
+    assert app.usermode_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_usermode_disable(app: App):
+    """关闭 usermode → ready=0"""
+    # 先启用
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = 1
+    await app.set_usermode(True)
+    assert app.usermode_enabled is True
+
+    # 再关闭
+    result = await app.set_usermode(False)
+    assert result['enabled'] is False
+    assert app.usermode_enabled is False
+    ready_addr = app.mapper.addr_output('ready', 0)
+    assert app.io.get_output(ready_addr) == 0
+
+
+@pytest.mark.asyncio
+async def test_usermode_status_snapshot(app: App):
+    """status_snapshot 包含 usermode 字段"""
+    snap = app.status_snapshot(car_id=1)
+    assert 'usermode' in snap
+    assert snap['usermode'] is False
+
+    # 启用后
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = 1
+    await app.set_usermode(True)
+
+    snap = app.status_snapshot(car_id=1)
+    assert snap['usermode'] is True
+
+
+# ===== 外召派车测试 =====
+
+
+@pytest.mark.asyncio
+async def test_dispatch_no_cars_ready(app: App):
+    """所有车未初始化 → 无车可派"""
+    # 默认所有车 UNKNOWN, position=None
+    result = app._dispatch_hall_call(5, 'up')
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_single_idle(app: App):
+    """只有 1 部 READY 空闲车 → 派给它"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 3
+    result = app._dispatch_hall_call(5, 'up')
+    assert result == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_idle_closest_wins(app: App):
+    """多部空闲车 → 选距离 floor 最近的"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 8  # 离 floor=5 远
+    app.cars[3].state = CarState.READY
+    app.cars[3].position = 4  # 离 floor=5 最近
+
+    result = app._dispatch_hall_call(5, 'up')
+    assert result == 3
+
+
+@pytest.mark.asyncio
+async def test_dispatch_same_dir_passing_priority(app: App):
+    """顺向经过的车优先级高于空闲车"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 2
+    app.cars[1].direction = Direction.UP
+    app.cars[1].target_floor = 8  # 上行去 8 楼，会经过 5
+
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 5  # 离 floor=5 最近（距离 0）
+    app.cars[2].direction = Direction.IDLE
+
+    result = app._dispatch_hall_call(5, 'up')
+    # car1 顺向经过 → priority 0，胜出（即使距离更远）
+    assert result == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_opposite_direction(app: App):
+    """方向相反的车被跳过"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+    app.cars[1].direction = Direction.DOWN  # 车在 DOWN
+    app.cars[1].target_floor = 1
+
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 8
+    app.cars[2].direction = Direction.IDLE
+
+    # hall_call_up_5：car1 方向不顺向不空闲 → 跳过；car2 空闲 → 派给它
+    result = app._dispatch_hall_call(5, 'up')
+    assert result == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_same_dir_past_target(app: App):
+    """同向但已过 floor 的车被跳过"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 6  # 已在 floor=5 之上
+    app.cars[1].direction = Direction.UP
+    app.cars[1].target_floor = 8  # 上行去 8，不会再下到 5
+
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 3
+    app.cars[2].direction = Direction.IDLE
+
+    # hall_call_up_5：car1 不会经过 5（pos > floor），跳过
+    result = app._dispatch_hall_call(5, 'up')
+    assert result == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_fault_car(app: App):
+    """FAULT 状态的车被跳过"""
+    app.cars[1].state = CarState.FAULT  # 撞过 2 限位
+    app.cars[1].position = 3
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 7
+
+    result = app._dispatch_hall_call(5, 'up')
+    assert result == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_manual_mode(app: App):
+    """手动模式的车被跳过"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 3
+    app.manual_mode[1] = True  # 手动调试中
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 7
+
+    result = app._dispatch_hall_call(5, 'up')
+    assert result == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_down_direction(app: App):
+    """hall_call_down 同样工作"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 8
+    app.cars[1].direction = Direction.DOWN
+    app.cars[1].target_floor = 2  # 下行去 2，会经过 5
+
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 1  # 离 floor=5 距离 4
+    app.cars[2].direction = Direction.IDLE
+
+    # hall_call_down_5：car1 顺向经过（8 > 5 >= 2）→ 胜出
+    result = app._dispatch_hall_call(5, 'down')
+    assert result == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_same_distance_lowest_cid(app: App):
+    """同优先级同距离 → 取最小 car_id"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 3  # 距离 floor=5 都是 2
+    app.cars[1].direction = Direction.IDLE
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 7  # 距离 floor=5 都是 2
+    app.cars[2].direction = Direction.IDLE
+
+    result = app._dispatch_hall_call(5, 'up')
+    assert result == 1
+
+
+@pytest.mark.asyncio
+async def test_hall_call_event_to_call_internal(app: App):
+    """IO 事件触发后，pending_calls 增加"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    # 启用 usermode
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = 1
+    await app.set_usermode(True)
+
+    # 模拟 hall_call_up_5 按下
+    i_addr = hall_call_i_addr(app, 'hall_call_up_5')
+    app.io.simulate_input(i_addr, 1)
+    await asyncio.sleep(0.05)
+
+    # car 1 应该被派到，pending_calls 增加 5
+    assert 5 in app.pending_calls[1]
+
+
+@pytest.mark.asyncio
+async def test_hall_call_ignored_when_usermode_off(app: App):
+    """usermode 关闭时，按钮按下无效"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    # usermode 保持关闭
+
+    i_addr = hall_call_i_addr(app, 'hall_call_up_5')
+    app.io.simulate_input(i_addr, 1)
+    await asyncio.sleep(0.05)
+
+    # 不应分配到任何车
+    assert 5 not in app.pending_calls[1]
+
+
+@pytest.mark.asyncio
+async def test_hall_call_release_ignored(app: App):
+    """bit=0（松开门）不触发派车"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = 1
+    await app.set_usermode(True)
+
+    i_addr = hall_call_i_addr(app, 'hall_call_up_5')
+    # 先按 1
+    app.io.simulate_input(i_addr, 1)
+    await asyncio.sleep(0.05)
+    # 再松开门（bit=0）
+    app.io.simulate_input(i_addr, 0)
+    await asyncio.sleep(0.05)
+
+    # pending_calls 应只有 1 次 5
+    assert app.pending_calls[1].count(5) == 1
+
+
+# ===== 门循环 + human_presence 测试 =====
+
+
+@pytest.mark.asyncio
+async def test_hall_call_opens_door_on_arrival(app: App):
+    """外召到站 → push OPEN_DOOR → 门由 executor 处理"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    # 模拟 pending + origin
+    app.pending_calls[1].append(5)
+    app.pending_call_origin[1][5] = 'hall'
+    app.cars[1].target_floor = 5
+
+    # 模拟 MOVE_UP 完成
+    app.cars[1].position = 5
+    await app._on_action_done(1, Action(ActionKind.MOVE_UP))
+
+    # 应 push OPEN_DOOR
+    assert not app.action_queues[1].empty()
+    action = await app.action_queues[1].get()
+    assert action.kind == ActionKind.OPEN_DOOR
+
+
+@pytest.mark.asyncio
+async def test_internal_call_no_door(app: App):
+    """内召不起门"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    # 模拟内部 pending（不设 origin = 默认 internal）
+    app.pending_calls[1].append(5)
+    app.cars[1].target_floor = 5
+
+    # 模拟 MOVE_UP 完成
+    app.cars[1].position = 5
+    await app._on_action_done(1, Action(ActionKind.MOVE_UP))
+
+    # 不应 push OPEN_DOOR
+    assert app.action_queues[1].empty()
+
+
+@pytest.mark.asyncio
+async def test_cabin_button_sets_human_presence(app: App):
+    """内部按钮按下 → human_presence=1 + 内召"""
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = 1
+    await app.set_usermode(True)
+
+    assert app.cars[1].human_presence == -1  # 默认无人
+
+    # 模拟 cabin_button_5 按下
+    i_addr = app.mapper.db_to_i(
+        app.mapper.addr_input('cabin_button_5', 1))
+    app.io.simulate_input(i_addr, 1)
+    await asyncio.sleep(0.05)
+
+    assert app.cars[1].human_presence == 1
+    assert 5 in app.pending_calls[1]
+
+
+@pytest.mark.asyncio
+async def test_human_presence_transition_hall(app: App):
+    """外召 door cycle → human_presence: -1 → 0 → 熄灯 cron"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+    app.cars[1].human_presence = -1  # 默认
+
+    # 外召完成 MOVE
+    app.pending_calls[1].append(5)
+    app.pending_call_origin[1][5] = 'hall'
+    app.cars[1].target_floor = 5
+
+    # MOVE done → OPEN_DOOR
+    await app._on_action_done(1, Action(ActionKind.MOVE_UP))
+    action = await app.action_queues[1].get()
+    assert action.kind == ActionKind.OPEN_DOOR
+    assert app.cars[1].human_presence == -1  # 开门不改变
+
+    # OPEN_DOOR done → 关门 cron
+    await app._on_action_done(1, Action(ActionKind.OPEN_DOOR))
+    # 应有 close_door cron
+    assert f'car1_close_door' in app.cron._jobs
+
+    # CLOSE_DOOR done → human_presence stays -1 (nobody entered)
+    await app._on_action_done(1, Action(ActionKind.CLOSE_DOOR))
+    assert app.cars[1].human_presence == -1  # 一直无人
+    # -1 时不应熄灯 cron
+    assert f'car1_lights_off' not in app.cron._jobs
+
+
+@pytest.mark.asyncio
+async def test_human_presence_after_cabin_button(app: App):
+    """cabin_button → human_presence=1, 关门后 → 0 → 熄灯 cron"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+    app.cars[1].human_presence = 1  # 确认有人
+
+    # 关门
+    await app._on_action_done(1, Action(ActionKind.CLOSE_DOOR))
+    assert app.cars[1].human_presence == 0  # 可能出去了
+    # human_presence==0 → 熄灯 cron
+    assert f'car1_lights_off' in app.cron._jobs
+
+
+@pytest.mark.asyncio
+async def test_cabin_button_cancels_lights_off(app: App):
+    """熄灯 cron 通过 cron.cancel 直接销毁"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+    app.cars[1].human_presence = 0
+
+    await app._schedule_lights_off(1)
+    assert f'car1_lights_off' in app.cron._jobs
+
+    # cron.cancel 正常销毁
+    await app.cron.cancel('car1_lights_off')
+    assert f'car1_lights_off' not in app.cron._jobs
+
+
+@pytest.mark.asyncio
+async def test_open_door_cancels_lights_off(app: App):
+    """door_open_done → 自毁熄灯 cron"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+    app.cars[1].human_presence = 0
+
+    # 先有熄灯 cron
+    await app._schedule_lights_off(1)
+    assert f'car1_lights_off' in app.cron._jobs
+
+    # 模拟 door_open_done 上升沿
+    i_addr = app.mapper.db_to_i(
+        app.mapper.addr_input('door_open_done', 1))
+    app.io.simulate_input(i_addr, 1)
+    await asyncio.sleep(0.05)
+
+    # 熄灯 cron 已自毁
+    assert f'car1_lights_off' not in app.cron._jobs
+
+
+@pytest.mark.asyncio
+async def test_cron_light_off_fires_light_off_action(app: App):
+    """熄灯 cron 到期 → push LIGHT_OFF → human_presence=-1"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+    app.cars[1].human_presence = 0
+
+    # 直接调度熄灯 cron 到队列（绕过 cron.run 异步循环——单元测试环境
+    # 不需要 cron 事件循环，直接模拟触发）
+    from core.cron import CronJob
+    import time as _time
+    job = CronJob(
+        name='car1_lights_off',
+        trigger_time=_time.monotonic() + 0.01,
+        delay=0.01,
+        action=app._make_push_action(1, ActionKind.LIGHT_OFF),
+        event_rules=None,
+    )
+    await app.cron.schedule(job)
+
+    # 模拟 cron 触发：手动 fire（不依赖 cron.run 事件循环）
+    action = app._make_push_action(1, ActionKind.LIGHT_OFF)
+    await action()
+
+    # LIGHT_OFF 应已在队列（ActionQueue.get 是异步方法）
+    a = await app.action_queues[1].get()
+    assert a.kind == ActionKind.LIGHT_OFF
+
+    # LIGHT_OFF done → human_presence = -1
+    await app._on_action_done(1, a)
+    assert app.cars[1].human_presence == -1
+
+
+@pytest.mark.asyncio
+async def test_hall_call_pending_origin_tracked(app: App):
+    """外召派车记录 origin='hall' 到 pending_call_origin"""
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = 1
+    await app.set_usermode(True)
+
+    # 模拟 hall_call_up_3
+    i_addr = hall_call_i_addr(app, 'hall_call_up_3')
+    app.io.simulate_input(i_addr, 1)
+    await asyncio.sleep(0.05)
+
+    # 记录 origin
+    assert app.pending_call_origin[1].get(3) == 'hall'

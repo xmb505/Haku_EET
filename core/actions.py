@@ -23,6 +23,8 @@ class ActionKind(Enum):
     RESET_FAULT = "reset_fault"        # 复位故障
     EMERGENCY_STOP = "emergency_stop"  # 紧急停止
     NOOP = "noop"                      # 空动作（占位/心跳）
+    LIGHT_OFF = "light_off"            # 熄灯
+    LIGHT_ON = "light_on"              # 亮灯
 
 
 @dataclass(frozen=True)

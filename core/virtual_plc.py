@@ -77,6 +77,10 @@ class VirtualPLC:
         # 虚拟电梯内部位置（不写到 car.position——executor 自己跟踪，
         # 避免虚拟 PLC 过层先改 pos、后 fire 平层被 executor 误读为"已是新楼层"）
         self._pos: int = 1
+        # 门传感器模拟
+        self._last_door_open_relay: int = 0
+        self._last_door_close_relay: int = 0
+        self._door_done_tasks: dict[str, asyncio.Task] = {}
 
     def start(self) -> None:
         if self._running:
@@ -104,6 +108,9 @@ class VirtualPLC:
         for t in list(self._level_pulses.values()):
             if not t.done():
                 t.cancel()
+        for t in list(self._door_done_tasks.values()):
+            if not t.done():
+                t.cancel()
 
     async def _run(self) -> None:
         """主循环：每 tick 检查接触器输出，驱动虚拟位置"""
@@ -117,6 +124,9 @@ class VirtualPLC:
                 await asyncio.sleep(self.tick)
             except asyncio.CancelledError:
                 break
+
+            # 门继电器模拟：door_open_relay=1 → 500ms → door_open_done=1
+            self._simulate_door_sensors()
 
             # 读接触器 + 电机
             up = self.io.get_output(
@@ -234,3 +244,67 @@ class VirtualPLC:
             except asyncio.CancelledError:
                 pass
         asyncio.create_task(reset_later())
+
+    def _simulate_door_sensors(self) -> None:
+        """检测门继电器变化 → 模拟 door_open_done / door_close_done
+
+        上升沿检测：
+            door_open_relay 0→1  →  500ms 后 fire door_open_done=1
+            door_close_relay 0→1 →  500ms 后 fire door_close_done=1
+        继电器归 0 →  300ms 后复位 done 信号
+        """
+        try:
+            open_relay = self.io.get_output(
+                self.mapper.addr_output('door_open_relay', self.car_id)
+            )
+            close_relay = self.io.get_output(
+                self.mapper.addr_output('door_close_relay', self.car_id)
+            )
+        except KeyError:
+            return
+
+        if open_relay != self._last_door_open_relay:
+            self._last_door_open_relay = open_relay
+            if open_relay == 1:
+                self._schedule_door_done('door_open_done', 0.5)  # 500ms
+            else:
+                self._schedule_door_done('door_open_done', 0.3)  # 300ms reset
+
+        if close_relay != self._last_door_close_relay:
+            self._last_door_close_relay = close_relay
+            if close_relay == 1:
+                self._schedule_door_done('door_close_done', 0.5)  # 500ms
+            else:
+                self._schedule_door_done('door_close_done', 0.3)  # 300ms reset
+
+    def _schedule_door_done(self, signal: str, delay: float) -> None:
+        """延时后 fire door_*_done = 1/0
+
+        signal: 'door_open_done' 或 'door_close_done'
+        delay:  延时秒数
+        """
+        i_addr = self.mapper.db_to_i(
+            self.mapper.addr_input(signal, self.car_id)
+        )
+        # 取消旧任务
+        old = self._door_done_tasks.pop(signal, None)
+        if old and not old.done():
+            old.cancel()
+
+        async def trigger():
+            try:
+                await asyncio.sleep(delay)
+                # 读当前继电器状态决定 done 值
+                if signal == 'door_open_done':
+                    relay = self.io.get_output(
+                        self.mapper.addr_output('door_open_relay', self.car_id)
+                    )
+                else:
+                    relay = self.io.get_output(
+                        self.mapper.addr_output('door_close_relay', self.car_id)
+                    )
+                self.io.simulate_input(i_addr, relay)
+            except asyncio.CancelledError:
+                pass
+
+        self._door_done_tasks[signal] = asyncio.create_task(trigger())
