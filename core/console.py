@@ -18,7 +18,7 @@ from .io_client import IOEvent
 HELP_TEXT = """
 可用命令:
   /car <id> <action> [args...]   指定轿厢执行命令
-    动作: init / call / status / manual / auto
+    动作: init / call / change / fireman / status / manual / auto
   /clear                         将所有输出位置零（不含 ready 信号）
   /debug show pass_floor         toggle 平层监视（每次经过楼层输出 [DEBUG] pass_floor L<n>）
   /debug show input_change       toggle 输入变化监视（打印变化的 I 点信号名）
@@ -39,6 +39,8 @@ HELP_TEXT = """
   /car 1 manual                  进入手动控制（方向键控制，ESC 退出）
   /car 1 auto                    切回自动控制
   /car 1 call 5                  1 号梯内召 5 楼
+  /car 1 change 6               1 号梯中途改目标为 6 楼（仅运行中可改短行程）
+  /car 1 fireman 5              1 号梯救火到 5 楼（自动停靠最近平层点后倒车）
   /car 1 status                  查看 1 号梯状态
   /clear                         清空所有输出
 
@@ -140,13 +142,15 @@ class Console:
 
             cmds = sorted([f'/{c}' for c in self._commands])
             commands_with_subs: dict[str, list[str]] = {
-                '/car': ['init', 'call', 'status', 'manual', 'auto'],
+                '/car': ['init', 'call', 'change', 'fireman', 'status', 'manual', 'auto'],
                 '/debug': ['show'],
                 '/module': ['station_seek'],
             }
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+                'change': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+                'fireman': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek'],
                 'station_seek': ['true', 'false'],
             }
@@ -484,6 +488,10 @@ class Console:
             await self._do_init(sub_args)
         elif sub_action == 'call':
             await self._do_call(sub_args)
+        elif sub_action == 'change':
+            await self._do_change(sub_args)
+        elif sub_action == 'fireman':
+            await self._do_fireman(sub_args)
         elif sub_action == 'status':
             await self._do_status(sub_args)
         elif sub_action == 'manual':
@@ -877,6 +885,56 @@ class Console:
             await self.app.manual_auto(car_id=self.current_car_id)
         await self.app.call_internal(floor, car_id=self.current_car_id)
         print(f'car {self.current_car_id} 已内召 L{floor}')
+
+    async def _do_change(self, args: list[str]) -> None:
+        """/car N change <floor> — 中途改目的地"""
+        if not args:
+            print('用法: /car N change <floor>')
+            return
+        try:
+            floor = int(args[0])
+        except ValueError:
+            print(f'楼层必须是整数: {args[0]}')
+            return
+
+        result = await self.app.change_internal(floor, self.current_car_id)
+        if result == 'accepted':
+            print(f'car {self.current_car_id} change 接受: 目的地已改为 L{floor}')
+        elif result == 'rejected':
+            print(f'car {self.current_car_id} change 拒绝: 无法在当前位置刹停到 L{floor}，继续原行程')
+        elif result == 'not_running':
+            print(f'car {self.current_car_id} change 未运行: 电梯当前未在移动')
+        else:
+            print(f'未知状态: {result}')
+
+    async def _do_fireman(self, args: list[str]) -> None:
+        """/car N fireman <floor> — 救火命令"""
+        if not args:
+            print('用法: /car N fireman <floor>')
+            return
+        try:
+            floor = int(args[0])
+        except ValueError:
+            print(f'楼层必须是整数: {args[0]}')
+            return
+
+        result = await self.app.fireman(floor, self.current_car_id)
+        status = result['status']
+        if status == 'called':
+            print(f'car {self.current_car_id} fireman: 电梯未在运行，已内召 L{floor}')
+        elif status == 'noop':
+            print(f'car {self.current_car_id} fireman: 已在去 L{floor} 的路上')
+        elif status == 'changed':
+            print(f'car {self.current_car_id} fireman: 已直接切入 L{floor}，原队列已清空')
+        elif status == 'waypoint':
+            wp = result['waypoint']
+            print(f'car {self.current_car_id} fireman: 先停靠 L{wp}，到站后自动倒车去 L{floor}')
+        elif status == 'queued':
+            print(f'car {self.current_car_id} fireman: 无合法中间站，等当前任务完成后 call L{floor}')
+        elif status == 'invalid':
+            print(f'car {self.current_car_id} fireman: 当前状态不支持救火命令')
+        else:
+            print(f'car {self.current_car_id} fireman: 未知状态 {status}')
 
     async def cmd_clear(self, args: list[str]) -> None:
         await self.app.clear_outputs()

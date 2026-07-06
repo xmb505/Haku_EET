@@ -383,3 +383,187 @@ async def test_batch_call_scenario_replays_user_bug(app: App):
     assert app.pending_calls[2] == [], \
         f'期望 pending 清空，实际 {app.pending_calls[2]}'
     assert app.cars[2].target_floor is None
+
+
+# ===== change_internal 测试 =====
+
+@pytest.mark.asyncio
+async def test_change_not_running(app: App):
+    """空闲时 change → not_running"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 3
+    app.cars[1].target_floor = 9
+
+    result = await app.change_internal(6, car_id=1)
+    assert result == 'not_running'
+    # target_floor 不应被修改
+    assert app.cars[1].target_floor == 9
+
+
+@pytest.mark.asyncio
+async def test_change_accepted(app: App):
+    """MOVE_UP pos=3 target=9 change=6 → accepted, target 改为 6, pending 清空"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 3
+    app.cars[1].target_floor = 9
+    app.pending_calls[1] = [9]
+    app.executors[1].current_action = Action(ActionKind.MOVE_UP)
+
+    result = await app.change_internal(6, car_id=1)
+    assert result == 'accepted'
+    assert app.cars[1].target_floor == 6
+    assert app.pending_calls[1] == []
+
+
+@pytest.mark.asyncio
+async def test_change_rejected_too_late(app: App):
+    """MOVE_UP pos=5 target=9 change=6 → rejected（已过 5 楼）"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+    app.cars[1].target_floor = 9
+    app.pending_calls[1] = [9]
+    app.executors[1].current_action = Action(ActionKind.MOVE_UP)
+
+    result = await app.change_internal(6, car_id=1)
+    assert result == 'rejected'
+    # target_floor 不应被修改
+    assert app.cars[1].target_floor == 9
+    assert app.pending_calls[1] == [9]
+
+
+@pytest.mark.asyncio
+async def test_change_rejected_extends(app: App):
+    """MOVE_UP pos=3 target=4 change=6 → rejected（延长行程，应用 call）"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 3
+    app.cars[1].target_floor = 4
+    app.pending_calls[1] = [4]
+    app.executors[1].current_action = Action(ActionKind.MOVE_UP)
+
+    result = await app.change_internal(6, car_id=1)
+    assert result == 'rejected'
+    assert app.cars[1].target_floor == 4
+
+
+@pytest.mark.asyncio
+async def test_change_down_accepted(app: App):
+    """MOVE_DOWN pos=8 target=2 change=5 → accepted"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 8
+    app.cars[1].target_floor = 2
+    app.pending_calls[1] = [2]
+    app.executors[1].current_action = Action(ActionKind.MOVE_DOWN)
+
+    result = await app.change_internal(5, car_id=1)
+    assert result == 'accepted'
+    assert app.cars[1].target_floor == 5
+    assert app.pending_calls[1] == []
+
+
+@pytest.mark.asyncio
+async def test_change_down_rejected_too_late(app: App):
+    """MOVE_DOWN pos=5 target=2 change=5 → rejected（已过 5 楼）"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+    app.cars[1].target_floor = 2
+    app.pending_calls[1] = [2]
+    app.executors[1].current_action = Action(ActionKind.MOVE_DOWN)
+
+    result = await app.change_internal(5, car_id=1)
+    assert result == 'rejected'
+    assert app.cars[1].target_floor == 2
+
+
+# ===== fireman 测试 =====
+
+@pytest.mark.asyncio
+async def test_fireman_not_moving(app: App):
+    """不在运行 → called"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 5
+
+    result = await app.fireman(3, car_id=1)
+    assert result['status'] == 'called'
+    assert 3 in app.pending_calls[1]
+
+
+@pytest.mark.asyncio
+async def test_fireman_direct_change(app: App):
+    """MOVE_UP pos=4→10 fireman=6 → changed（场景A：顺向刹得住）"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 4
+    app.cars[1].target_floor = 10
+    app.pending_calls[1] = [10]
+    app.executors[1].current_action = Action(ActionKind.MOVE_UP)
+
+    result = await app.fireman(6, car_id=1)
+    assert result['status'] == 'changed'
+    # change_internal 已清空 pending + 改了 target
+    assert app.cars[1].target_floor == 6
+    assert app.pending_calls[1] == []
+
+
+@pytest.mark.asyncio
+async def test_fireman_waypoint(app: App):
+    """MOVE_UP pos=4→10 fireman=5 → waypoint（场景B：顺向刹不住，先到6再倒车）"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 4
+    app.cars[1].target_floor = 10
+    app.pending_calls[1] = [10, 8]
+    app.executors[1].current_action = Action(ActionKind.MOVE_UP)
+
+    result = await app.fireman(5, car_id=1)
+    assert result['status'] == 'waypoint'
+    assert result['waypoint'] == 6
+    # change_internal(6) 清空 pending 改 target
+    assert app.cars[1].target_floor == 6
+    # pending 被 change 清空后追加了 fireman floor
+    assert app.pending_calls[1] == [5]
+
+
+@pytest.mark.asyncio
+async def test_fireman_queued_no_waypoint(app: App):
+    """MOVE_UP pos=9→10 fireman=4 → queued（场景C：无合法中间站）"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 9
+    app.cars[1].target_floor = 10
+    app.pending_calls[1] = [10]
+    app.executors[1].current_action = Action(ActionKind.MOVE_UP)
+
+    result = await app.fireman(4, car_id=1)
+    assert result['status'] == 'queued'
+    # target_floor 不动（change 未调用）
+    assert app.cars[1].target_floor == 10
+    # 队列清空只剩 fireman
+    assert app.pending_calls[1] == [4]
+
+
+@pytest.mark.asyncio
+async def test_fireman_down_direct(app: App):
+    """MOVE_DOWN pos=7→2 fireman=3 → changed（场景D：顺向刹得住）"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 7
+    app.cars[1].target_floor = 2
+    app.pending_calls[1] = [2]
+    app.executors[1].current_action = Action(ActionKind.MOVE_DOWN)
+
+    result = await app.fireman(3, car_id=1)
+    assert result['status'] == 'changed'
+    assert app.cars[1].target_floor == 3
+    assert app.pending_calls[1] == []
+
+
+@pytest.mark.asyncio
+async def test_fireman_same_target(app: App):
+    """fireman floor == target → noop"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 4
+    app.cars[1].target_floor = 6
+    app.pending_calls[1] = [6]
+    app.executors[1].current_action = Action(ActionKind.MOVE_UP)
+
+    result = await app.fireman(6, car_id=1)
+    assert result['status'] == 'noop'
+    # 一切不变
+    assert app.cars[1].target_floor == 6
+    assert app.pending_calls[1] == [6]

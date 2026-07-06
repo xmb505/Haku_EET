@@ -270,6 +270,125 @@ class App:
             self.cars[cid].target_floor = floor
         await self._tick(cid)
 
+    async def change_internal(self, floor: int, car_id: int) -> str:
+        """中途更改目的地
+
+        MOVE_UP/MOVE_DOWN 运行时，将目标改为一个更近的楼层（缩短行程）。
+        如果电梯已经过了刹得住的位置，则拒绝。
+
+        Returns:
+            'accepted'  — 已接受：清空 pending_calls，改 target_floor 为 floor
+            'rejected'  — 拒绝：无法在当前位置刹停到目标楼层
+            'not_running' — 电梯当前未在移动
+        """
+        cid = car_id
+        car = self.cars[cid]
+        exe = self.executors[cid]
+        building = self.config['building']
+
+        # 0. 楼层范围检查
+        if not (building['min_floor'] <= floor <= building['max_floor']):
+            return 'rejected'
+
+        # 1. 必须正在运行 MOVE
+        action = exe.current_action
+        if action is None or action.kind not in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN):
+            return 'not_running'
+
+        pos = car.position
+        target = car.target_floor
+        if pos is None or target is None:
+            return 'not_running'
+
+        # 2. 方向判断 + 缩短检查 + 刹车距离检查
+        if action.kind == ActionKind.MOVE_UP:
+            # 上行：change 必须在当前位置至少 1 层之上（留刹车指令下发时间）、原目标之下
+            if not (pos + 1 < floor < target):
+                return 'rejected'
+        else:  # MOVE_DOWN
+            # 下行：change 必须在当前位置至少 1 层之下、原目标之上
+            if not (pos - 1 > floor > target):
+                return 'rejected'
+
+        # 3. 接受：改目标 + 清队列
+        car.target_floor = floor
+        self.pending_calls[cid].clear()
+        return 'accepted'
+
+    async def fireman(self, floor: int, car_id: int) -> dict:
+        """救火命令：找到最近可平层停靠的楼层，先停车再换向
+
+        核心原则：不可中途倒车——必须先在一个合法楼层完成平层停靠后，
+        再改变运行方向。直接倒车会破坏楼层计数器。
+
+        Returns:
+            {'status': 'called'|'noop'|'changed'|'waypoint'|'queued',
+             'waypoint': int|None}
+        """
+        cid = car_id
+        car = self.cars[cid]
+        exe = self.executors[cid]
+        building = self.config['building']
+
+        # 0. 楼层范围检查
+        if not (building['min_floor'] <= floor <= building['max_floor']):
+            return {'status': 'invalid'}
+        if car.position is None or car.state != CarState.READY:
+            return {'status': 'invalid'}
+
+        action = exe.current_action
+        pos = car.position
+        target = car.target_floor
+
+        # 1. 不在 MOVE → call
+        if action is None or action.kind not in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN):
+            await self.call_internal(floor, car_id=cid)
+            return {'status': 'called'}
+
+        # 2. 已在去目标层的路上
+        if floor == target:
+            return {'status': 'noop'}
+
+        if action.kind == ActionKind.MOVE_UP:
+            # === 上行 ===
+            # a. 顺向且刹得住：直接 change
+            if pos + 1 < floor <= target:
+                await self.change_internal(floor, car_id=cid)
+                return {'status': 'changed'}
+
+            # b. 刹不住 / 逆向 / 延长 → 找 waypoint
+            waypoint = pos + 2
+            if waypoint < target:
+                # 有中间站可停靠 → 先平层到 waypoint，再倒车
+                await self.change_internal(waypoint, car_id=cid)
+                self.pending_calls[cid].append(floor)
+                return {'status': 'waypoint', 'waypoint': waypoint}
+
+            # 无中间站（如 pos=9→target=10）→ 等当前 MOVE 完再 call
+            self.pending_calls[cid].clear()
+            self.pending_calls[cid].append(floor)
+            return {'status': 'queued'}
+
+        else:
+            # === 下行 ===
+            # a. 顺向且刹得住：直接 change
+            if pos - 1 > floor >= target:
+                await self.change_internal(floor, car_id=cid)
+                return {'status': 'changed'}
+
+            # b. 刹不住 / 逆向 / 延长 → 找 waypoint
+            waypoint = pos - 2
+            if waypoint > target:
+                # 有中间站可停靠 → 先平层到 waypoint，再倒车
+                await self.change_internal(waypoint, car_id=cid)
+                self.pending_calls[cid].append(floor)
+                return {'status': 'waypoint', 'waypoint': waypoint}
+
+            # 无中间站 → 等当前 MOVE 完再 call
+            self.pending_calls[cid].clear()
+            self.pending_calls[cid].append(floor)
+            return {'status': 'queued'}
+
     async def reset(self, direction: str | None = None,
                     target_floor: int | None = None,
                     car_id: int | None = None) -> None:
