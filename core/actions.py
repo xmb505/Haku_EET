@@ -36,17 +36,19 @@ class Action:
         - floor 给定 → 查 display_config.floor_display 映射到字符
         - glyph 给定 → 直接用字符（跳过 floor 映射，比如 'up'/'down'/'fault'）
     MOVE_UP/MOVE_DOWN 由硬件层看 car.target_floor 自动决定停哪层。
+
     """
     kind: ActionKind
     floor: int | None = None
     glyph: str | None = None
 
     def __repr__(self) -> str:
+        parts = [self.kind.value]
         if self.floor is not None:
-            return f'Action({self.kind.value}, floor={self.floor})'
+            parts.append(f'floor={self.floor}')
         if self.glyph is not None:
-            return f'Action({self.kind.value}, glyph={self.glyph!r})'
-        return f'Action({self.kind.value})'
+            parts.append(f'glyph={self.glyph!r}')
+        return f'Action({", ".join(parts)})'
 
 
 class ActionQueue:

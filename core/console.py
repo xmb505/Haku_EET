@@ -17,9 +17,12 @@ from .io_client import IOEvent
 
 HELP_TEXT = """
 可用命令:
+  /buttonui out <floor|list> <up|down> [true|false]   外召按钮指示灯
+  /buttonui in <car_id|all> <floor|list> [true|false]  轿内按钮 LED（支持 3 / 1,2,3 / 1-10 / all）
   /car <id> <action> [args...]   指定轿厢执行命令
     动作: init / call / change / fireman / status / manual / auto
   /clear                         将所有输出位置零（不含 ready 信号）
+  /door <car_id> <open|close> [force]   控制开关门（force 跳过预检,运行中拒绝）
   /debug show pass_floor         toggle 平层监视（每次经过楼层输出 [DEBUG] pass_floor L<n>）
   /debug show input_change       toggle 输入变化监视（打印变化的 I 点信号名）
   /debug show websocket_connect_status  toggle WebSocket 连接状态监视
@@ -27,8 +30,11 @@ HELP_TEXT = """
   /debug show elevator_speed      toggle 速度档位监视（高速/减速/刹车）
   /debug show level_check        toggle 平层检测（每次 level 翻转打印所有车 ↑↓）
   /debug show station_seek       toggle 站点吸附（吸附状态 / 反冲中 / 平层信号）
+  /debug show door_status        toggle 门动作完成监视(/door 完成时输出 [door] car N 完成)
   /module <name> [true|false]        切换功能模块（默认关）
     模块: station_seek  站点吸附——到站后保持完美平层,偏离全速反冲
+  /ui <car_id|all> <type> [true|false]   轿厢状态指示灯
+    type: max(满载) / warn(故障) / fan / light
   /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
@@ -44,6 +50,14 @@ HELP_TEXT = """
   /car 1 change 6               1 号梯中途改目标为 6 楼（仅运行中可改短行程）
   /car 1 fireman 5              1 号梯救火到 5 楼（自动停靠最近平层点后倒车）
   /car 1 status                  查看 1 号梯状态
+  /ui 1 max true                 亮起 1 号梯满载指示灯
+  /ui all warn true              所有梯亮故障灯
+  /buttonui out 1 up true        亮起外部 1 层上行按钮灯
+  /buttonui in 1 1               toggle 1 号梯轿内 1 楼按钮灯
+  /buttonui in 1,2,3 1-5 true   批量:1/2/3 号梯轿内 1-5 楼按钮灯全亮
+  /buttonui out 1-9 up true     批量:外召 1-9 层上行按钮灯全亮
+  /door 1 open                  1 号梯开门（等待门锁到位）
+  /door 1 close force           1 号梯强制关门（不等待不检测）
   /clear                         清空所有输出
 
 提示:
@@ -68,13 +82,16 @@ class Console:
         # 当前选中的 car_id（/car <id> 切换）
         self.current_car_id: int = app.car.car_id
         self._commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
+            'buttonui': self.cmd_buttonui,
             'car': self.cmd_car,
             'clear': self.cmd_clear,
             'debug': self.cmd_debug,
+            'door': self.cmd_door,
             'help': self.cmd_help,
             'module': self.cmd_module,
             'reload': self.cmd_reload,
             'quit': self.cmd_quit,
+            'ui': self.cmd_ui,
             'usermode': self.cmd_usermode,
         }
         # debug 监视项状态
@@ -90,6 +107,8 @@ class Console:
         self._level_check_listener_ref = None
         self.level_seek_debug_enabled: bool = False
         self._level_seek_debug_listener_ref = None
+        self.door_status_monitor_enabled: bool = False
+        self._door_status_listener_ref = None
         self._last_ws_connected: bool = False
         self.exec_trace_enabled: bool = False
         self.elevator_speed_enabled: bool = False
@@ -118,6 +137,49 @@ class Console:
             if cid not in self.app.car_ids:
                 raise ValueError(f'无效轿厢 ID: {cid}')
         return ids
+
+    def _parse_floor_list(self, s: str) -> list[int]:
+        """'1,2,3' / '1-10' / 'all' / '5' → list[int]（1-10 范围）
+
+        与 _parse_car_list 对称,但校验楼层范围 1-10(建筑实际可用层)。
+        """
+        s = s.strip()
+        if s == 'all':
+            return list(range(1, 11))
+        # 范围: 1-10
+        if '-' in s:
+            try:
+                parts = s.split('-', 1)
+                lo, hi = int(parts[0]), int(parts[1])
+            except ValueError:
+                raise ValueError(f'楼层范围格式错误: {s!r}（应为 "1-10" 格式）')
+            if not (1 <= lo <= 10 and 1 <= hi <= 10 and lo <= hi):
+                raise ValueError(f'楼层范围错误: {s}（每层 1-10 且 lo <= hi）')
+            return list(range(lo, hi + 1))
+        # 逗号列表
+        floors = [int(x.strip()) for x in s.split(',') if x.strip()]
+        for f in floors:
+            if not (1 <= f <= 10):
+                raise ValueError(f'楼层超出范围: {f}（应为 1-10）')
+        return floors
+
+    @staticmethod
+    def _format_floors(floors: list[int]) -> str:
+        """楼层列表 → 显示字符串(连续 → 范围,否则 → 逗号)
+
+        例:
+          [3]              → '3'
+          [1, 2, 3, 4, 5]  → '1-5'
+          [1, 3, 5]        → '1,3,5'
+        """
+        if not floors:
+            return ''
+        s = sorted(set(floors))
+        if len(s) == 1:
+            return str(s[0])
+        if s == list(range(s[0], s[-1] + 1)):
+            return f'{s[0]}-{s[-1]}'
+        return ','.join(str(f) for f in s)
 
     def _parse_token_list(self, s: str, *, cast=int, sep=','):
         """'1,2,3' → [1,2,3]  或 'up,down' → ['up','down']"""
@@ -149,7 +211,10 @@ class Console:
             commands_with_subs: dict[str, list[str]] = {
                 '/car': ['init', 'call', 'change', 'fireman', 'status', 'manual', 'auto'],
                 '/debug': ['show'],
+                '/door': ['open', 'close'],
                 '/module': ['station_seek'],
+                '/ui': ['max', 'warn', 'fan', 'light'],
+                '/buttonui': ['out', 'in'],
                 '/usermode': ['true', 'false'],
             }
             sub_sub_args: dict[str, list[str]] = {
@@ -157,8 +222,15 @@ class Console:
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'change': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'fireman': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status'],
                 'station_seek': ['true', 'false'],
+                'max': ['true', 'false'],
+                'warn': ['true', 'false'],
+                'fan': ['true', 'false'],
+                'light': ['true', 'false'],
+                'out': ['up', 'down'],
+                'open': ['force'],
+                'close': ['force'],
             }
 
             # ===== 通用补全原语 =====
@@ -259,6 +331,63 @@ class Console:
                 yield from self._yield_options(
                     [str(i) for i in range(1, 11)], word)
 
+            def _complete_floor(self, word):
+                """楼层号补全：单数字 / 'all' / 逗号列表 / 范围
+
+                候选池 = 1..10 + 'all'。
+                例:
+                  ''      → 1,2,3,4,5,6,7,8,9,10,all
+                  '1'     → 1,1-10,10（优先匹配 1 / 1-10 / 10）
+                  '1,'    → 2,3,4,5,6,7,8,9,10（不含 all）
+                  '1,3,'  → 2,4,5,6,7,8,9,10
+                  'all'   → all
+                """
+                candidates = [str(i) for i in range(1, 11)] + ['all']
+
+                # word 含 ',' → 按最后 token 前缀匹配
+                if ',' in word:
+                    if word.endswith(','):
+                        # 已确定的逗号列表 → 补剩余数字(不含 all)
+                        used = self._parse_used_floors(word)
+                        remaining = [f for f in range(1, 11) if f not in used]
+                        yield from self._yield_options(
+                            [str(f) for f in remaining], '')
+                        return
+                    # 中间状态: '1,2' / '1,a' → 按 last_token 过滤候选
+                    last_token = word.rsplit(',', 1)[-1]
+                    yield from self._yield_options(candidates, last_token)
+                    return
+
+                # 单 token
+                yield from self._yield_options(candidates, word)
+
+            @staticmethod
+            def _parse_used_floors(word: str) -> set[int]:
+                """从 '1,2,3-5,all,6,' 之类的字符串解析已出现的楼层集合
+
+                只接受 _parse_floor_list 能解析的形态。
+                异常 token 忽略（不抛,补全不应让用户输入崩）。
+                """
+                used: set[int] = set()
+                for token in word.split(','):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    if token == 'all':
+                        used.update(range(1, 11))
+                    elif '-' in token:
+                        try:
+                            lo_s, hi_s = token.split('-', 1)
+                            lo, hi = int(lo_s), int(hi_s)
+                            used.update(range(lo, hi + 1))
+                        except ValueError:
+                            pass
+                    elif token.isdigit():
+                        n = int(token)
+                        if 1 <= n <= 10:
+                            used.add(n)
+                return used
+
             # ===== 主调度器 =====
 
             def get_completions(self, document, complete_event):
@@ -321,7 +450,7 @@ class Console:
                     yield from self._complete_sub_arg(current_word, parts[1])
                     return
 
-                # 5. /module 路径：子命令 → on/off
+                # 5. /module 路径：子命令 → true/false
                 if cmd == '/module':
                     if len(parts) < 2:
                         yield from self._complete_sub_cmd(
@@ -329,6 +458,74 @@ class Console:
                         return
                     yield from self._complete_sub_arg(current_word, parts[1])
                     return
+
+                # 6. /ui 路径：car_id|all → type → true/false
+                if cmd == '/ui':
+                    if len(parts) < 2:
+                        yield from self._complete_car_id(current_word)
+                        return
+                    raw = parts[1]
+                    if not self._looks_like_car_id(raw):
+                        yield from self._complete_car_id(current_word)
+                        return
+                    if len(parts) < 3:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    yield from self._complete_sub_arg(current_word, parts[2])
+                    return
+
+                # 6b. /door 路径：car_id → open|close → [force]
+                if cmd == '/door':
+                    if len(parts) < 2:
+                        yield from self._complete_car_id(current_word)
+                        return
+                    raw = parts[1]
+                    if not self._looks_like_car_id(raw):
+                        yield from self._complete_car_id(current_word)
+                        return
+                    if len(parts) < 3:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    yield from self._complete_sub_arg(current_word, parts[2])
+                    return
+
+                # 7. /buttonui 路径：out|in → 子参数
+                if cmd == '/buttonui':
+                    if len(parts) < 2:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    scope = parts[1]
+                    if scope == 'out':
+                        # /buttonui out floor|floor_list up|down [true|false]
+                        if len(parts) < 3:
+                            yield from self._complete_floor(current_word)
+                            return
+                        if len(parts) < 4:
+                            yield from self._complete_sub_cmd(
+                                current_word, ['up', 'down'])
+                            return
+                        yield from self._yield_options(
+                            ['true', 'false'], current_word)
+                        return
+                    if scope == 'in':
+                        # /buttonui in car_id floor [true|false]
+                        #     floor 支持: 3 / 1,2,3 / 1-10 / all
+                        if len(parts) < 3:
+                            yield from self._complete_car_id(current_word)
+                            return
+                        raw = parts[2]
+                        if not self._looks_like_car_id(raw):
+                            yield from self._complete_car_id(current_word)
+                            return
+                        if len(parts) < 4:
+                            yield from self._complete_floor(current_word)
+                            return
+                        yield from self._yield_options(
+                            ['true', 'false'], current_word)
+                        return
 
             @staticmethod
             def _looks_like_car_id(raw: str) -> bool:
@@ -945,13 +1142,303 @@ class Console:
     async def cmd_clear(self, args: list[str]) -> None:
         await self.app.clear_outputs()
 
+    # ===== /door 命令 =====
+
+    async def cmd_door(self, args: list[str]) -> None:
+        """控制开关门（拉开门/关门继电器,**非阻塞**）
+
+        用法:
+          /door <car_id|all> <open|close> [force]
+            open   - 开门,预检后立即返回 dispatched,后台 task 等 door_open_done
+            close  - 关门,后台 task 等 door_close_done
+            force  - 跳过部分预检,直接拉 relay 立即返回(不等待不检测)
+
+        输出:
+          非 force:
+            - 命令同步输出 "car N: 已派发 open 命令,后台跟踪中"
+            - 完成时:仅 /debug show door_status 时输出 [door] car N 开门到位
+            - 错层时:**始终**输出 ⚠️ (错误必显,不需开关)
+          force:
+            - 命令同步输出 "force 已拉 relay"
+          rejected/busy:
+            - 命令同步输出错误
+        """
+        if len(args) < 2:
+            print('用法: /door <car_id|all> <open|close> [force]')
+            return
+        try:
+            car_ids = self._parse_car_list(args[0])
+        except (ValueError, IndexError) as e:
+            print(f'参数错误: {e}')
+            return
+        action = args[1].lower()
+        if action not in ('open', 'close'):
+            print(f'参数错误: action 必须是 open 或 close,得到 {action!r}')
+            return
+        force = (len(args) >= 3 and args[2].lower() == 'force')
+
+        for cid in car_ids:
+            result = await self.app.control_door(cid, action, force)
+            status = result['status']
+            msg = result['message']
+            if status == 'dispatched':
+                print(f'car {cid}: {msg}')
+            elif status == 'force_done':
+                print(f'car {cid}: {msg}')
+            elif status == 'busy':
+                print(f'car {cid}: {msg}')
+            elif status == 'rejected':
+                print(f'car {cid}: 拒绝:{msg}')
+            # success/wrong_floor 由后台 task 或 door_status monitor 处理
+
+    # ===== UI 指示灯命令 =====
+
+    _UI_TYPE_TO_METHOD = {
+        'max':  'set_full_load',
+        'warn': 'set_fault',
+        'fan':  'set_fan',
+        'light': 'set_light',
+    }
+
+    _UI_METHOD_TO_ATTR = {
+        'set_full_load': 'full_load',
+        'set_fault':     'fault',
+        'set_fan':       'fan',
+        'set_light':     'light',
+    }
+
+    async def cmd_ui(self, args: list[str]) -> None:
+        """控制轿厢状态指示灯
+
+        用法:
+          /ui <car_id|all> <type> [true|false]
+          type ∈ {max, warn, fan, light}
+          省略 true/false 时取反当前状态(toggle)
+        """
+        if not args or len(args) < 2:
+            print('用法: /ui <car_id|all> <max|warn|fan|light> [true|false]')
+            return
+        try:
+            car_ids = self._parse_car_list(args[0])
+        except (ValueError, IndexError) as e:
+            print(f'参数错误: {e}')
+            return
+        type_str = args[1].lower()
+        if type_str not in self._UI_TYPE_TO_METHOD:
+            print(f'未知 UI 类型: {type_str}（支持: max/warn/fan/light）')
+            return
+        method_name = self._UI_TYPE_TO_METHOD[type_str]
+
+        # 解析 on/off,缺省则 toggle
+        toggle = len(args) < 3
+        on: bool | None = None
+        if not toggle:
+            arg = args[2].lower()
+            if arg == 'true':
+                on = True
+            elif arg == 'false':
+                on = False
+            else:
+                print(f'参数错误: {args[2]}（要 true / false / 省略=toggle）')
+                return
+
+        attr = self._UI_METHOD_TO_ATTR[method_name]
+        for cid in car_ids:
+            ui = self.app.ui[cid]
+            if toggle:
+                current = getattr(self.app.cars[cid].ui, attr)
+                new_on = not current
+            else:
+                new_on = on
+            await getattr(ui, method_name)(new_on)
+            print(f'car {cid} {type_str} = {new_on}')
+
+    async def cmd_buttonui(self, args: list[str]) -> None:
+        """控制外召按钮灯 / 轿内按钮 LED
+
+        用法:
+          /buttonui out <floor|floor_list> <up|down> [true|false]
+          /buttonui in <car_id|all> <floor|floor_list> [true|false]
+              floor 支持: 3 / 1,2,3 / 1-10 / all
+          省略 true/false 时取反当前状态(toggle)
+        """
+        if not args:
+            print('用法:')
+            print('  /buttonui out <floor|floor_list> <up|down> [true|false]')
+            print('  /buttonui in <car_id|all> <floor|floor_list> [true|false]')
+            print('    floor 支持: 3 / 1,2,3 / 1-10 / all')
+            return
+
+        scope = args[0].lower()
+        if scope == 'out':
+            await self._buttonui_out(args[1:])
+        elif scope == 'in':
+            await self._buttonui_in(args[1:])
+        else:
+            print(f'未知 scope: {scope}（支持: out / in）')
+
+    async def _buttonui_out(self, args: list[str]) -> None:
+        """/buttonui out <floor|floor_list> <up|down> [true|false]
+
+        floor 支持 1,2,3 / 1-10 / all(同 _buttonui_in)
+        每个 floor 按 direction 单独校验:
+            up:   1-9(10 没上行按钮)
+            down: 2-10(1 没下行按钮)
+        """
+        if len(args) < 2:
+            print('用法: /buttonui out <floor|floor_list> <up|down> [true|false]')
+            print('  floor 支持: 3 / 1,2,3 / 1-10 / all')
+            return
+        try:
+            floors = self._parse_floor_list(args[0])
+        except ValueError as e:
+            print(f'参数错误: {e}')
+            return
+        direction = args[1].lower()
+        if direction not in ('up', 'down'):
+            print(f'参数错误: 方向必须是 up 或 down')
+            return
+        # 按 direction 过滤每层（不直接整批 reject——而是跳过非法层 + 警告）
+        valid_floors: list[int] = []
+        for f in floors:
+            if direction == 'up' and not (1 <= f <= 9):
+                print(f'  跳过: 楼层 {f} 没有上行指示灯(1-9 才有)')
+                continue
+            if direction == 'down' and not (2 <= f <= 10):
+                print(f'  跳过: 楼层 {f} 没有下行指示灯(2-10 才有)')
+                continue
+            valid_floors.append(f)
+        if not valid_floors:
+            print('错误: 给定楼层列表中没有合法目标')
+            return
+
+        # 解析 on/off,缺省则逐个 toggle
+        toggle = len(args) < 3
+        on: bool | None = None
+        if not toggle:
+            arg = args[2].lower()
+            if arg == 'true':
+                on = True
+            elif arg == 'false':
+                on = False
+            else:
+                print(f'参数错误: {args[2]}（要 true / false / 省略=toggle）')
+                return
+
+        # 收集所有 (floor, new_state) 对
+        actions: list[tuple[int, bool]] = []
+        for floor in valid_floors:
+            if toggle:
+                led_on = not self.app.hall_indicator_state(floor, direction)
+            else:
+                led_on = on
+            actions.append((floor, led_on))
+
+        # 执行 IO 写
+        for floor, led_on in actions:
+            await self.app.set_hall_indicator(floor, direction, led_on)
+
+        # 输出:单层逐行,批量合并
+        if len(actions) == 1:
+            floor, led_on = actions[0]
+            print(f'hall_indicator_{direction}_{floor} = {led_on}')
+        else:
+            floors_str = self._format_floors([f for f, _ in actions])
+            if toggle:
+                state_word = '已 toggle'
+            elif on:
+                state_word = '全亮'
+            else:
+                state_word = '全灭'
+            print(
+                f'hall_indicator_{direction} {floors_str} 楼 LED '
+                f'{state_word} ({len(actions)} 个)'
+            )
+
+    async def _buttonui_in(self, args: list[str]) -> None:
+        """/buttonui in <car_id|all> <floor|floor_list> [true|false]
+
+        floor 支持:
+          单层:     3
+          多层:     1,2,3
+          范围:     1-10
+          全部:     all
+
+        与 car_id 形成笛卡尔积,每条组合各设一次。
+        省略 true/false 时逐个 toggle 自身当前状态。
+        """
+        if len(args) < 2:
+            print('用法: /buttonui in <car_id|all> <floor|floor_list> [true|false]')
+            print('  floor 支持: 3 / 1,2,3 / 1-10 / all')
+            return
+        try:
+            car_ids = self._parse_car_list(args[0])
+        except (ValueError, IndexError) as e:
+            print(f'参数错误: {e}')
+            return
+        try:
+            floors = self._parse_floor_list(args[1])
+        except ValueError as e:
+            print(f'参数错误: {e}')
+            return
+
+        # 解析 on/off,缺省则 toggle
+        toggle = len(args) < 3
+        on: bool | None = None
+        if not toggle:
+            arg = args[2].lower()
+            if arg == 'true':
+                on = True
+            elif arg == 'false':
+                on = False
+            else:
+                print(f'参数错误: {args[2]}（要 true / false / 省略=toggle）')
+                return
+
+        # 收集所有 (cid, floor, new_state) 对
+        actions: list[tuple[int, int, bool]] = []
+        for cid in car_ids:
+            car = self.app.cars[cid]
+            for floor in floors:
+                if toggle:
+                    current = car.ui.cabin_button_leds.get(floor, False)
+                    led_on = not current
+                else:
+                    led_on = on
+                actions.append((cid, floor, led_on))
+
+        # 执行 IO 写
+        for cid, floor, led_on in actions:
+            await self.app.ui[cid].set_cabin_button_led(floor, led_on)
+
+        # 输出:单车单层逐行,批量按车合并
+        if len(actions) == 1:
+            cid, floor, led_on = actions[0]
+            print(f'car {cid} cabin_button_led_{floor} = {led_on}')
+        else:
+            for cid in car_ids:
+                car_actions = [(f, s) for c, f, s in actions if c == cid]
+                if not car_actions:
+                    continue
+                floors_str = self._format_floors([f for f, _ in car_actions])
+                if toggle:
+                    state_word = '已 toggle'
+                elif on:
+                    state_word = '全亮'
+                else:
+                    state_word = '全灭'
+                print(
+                    f'car {cid}: {floors_str} 楼 LED {state_word} '
+                    f'({len(car_actions)} 个)'
+                )
+
     async def cmd_module(self, args: list[str]) -> None:
         """切换功能模块开关
 
         用法:
           /module                       显示所有模块当前状态
           /module station_seek          显示当前状态
-          /module station_seek on|off   切换
+          /module station_seek true|false 切换
         """
         if not args:
             self._show_module_status()
@@ -1041,6 +1528,8 @@ class Console:
             print(f'level_check 监视:           {lc}')
             lh = '启用' if self.level_seek_debug_enabled else '禁用'
             print(f'拉扯(站点吸附)监视:         {lh}')
+            ds = '启用' if self.door_status_monitor_enabled else '禁用'
+            print(f'door_status 监视:          {ds}')
             return
         topic = args[1]
         if topic == 'pass_floor':
@@ -1057,6 +1546,8 @@ class Console:
             self._toggle_level_check_monitor()
         elif topic in ('拉扯', 'station_seek'):
             self._toggle_level_seek_debug()
+        elif topic == 'door_status':
+            self._toggle_door_status_monitor()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -1394,6 +1885,37 @@ class Console:
                         sys.stderr.flush()
         except asyncio.CancelledError:
             pass
+
+    def _toggle_door_status_monitor(self) -> None:
+        """toggle 门动作完成监视：监听 door_open_done / door_close_done
+
+        启用后,/door 命令完成后会打印 [door] car N open完成
+        错层错误始终打印(不受此开关影响)
+        """
+        if self.door_status_monitor_enabled:
+            self.door_status_monitor_enabled = False
+            if self._door_status_listener_ref:
+                self.app.io.remove_listener(self._door_status_listener_ref)
+                self._door_status_listener_ref = None
+            print('[debug] door_status 监视已禁用')
+        else:
+            self.door_status_monitor_enabled = True
+
+            async def door_status_listener(event) -> None:
+                if not self.door_status_monitor_enabled:
+                    return
+                sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
+                if not sig:
+                    return
+                car_id, signal_name = sig
+                if signal_name == 'door_open_done' and event.bit == 1:
+                    print(f'[door] car {car_id} 开门到位')
+                elif signal_name == 'door_close_done' and event.bit == 1:
+                    print(f'[door] car {car_id} 关门到位')
+
+            self._door_status_listener_ref = door_status_listener
+            self.app.io.add_listener(door_status_listener)
+            print('[debug] door_status 监视已启用(/door 完成时输出)')
 
     async def cmd_reload(self, args: list[str]) -> None:
         await self.app.reload()

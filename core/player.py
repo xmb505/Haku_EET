@@ -51,6 +51,21 @@ class FaultFlags:
 
 
 @dataclass
+class IndicatorState:
+    """电梯 UI 指示灯逻辑状态（与 IO 输出解耦的游戏实体属性）
+
+    读:  car.ui.fault / car.ui.light / ...
+    写:  app.ui[cid].set_fault(True) / ...
+    严禁直接赋值 car.ui.fault = True —— 那只会改逻辑状态不同步 IO。
+    """
+    full_load: bool = False       # 满载指示灯
+    fault: bool = False           # 故障指示灯
+    light: bool = False           # 照明
+    fan: bool = False             # 风扇
+    cabin_button_leds: dict[int, bool] = field(default_factory=dict)  # 轿内按钮 LED：floor → on
+
+
+@dataclass
 class Car:
     """
     电梯 = 玩家（首版单实例）
@@ -67,6 +82,7 @@ class Car:
     display: int = 1                         # 7 段显示的楼层数字
     manual_speed: bool | None = None         # 手动模式当前速度档 (True=高速, False=低速, None=未在动)
     human_presence: int = -1                 # -1=确定无人, 0=不确定, 1=确定有人
+    ui: IndicatorState = field(default_factory=IndicatorState)  # UI 指示灯逻辑状态
 
     def is_ready(self) -> bool:
         return self.state == CarState.READY and not self.fault.service_mode
@@ -88,6 +104,13 @@ class Car:
                 'light_curtain': self.fault.light_curtain,
                 'top_limit': self.fault.top_limit,
                 'bottom_limit': self.fault.bottom_limit,
+            },
+            'ui': {
+                'full_load': self.ui.full_load,
+                'fault': self.ui.fault,
+                'light': self.ui.light,
+                'fan': self.ui.fan,
+                'cabin_button_leds': dict(self.ui.cabin_button_leds),
             },
         }
 

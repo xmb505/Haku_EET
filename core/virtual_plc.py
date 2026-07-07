@@ -246,12 +246,16 @@ class VirtualPLC:
         asyncio.create_task(reset_later())
 
     def _simulate_door_sensors(self) -> None:
-        """检测门继电器变化 → 模拟 door_open_done / door_close_done
+        """检测门继电器变化 → 模拟 door_open_done / door_close_done + 门锁状态
+
+        物理时序:门动起来 → 锁先变（开一点就 false/true）→ 门到位 → PLC 反馈 done
 
         上升沿检测：
-            door_open_relay 0→1  →  500ms 后 fire door_open_done=1
-            door_close_relay 0→1 →  500ms 后 fire door_close_done=1
-        继电器归 0 →  300ms 后复位 done 信号
+            door_open_relay 0→1  →  300ms 后 car_door_lock + floor_door_lock_{pos} → false
+                                    + 500ms 后 fire door_open_done=1
+            door_close_relay 0→1 →  300ms 后 car_door_lock + floor_door_lock_{pos} → true
+                                    + 500ms 后 fire door_close_done=1
+        继电器归 0 →  300ms 后复位 done 信号（门锁状态不归 0,等下一次继电器动作）
         """
         try:
             open_relay = self.io.get_output(
@@ -266,16 +270,52 @@ class VirtualPLC:
         if open_relay != self._last_door_open_relay:
             self._last_door_open_relay = open_relay
             if open_relay == 1:
-                self._schedule_door_done('door_open_done', 0.5)  # 500ms
+                self._schedule_door_locks(action='open', delay=0.3)
+                self._schedule_door_done('door_open_done', 0.5)
             else:
-                self._schedule_door_done('door_open_done', 0.3)  # 300ms reset
+                self._schedule_door_done('door_open_done', 0.3)
 
         if close_relay != self._last_door_close_relay:
             self._last_door_close_relay = close_relay
             if close_relay == 1:
-                self._schedule_door_done('door_close_done', 0.5)  # 500ms
+                self._schedule_door_locks(action='close', delay=0.3)
+                self._schedule_door_done('door_close_done', 0.5)
             else:
-                self._schedule_door_done('door_close_done', 0.3)  # 300ms reset
+                self._schedule_door_done('door_close_done', 0.3)
+
+    def _schedule_door_locks(self, action: str, delay: float) -> None:
+        """延时后 fire car_door_lock + floor_door_lock_{pos} 状态变化
+
+        action='open':  模拟开门到位:  锁 → false
+        action='close': 模拟关门到位:  锁 → true
+
+        位置用 car.position（executor 维护）。
+        """
+        target_bit = 0 if action == 'open' else 1
+
+        async def trigger():
+            try:
+                await asyncio.sleep(delay)
+                pos = self.car.position
+                if pos is None or not isinstance(pos, int):
+                    return
+                # car_door_lock 一定存在
+                car_lock_addr = self.mapper.db_to_i(
+                    self.mapper.addr_input('car_door_lock', self.car_id)
+                )
+                # floor_door_lock_{pos} 可能不存在（pos 越界）
+                try:
+                    floor_lock_addr = self.mapper.db_to_i(
+                        self.mapper.addr_input(f'floor_door_lock_{pos}', self.car_id)
+                    )
+                except KeyError:
+                    floor_lock_addr = None
+                self.io.simulate_input(car_lock_addr, target_bit)
+                if floor_lock_addr is not None:
+                    self.io.simulate_input(floor_lock_addr, target_bit)
+            except asyncio.CancelledError:
+                pass
+        asyncio.create_task(trigger())
 
     def _schedule_door_done(self, signal: str, delay: float) -> None:
         """延时后 fire door_*_done = 1/0

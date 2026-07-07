@@ -87,20 +87,11 @@ class ActionExecutor:
         # INITIALIZE 触到 1 限位后反向运行，逐层计数完美平层直达 target_floor
         self._init_reverse_mode: bool = False
         # 是否正处于"完美平层"瞬态（用于边沿检测：上升沿 step，下降沿 reset）
-        # ——代替旧的 _init_last_reverse_pos 防抖，因为现在 read cache 而非 state 字段，
-        #   cache 在一次脉冲中两个 signal 都=1 时单次 edge 事件可能重复触发（虚拟 PLC
-        #   fire level_up + level_down 各触发一次 dispatch）。
         self._init_perfect_leveling_active: bool = False
-        # 反向开始时的时间戳:用于跳过 base 层的第一个 (1,1)
-        # 如果 (1,1) 在 <500ms 内触发,说明在 base 层(车还没离开/level 抖动),
-        # 跳过等下一层的 (1,1) 再计数(fix car5 L0 层过早触发)
-        self._init_reverse_start_time: float | None = None
         # INITIALIZE 完成后轿厢所在的基站楼层（由方向决定：up→top, down→bottom）
         self._init_base_floor: int = 1
         # INITIALIZE 到达基站后还要移动到的目标楼层（/car N init <dir> <floor>）
         self._init_target_floor: int = 1
-        # 上一次 perfection level 触发的 position 值（防止重复递减）
-        self._init_last_reverse_pos: int | None = None
         # 基站段完成标记：反冲后第一个完美平层上升沿 = 临界点
         # 临界点前(基站段)全程低速；临界点后(客运段)用正常减速曲线
         # 比赛不计时，所以"慢起步"换取"刹得住"比"高速过冲"更重要
@@ -271,8 +262,6 @@ class ActionExecutor:
             _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
             _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
             self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
-            self._init_reverse_start_time = asyncio.get_event_loop().time()
-            self._init_last_reverse_pos = None
             self.waiting_sensor = None
             # 如果 base == target，直接完成（电梯已在目标层）
             if await self._try_complete_init_if_at_target():
@@ -396,7 +385,6 @@ class ActionExecutor:
         await self._all_outputs_off()
         self.car.state = CarState.FAULT
         self.car.direction = Direction.IDLE
-        self._init_waiting_perfect_level = False
         # 如果有当前动作也清掉（不再等传感器）
         self.current_action = None
         self.waiting_sensor = None
@@ -444,6 +432,9 @@ class ActionExecutor:
         await self.motor.hold_stop()
         self.car.direction = Direction.IDLE
         await self.motor.set_direction_indicator(None)
+        # 注:此 sleep 违反"无 sleep/wait"哲学,但实测是 PLC 物理时序的必备
+        # dead time(详见 project/brake-before-stop.md)。不允许改成 cron 或删除,
+        # 除非实机复现过冲 bug 且有 PLC 反馈信号替换方案(详见 feedback/practicality-first.md)
         await asyncio.sleep(0.1)
         if self._station_seek_enabled:
             self._level_seek_active = True
@@ -621,8 +612,6 @@ class ActionExecutor:
                 # VPLC 跑上去会撞 top_limit_2 触发 emergency）
                 self._init_reverse_mode = False
                 self._init_perfect_leveling_active = False
-                self._init_last_reverse_pos = None
-                self._init_reverse_start_time = None
                 self._init_base_segment_done = False
                 await self._execute_initialize()
 
@@ -666,11 +655,16 @@ class ActionExecutor:
                 await self._complete_action()
 
             case ActionKind.LIGHT_OFF:
+                # 注:LIGHT_OFF / LIGHT_ON 当前不被 app 控制层 dispatch,
+                # 保留 handler 是为了未来 passenger_flow 模块
+                # (由 IO 事件驱动,经 action_queue 推入)。
+                # 控制层已剥离 _schedule_lights_off 副作用。
                 await self.io.set(
                     self.mapper.addr_output('light_indicator', self.car_id), 0)
                 await self._complete_action()
 
             case ActionKind.LIGHT_ON:
+                # 同 LIGHT_OFF,留给未来 passenger_flow 模块。
                 await self.io.set(
                     self.mapper.addr_output('light_indicator', self.car_id), 1)
                 await self._complete_action()
@@ -715,8 +709,6 @@ class ActionExecutor:
             _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
             _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
             self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
-            self._init_reverse_start_time = asyncio.get_event_loop().time()
-            self._init_last_reverse_pos = None
             self.waiting_sensor = None
             self.car.direction = Direction.UP
             await self.motor.set_direction_indicator('down')
@@ -748,8 +740,6 @@ class ActionExecutor:
             _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
             _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
             self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
-            self._init_reverse_start_time = asyncio.get_event_loop().time()
-            self._init_last_reverse_pos = None
             self.waiting_sensor = None
             self.car.direction = Direction.DOWN
             await self.motor.set_direction_indicator('up')

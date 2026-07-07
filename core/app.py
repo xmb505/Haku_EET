@@ -23,7 +23,8 @@ from .display import DisplayEncoder
 from .executor import ActionExecutor
 from .io_client import IOClient, IOEvent
 from .io_mapper import IOMapper
-from .player import Car, CarState, Direction
+from .player import Car, CarState, Direction, DoorState, IndicatorState
+from .ui import UiController
 from .virtual_plc import VirtualPLC
 
 # 默认轿厢范围(若 config.yaml 里 elevator.car_ids 未配置)
@@ -122,6 +123,26 @@ class App:
                 station_seek_enabled=self.config['elevator'].get('station_seek', False),
                 action_queue=self.action_queues[cid],
             )
+
+        # 装配 per-car UiController(与 executors 平级,游戏 entity-component 模式)
+        # UI 是电梯实体的属性,通过 app.ui[cid].set_xxx() 写,car.ui.xxx 读
+        self.ui: dict[int, UiController] = {}
+        for cid in self.car_ids:
+            self.ui[cid] = UiController(
+                io_write=self.io_write[cid],
+                mapper=self.mapper,
+                car_id=cid,
+                car=self.cars[cid],
+            )
+
+        # Hall indicator 是建筑级信号(car_id=0),不属于任何轿厢
+        # 状态单独存在 App 上(不挂在 Car 上)
+        self._hall_indicator_state: dict[tuple[int, str], bool] = {}
+
+        # 同轿厢互斥锁(/door 同车不能并发)
+        # 用 bool 标志即可:asyncio 是协作式调度,await done_event.wait()
+        # 期间事件循环可调度其他 coroutine,但其他 /door 调用会看到 busy=True 而退出。
+        self._door_busy: dict[int, bool] = {cid: False for cid in self.car_ids}
 
         self._executor_task: asyncio.Task | None = None
         self.debug = False
@@ -359,13 +380,35 @@ class App:
         return _on_action_done
 
     async def _on_action_done(self, car_id: int, last_action: Action) -> None:
+        """
+        Action 完成事件分发器
+
+        只做算法编排 (mid-level):
+        - MOVE 完成 → 清 pending, 外召到站开门
+        - INITIALIZE 完成 → 启动方向运行
+        上层应用逻辑（开关门后自动流程等）通过事件监听机制由外部模块接入。
+        """
         if last_action is None:
             await self._tick(car_id)
             return
 
+        advanced = await self._handle_algorithm_state_change(car_id, last_action)
+        if not advanced:
+            await self._tick(car_id)
+
+    async def _handle_algorithm_state_change(
+        self, car_id: int, last_action: Action
+    ) -> bool:
+        """
+        算法状态转换 (mid-level)
+
+        只关心"算法编排后的电梯下一步该做什么":
+        - MOVE 完成 → 清 pending + 外召开门
+        - INITIALIZE 完成 → 启动方向运行
+        返回 True 表示已接管下一步动作(避免上层 _tick 再插一手)。
+        """
         kind = last_action.kind
 
-        # 1. MOVE 完成
         if kind in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN):
             pos = self.cars[car_id].position
             target = self.cars[car_id].target_floor
@@ -375,15 +418,13 @@ class App:
                 ]
                 origin = self.pending_call_origin[car_id].pop(target, 'internal')
                 self.cars[car_id].target_floor = None
-                # 外召到站 → 开门（内召不碰门）
+                # 外召到站 → 开门(内召不碰门)
                 if origin == 'hall':
                     await self.action_queues[car_id].put(
                         Action(ActionKind.OPEN_DOOR))
-                    return
-            await self._tick(car_id)
-            return
+                    return True
+            return False
 
-        # 2. INITIALIZE 完成
         if kind == ActionKind.INITIALIZE:
             target = last_action.floor
             if target is not None and target != self.cars[car_id].position:
@@ -393,76 +434,10 @@ class App:
                     else ActionKind.MOVE_DOWN
                 )
                 await self.action_queues[car_id].put(dir_action)
-                return
-            await self._tick(car_id)
-            return
+                return True
+            return False
 
-        # 3. OPEN_DOOR 完成 → 关门倒计时
-        if kind == ActionKind.OPEN_DOOR:
-            await self._schedule_close_door(car_id)
-            return
-
-        # 4. CLOSE_DOOR 完成 → human_presence + 熄灯倒计时 + _tick
-        if kind == ActionKind.CLOSE_DOOR:
-            car = self.cars[car_id]
-            if car.human_presence == 1:
-                car.human_presence = 0
-            if car.human_presence == 0:
-                await self._schedule_lights_off(car_id)
-            await self._tick(car_id)
-            return
-
-        # 5. LIGHT_OFF/LIGHT_ON 完成
-        if kind == ActionKind.LIGHT_OFF:
-            self.cars[car_id].human_presence = -1
-            return
-        if kind == ActionKind.LIGHT_ON:
-            self.cars[car_id].human_presence = 1
-            return
-
-        await self._tick(car_id)
-
-    async def _schedule_close_door(self, car_id: int) -> None:
-        """关门倒计时：开门后 delay 秒自动关门，光幕可推迟"""
-        delay = self.config.get('elevator', {}).get('door_close_delay', 10)
-        job = CronJob(
-            name=f'car{car_id}_close_door',
-            trigger_time=time.monotonic() + delay,
-            delay=delay,
-            action=self._make_push_action(car_id, ActionKind.CLOSE_DOOR),
-            event_rules=[
-                EventRule('light_curtain', car_id, 'reschedule', delay),
-            ],
-        )
-        await self.cron.schedule(job)
-
-    async def _schedule_lights_off(self, car_id: int) -> None:
-        """熄灯倒计时：关门后 delay 秒熄灯，内部按钮/开门自毁"""
-        delay = self.config.get('elevator', {}).get('light_off_delay', 600)
-        building = self.config.get('building', {})
-        min_f = building.get('min_floor', 1)
-        max_f = building.get('max_floor', 10)
-
-        rules = [
-            EventRule('door_open_done', car_id, 'cancel'),
-        ]
-        for floor in range(min_f, max_f + 1):
-            rules.append(EventRule(f'cabin_button_{floor}', car_id, 'cancel'))
-
-        job = CronJob(
-            name=f'car{car_id}_lights_off',
-            trigger_time=time.monotonic() + delay,
-            delay=delay,
-            action=self._make_push_action(car_id, ActionKind.LIGHT_OFF),
-            event_rules=rules,
-        )
-        await self.cron.schedule(job)
-
-    def _make_push_action(self, car_id: int, kind: ActionKind):
-        """创建推送指定 Action 到队列的回调（供 cron 使用）"""
-        async def _push():
-            await self.action_queues[car_id].put(Action(kind))
-        return _push
+        return False
 
     def _make_on_emergency_stop(self, car_id: int):
         async def on_emergency():
@@ -624,8 +599,6 @@ class App:
         # 同步清 executor 的 init 残留（双重保险：_start_action 也清了）
         self.executors[cid]._init_reverse_mode = False
         self.executors[cid]._init_perfect_leveling_active = False
-        self.executors[cid]._init_last_reverse_pos = None
-        self.executors[cid]._init_reverse_start_time = None
         self.executors[cid]._init_base_segment_done = False
         # 清 executor 瞬态状态(复用 _emergency_stop 的清理模式,executor.py:401-411)
         # 不清 paused / _station_seek_enabled / manual_mode —— 这些是用户状态
@@ -646,6 +619,9 @@ class App:
         await self.cron.cancel(f'car{cid}_lights_off')
         self.pending_call_origin[cid].clear()
         self.cars[cid].human_presence = -1
+        # 重置 UI 状态(逻辑状态清零 + 同步到 IO)
+        self.cars[cid].ui = IndicatorState()
+        await self.ui[cid].sync_to_io()
         # 清空动作队列:避免旧 MOVE 在新 INITIALIZE _start_action 覆盖前污染状态
         while not self.action_queues[cid].empty():
             try:
@@ -903,7 +879,286 @@ class App:
                 continue
         if global_writes:
             await self.io.set_many(global_writes)
+        # 清空逻辑状态(UI + hall indicator)
+        for cid in self.car_ids:
+            self.cars[cid].ui = IndicatorState()
+        self._hall_indicator_state.clear()
         print(f'[clear] 所有输出已置零')
+
+    async def set_hall_indicator(self, floor: int, direction: str,
+                                  on: bool) -> None:
+        """外召按钮指示灯(建筑级信号,不属于任何轿厢)
+
+        Args:
+            floor: 楼层号 (up: 1..9, down: 2..10)
+            direction: 'up' | 'down'
+            on: True=亮, False=灭
+        """
+        if direction not in ('up', 'down'):
+            raise ValueError(
+                f"direction 必须是 'up' 或 'down',got {direction!r}"
+            )
+        self._hall_indicator_state[(floor, direction)] = on
+        sig = f'hall_indicator_{direction}_{floor}'
+        await self.io.set(self.mapper.addr_output(sig, 0), 1 if on else 0)
+
+    def hall_indicator_state(self, floor: int, direction: str) -> bool:
+        """读当前外召按钮指示灯状态(供 /buttonui toggle 用)"""
+        return self._hall_indicator_state.get((floor, direction), False)
+
+    # ===== /door 命令 =====
+
+    def _door_precheck(self, car_id: int, action: str,
+                        force: bool) -> dict | None:
+        """预检:不通过返回 dict 错误,通过返回 None
+
+        检查项:
+            - car_door_lock 信号存在
+            - init 检查 (force 跳过)
+            - 移动检查 (始终生效,force 也不越过)
+            - 门已开/已关 检查 (force 跳过)
+        """
+        car = self.cars[car_id]
+        io = self.io
+        mapper = self.mapper
+
+        try:
+            car_lock_i = mapper.db_to_i(
+                mapper.addr_input('car_door_lock', car_id)
+            )
+        except KeyError:
+            return {
+                'status': 'rejected',
+                'message': f'car {car_id} io_config 缺 car_door_lock 信号',
+            }
+        car_door_locked = bool(io.get_input(car_lock_i))
+
+        if not force and car.state != CarState.READY:
+            return {
+                'status': 'rejected',
+                'message': f'car {car_id} 未初始化,需要 force 参数强制执行',
+            }
+        if car.direction != Direction.IDLE:
+            return {
+                'status': 'rejected',
+                'message': f'car {car_id} 正在移动({car.direction.value}),无法执行门操作',
+            }
+        if not force:
+            if action == 'open' and not car_door_locked:
+                return {
+                    'status': 'rejected',
+                    'message': f'car {car_id} 门已开(car_door_lock=false),无需再开',
+                }
+            if action == 'close' and car_door_locked:
+                return {
+                    'status': 'rejected',
+                    'message': f'car {car_id} 门已关好(car_door_lock=true),无需再关',
+                }
+        return None  # 通过
+
+    async def control_door(self, car_id: int, action: str,
+                           force: bool = False) -> dict:
+        """控制开门/关门。**非阻塞**,预检后立即返回 dispatched,后台跟踪完成。
+
+        Args:
+            car_id: 轿厢 ID
+            action: 'open' | 'close'
+            force: 跳过部分预检,直接拉 relay 立即返回
+
+        Returns:
+            dict {
+                'status': 'dispatched' | 'rejected' | 'busy' | 'force_done',
+                'message': str,
+            }
+
+            - 'dispatched': 已派发 action + 后台 task 跟踪,REPL 不阻塞
+                           完成 / 错层 由后台 task / /debug show door_status 输出
+            - 'force_done': force 模式已拉 relay
+            - 'rejected' / 'busy': 命令级错误,命令立即打印
+        """
+        door = self.executors[car_id].door
+        mapper = self.mapper
+        io = self.io
+
+        # 1. 预检 (同步,极快)
+        precheck_result = self._door_precheck(car_id, action, force)
+        if precheck_result is not None:
+            return precheck_result
+
+        # 2. force: 直接拉 relay + 立即返回
+        if force:
+            if action == 'open':
+                await door.open()
+            else:
+                await door.close()
+            return {
+                'status': 'force_done',
+                'message': f'car {car_id} force 模式:已拉 {action} relay(不等待门锁)',
+            }
+
+        # 3. 同轿厢互斥
+        if self._door_busy[car_id]:
+            return {
+                'status': 'busy',
+                'message': f'car {car_id} 门动作进行中,请等待完成',
+            }
+        self._door_busy[car_id] = True
+
+        # 4. 注册 listener (同步,在 dispatch 前,防止 race)
+        floor_lock_i: dict[int, str] = {}
+        for f in range(1, 11):
+            try:
+                floor_lock_i[f] = mapper.db_to_i(
+                    mapper.addr_input(f'floor_door_lock_{f}', car_id)
+                )
+            except KeyError:
+                pass
+
+        door_done_signal = 'door_open_done' if action == 'open' else 'door_close_done'
+        try:
+            door_done_i = mapper.db_to_i(
+                mapper.addr_input(door_done_signal, car_id)
+            )
+        except KeyError:
+            self._door_busy[car_id] = False
+            return {
+                'status': 'rejected',
+                'message': f'car {car_id} io_config 缺 {door_done_signal} 信号',
+            }
+
+        done_event = asyncio.Event()
+        wrong_floor: list[int] = []
+        car = self.cars[car_id]
+        pos_at_dispatch = car.position
+
+        async def listener(event: IOEvent) -> None:
+            if event.i_addr == door_done_i and event.bit == 1:
+                done_event.set()
+            elif event.i_addr in floor_lock_i.values():
+                if event.bit == 0:
+                    f = next(
+                        fl for fl, addr in floor_lock_i.items()
+                        if addr == event.i_addr
+                    )
+                    if f != pos_at_dispatch:
+                        wrong_floor.append(f)
+
+        io.add_listener(listener)
+
+        # 5. 派发 action
+        try:
+            kind = ActionKind.OPEN_DOOR if action == 'open' else ActionKind.CLOSE_DOOR
+            await self.action_queues[car_id].put(Action(kind))
+        except Exception:
+            # 入队失败也清理
+            io.remove_listener(listener)
+            self._door_busy[car_id] = False
+            raise
+
+        # 6. 后台 task 跟踪完成 + 错层检测
+        # 注意:create_task 不阻塞当前 coroutine
+        asyncio.create_task(self._door_track_completion(
+            car_id=car_id,
+            action=action,
+            listener=listener,
+            done_event=done_event,
+            wrong_floor=wrong_floor,
+        ))
+
+        # 7. cron 兜底:PLC 异常不发 done 信号时,timeout 秒后强制释放 mutex
+        # 无 sleep / wait_for,完全由 cron 事件循环驱动
+        timeout = self.config.get('elevator', {}).get(
+            'door_complete_timeout', 8)
+        job_name = f'door_timeout_{car_id}_{action}'
+
+        async def _timeout_cb():
+            await self._door_timeout_callback(
+                car_id, action, listener, done_event)
+
+        try:
+            await self.cron.schedule(CronJob(
+                name=job_name,
+                trigger_time=time.monotonic() + timeout,
+                delay=timeout,
+                action=_timeout_cb,
+            ))
+        except Exception:
+            # 兜底调度失败不应影响主流程(派发已成功,后台 task 仍在跟踪)
+            pass
+
+        # 8. 立即返回,不阻塞 REPL
+        return {
+            'status': 'dispatched',
+            'message': f'car {car_id} 已派发 {action} 命令,后台跟踪中',
+        }
+
+    async def _door_track_completion(
+        self,
+        car_id: int,
+        action: str,
+        listener,
+        done_event: asyncio.Event,
+        wrong_floor: list[int],
+    ) -> None:
+        """后台跟踪任务:等 door_open_done/close_done + 错层检测 + 释放 mutex
+
+        行为:
+            - 错层(仅 open):始终打印 ⚠️ (不需 debug 开关)
+            - 成功完成:不打印 (由 /debug show door_status 控制)
+            - 释放 mutex + 注销 listener(无论结果)
+            - 取消 cron 兜底 job(避免 timeout 误触发)
+        """
+        try:
+            await done_event.wait()
+            # 成功路径:取消 cron 兜底(若还没 fire)
+            await self.cron.cancel(f'door_timeout_{car_id}_{action}')
+            if wrong_floor and action == 'open':
+                wf = wrong_floor[0]
+                pos = self.cars[car_id].position
+                print(
+                    f'[car {car_id}] ⚠️  开错楼:car 在 L{pos},'
+                    f'但 L{wf} 层门锁打开了'
+                )
+                print(
+                    f'         → 需手动 /door {car_id} close force '
+                    f'或 /car {car_id} init down 1 重置'
+                )
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                self.io.remove_listener(listener)
+            except Exception:
+                pass
+            self._door_busy[car_id] = False
+
+    async def _door_timeout_callback(
+        self,
+        car_id: int,
+        action: str,
+        listener,
+        done_event: asyncio.Event,
+    ) -> None:
+        """门动作完成超时兜底(cron 触发,无 sleep / wait)
+
+        PLC 异常不发 door_open_done / door_close_done 时,
+        强制释放 _door_busy 防锁死,set done_event 唤醒后台 task。
+        """
+        if not self._door_busy.get(car_id, False):
+            return  # 正常完成路径已释放,no-op
+        print(
+            f'[car {car_id}] ⚠️  门动作超时(无 door_{action}_done 信号),'
+            f'强制释放 mutex'
+        )
+        print(
+            f'         → 需手动检查 PLC 状态,后续 /door 命令可正常执行'
+        )
+        done_event.set()  # 唤醒后台 task
+        try:
+            self.io.remove_listener(listener)
+        except Exception:
+            pass
+        self._door_busy[car_id] = False
 
     def status_snapshot(self, car_id: int | None = None) -> dict[str, Any]:
         cid = car_id if car_id is not None else self.current_car_id

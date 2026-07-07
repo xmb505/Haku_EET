@@ -26,9 +26,14 @@ elevator:
   # 默认关闭——只在需要时启用（/module station_seek on）。开了之后会保持
   # 每部车在完美平层 ✓(↑1↓1),平层丢失立刻反冲。
   station_seek: false
-  # 关门延时（秒）：开门后等待多久自动关门
+  # 门动作完成超时(秒):/door open/close 派发后,等 door_open_done/close_done 信号
+  # 超过此时间视为 PLC 异常,cron 兜底自动释放 _door_busy + 打印警告。
+  door_complete_timeout: 8
+  # 关门延时(秒):开门后等待多久自动关门
+  # 当前控制层不读(已剥离 _schedule_close_door 副作用),留给未来 passenger_flow 模块
   door_close_delay: 10
-  # 熄灯节能延时（秒）：关门后等待多久自动熄灯
+  # 熄灯节能延时(秒):关门后等待多久自动熄灯
+  # 当前控制层不读(已剥离 _schedule_lights_off 副作用),留给未来 passenger_flow 模块
   light_off_delay: 600
 
 algorithm:
@@ -37,7 +42,7 @@ algorithm:
 
 console:
   # REPL 提示符。比赛现场想换风格时改这里 + /reload，无需重启。
-  prompt: 'haku> '
+  prompt: 'チルノ＄ '
 
 logging:
   level: INFO

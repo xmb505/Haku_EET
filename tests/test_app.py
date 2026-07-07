@@ -865,7 +865,7 @@ async def test_hall_call_release_ignored(app: App):
     assert app.pending_calls[1].count(5) == 1
 
 
-# ===== 门循环 + human_presence 测试 =====
+# ===== 门循环 + 算法编排测试 =====
 
 
 @pytest.mark.asyncio
@@ -923,119 +923,6 @@ async def test_cabin_button_sets_human_presence(app: App):
 
     assert app.cars[1].human_presence == 1
     assert 5 in app.pending_calls[1]
-
-
-@pytest.mark.asyncio
-async def test_human_presence_transition_hall(app: App):
-    """外召 door cycle → human_presence: -1 → 0 → 熄灯 cron"""
-    app.cars[1].state = CarState.READY
-    app.cars[1].position = 5
-    app.cars[1].human_presence = -1  # 默认
-
-    # 外召完成 MOVE
-    app.pending_calls[1].append(5)
-    app.pending_call_origin[1][5] = 'hall'
-    app.cars[1].target_floor = 5
-
-    # MOVE done → OPEN_DOOR
-    await app._on_action_done(1, Action(ActionKind.MOVE_UP))
-    action = await app.action_queues[1].get()
-    assert action.kind == ActionKind.OPEN_DOOR
-    assert app.cars[1].human_presence == -1  # 开门不改变
-
-    # OPEN_DOOR done → 关门 cron
-    await app._on_action_done(1, Action(ActionKind.OPEN_DOOR))
-    # 应有 close_door cron
-    assert f'car1_close_door' in app.cron._jobs
-
-    # CLOSE_DOOR done → human_presence stays -1 (nobody entered)
-    await app._on_action_done(1, Action(ActionKind.CLOSE_DOOR))
-    assert app.cars[1].human_presence == -1  # 一直无人
-    # -1 时不应熄灯 cron
-    assert f'car1_lights_off' not in app.cron._jobs
-
-
-@pytest.mark.asyncio
-async def test_human_presence_after_cabin_button(app: App):
-    """cabin_button → human_presence=1, 关门后 → 0 → 熄灯 cron"""
-    app.cars[1].state = CarState.READY
-    app.cars[1].position = 5
-    app.cars[1].human_presence = 1  # 确认有人
-
-    # 关门
-    await app._on_action_done(1, Action(ActionKind.CLOSE_DOOR))
-    assert app.cars[1].human_presence == 0  # 可能出去了
-    # human_presence==0 → 熄灯 cron
-    assert f'car1_lights_off' in app.cron._jobs
-
-
-@pytest.mark.asyncio
-async def test_cabin_button_cancels_lights_off(app: App):
-    """熄灯 cron 通过 cron.cancel 直接销毁"""
-    app.cars[1].state = CarState.READY
-    app.cars[1].position = 5
-    app.cars[1].human_presence = 0
-
-    await app._schedule_lights_off(1)
-    assert f'car1_lights_off' in app.cron._jobs
-
-    # cron.cancel 正常销毁
-    await app.cron.cancel('car1_lights_off')
-    assert f'car1_lights_off' not in app.cron._jobs
-
-
-@pytest.mark.asyncio
-async def test_open_door_cancels_lights_off(app: App):
-    """door_open_done → 自毁熄灯 cron"""
-    app.cars[1].state = CarState.READY
-    app.cars[1].position = 5
-    app.cars[1].human_presence = 0
-
-    # 先有熄灯 cron
-    await app._schedule_lights_off(1)
-    assert f'car1_lights_off' in app.cron._jobs
-
-    # 模拟 door_open_done 上升沿
-    i_addr = app.mapper.db_to_i(
-        app.mapper.addr_input('door_open_done', 1))
-    app.io.simulate_input(i_addr, 1)
-    await asyncio.sleep(0.05)
-
-    # 熄灯 cron 已自毁
-    assert f'car1_lights_off' not in app.cron._jobs
-
-
-@pytest.mark.asyncio
-async def test_cron_light_off_fires_light_off_action(app: App):
-    """熄灯 cron 到期 → push LIGHT_OFF → human_presence=-1"""
-    app.cars[1].state = CarState.READY
-    app.cars[1].position = 5
-    app.cars[1].human_presence = 0
-
-    # 直接调度熄灯 cron 到队列（绕过 cron.run 异步循环——单元测试环境
-    # 不需要 cron 事件循环，直接模拟触发）
-    from core.cron import CronJob
-    import time as _time
-    job = CronJob(
-        name='car1_lights_off',
-        trigger_time=_time.monotonic() + 0.01,
-        delay=0.01,
-        action=app._make_push_action(1, ActionKind.LIGHT_OFF),
-        event_rules=None,
-    )
-    await app.cron.schedule(job)
-
-    # 模拟 cron 触发：手动 fire（不依赖 cron.run 事件循环）
-    action = app._make_push_action(1, ActionKind.LIGHT_OFF)
-    await action()
-
-    # LIGHT_OFF 应已在队列（ActionQueue.get 是异步方法）
-    a = await app.action_queues[1].get()
-    assert a.kind == ActionKind.LIGHT_OFF
-
-    # LIGHT_OFF done → human_presence = -1
-    await app._on_action_done(1, a)
-    assert app.cars[1].human_presence == -1
 
 
 @pytest.mark.asyncio
