@@ -640,6 +640,15 @@ class Console:
             ] if val
         ]
         print(f'故障:        {", ".join(active_faults) if active_faults else "无"}')
+        # 大脑状态
+        pm = self.app.pm.status_snapshot(requested)
+        if self.app.usermode_enabled:
+            print(f'大脑:        启用 | 模式={pm["queue_mode"]}')
+            print(f'  内召缓存:  {pm["button_cache"]}')
+            print(f'  请求队列:  {pm["passenger_queue"]}')
+            print(f'  接客中:    {pm["pickup_active"]}')
+        else:
+            print(f'大脑:        禁用')
 
     async def cmd_cars(self, args: list[str]) -> None:
         print('已启用的轿厢:')
@@ -1466,9 +1475,33 @@ class Console:
                 print('[module] station_seek 已禁用(清吸附 + 取消反冲)')
             else:
                 print(f'未知开关: {args[1]}（要 true 或 false）')
+        elif name == 'queue':
+            await self._cmd_queue_mode(args[1:])
         else:
             print(f'未知模块: {name}')
-            print('当前支持: station_seek')
+            print('当前支持: station_seek, queue')
+
+    async def _cmd_queue_mode(self, args: list[str]) -> None:
+        """乘客队列模式切换
+
+        用法:
+          /module queue             显示当前模式
+          /module queue discard     切换为丢弃模式
+          /module queue keep        切换为保留模式
+        """
+        pm = self.app.pm
+        if not args:
+            print(f'queue_mode(乘客队列): {pm.queue_mode}')
+            return
+        mode = args[0].lower()
+        if mode not in ('discard', 'keep'):
+            print(f'未知模式: {mode}（需要 discard 或 keep）')
+            return
+        # 更新所有车队列的模式
+        from core.passenger import PassengerQueue
+        for cid in self.app.car_ids:
+            pm._passenger_queue[cid].mode = mode
+        print(f'queue_mode 已切换为 {mode}')
 
     def _show_module_status(self) -> None:
         """打印所有模块当前状态"""
@@ -1476,6 +1509,8 @@ class Console:
         print(f'station_seek(站点吸附): {"启用" if enabled else "禁用"}')
         usermode = self.app.usermode_enabled
         print(f'usermode(用户模式):    {"启用" if usermode else "禁用"}')
+        qmode = self.app.pm.queue_mode
+        print(f'queue(乘客队列模式):  {qmode}')
 
     async def cmd_usermode(self, args: list[str]) -> None:
         """切换用户模式

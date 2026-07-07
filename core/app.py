@@ -23,6 +23,7 @@ from .display import DisplayEncoder
 from .executor import ActionExecutor
 from .io_client import IOClient, IOEvent
 from .io_mapper import IOMapper
+from .passenger import PassengerManager
 from .player import Car, CarState, Direction, DoorState, IndicatorState
 from .ui import UiController
 from .virtual_plc import VirtualPLC
@@ -152,6 +153,10 @@ class App:
         for cid in self.car_ids:
             self.pending_call_origin[cid] = {}
 
+        # ===== 上层乘客交互（大脑） =====
+        self.ui_config_path = self.config_path.parent / 'ui_config.yaml'
+        self.pm = PassengerManager(self, self.ui_config_path)
+
     @property
     def car(self) -> Car:
         """当前选中的轿厢（console 兼容）"""
@@ -178,8 +183,11 @@ class App:
         if hasattr(self.io, 'set_known_i_addresses'):
             self.io.set_known_i_addresses(set(self.mapper.lookup_all_i_addresses()))
         self.io.add_listener(self._on_io_event)
+        # 小脑监听乘客事件 → 路由到大脑流程管理
         self.io.add_listener(self._on_hall_call_event)
         self.io.add_listener(self._on_cabin_button_event)
+        self.io.add_listener(self._on_door_button_event)
+        self.io.add_listener(self._on_light_curtain_event)
         self.cron.register(self.io, self.mapper)
         await self.cron.start()
         # 起 6 部电梯各自的写 IOClient(共享 input_cache,各自独立 flush)
@@ -231,50 +239,6 @@ class App:
         if cid in self.executors:
             await self.executors[cid].on_io_event(event)
 
-    async def _on_hall_call_event(self, event: IOEvent) -> None:
-        """IO 监听器: hall_call_up_X / hall_call_down_X 上升沿 → 派车
-
-        只在 usermode 启用时响应（外召按钮按下 = 客人按 = 系统接客）。
-        按下 (bit=1) 派车；松开门 (bit=0) 忽略——外召是锁存的，
-        由 PLC/算法完成召唤后自行熄灭指示灯。
-        """
-        if not self._usermode:
-            return
-        if event.bit != 1:
-            return
-
-        sig = self.mapper.lookup_signal_by_i(event.i_addr)
-        if sig is None:
-            return
-        car_id, signal_name = sig
-        if car_id != 0:
-            return  # hall_call 是全局信号（car_id=0）
-
-        direction: str | None = None
-        floor: int | None = None
-        if signal_name.startswith('hall_call_up_'):
-            direction = 'up'
-            try:
-                floor = int(signal_name[len('hall_call_up_'):])
-            except ValueError:
-                return
-        elif signal_name.startswith('hall_call_down_'):
-            direction = 'down'
-            try:
-                floor = int(signal_name[len('hall_call_down_'):])
-            except ValueError:
-                return
-        else:
-            return
-
-        target_cid = self._dispatch_hall_call(floor, direction)
-        if target_cid is None:
-            print(f'[hall_call] {direction}@L{floor} 无可用轿厢')
-            return
-
-        await self.call_internal(floor, car_id=target_cid, origin='hall')
-        print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
-
     def _dispatch_hall_call(self, floor: int, direction: str) -> int | None:
         """派车算法：顺向优先 + 空闲最近
 
@@ -322,11 +286,81 @@ class App:
         candidates.sort()
         return candidates[0][2]
 
-    async def _on_cabin_button_event(self, event: IOEvent) -> None:
-        """IO 监听器: cabin_button_X 上升沿 → 内召 + human_presence
+    # ===== IO 事件监听器（小脑） → 路由到大脑流程管理 =====
+
+    async def _on_hall_call_event(self, event: IOEvent) -> None:
+        """外召按钮事件
 
         只在 usermode 启用时响应。
-        按下 (bit=1) 认为有人在轿厢内，自毁熄灯 cron。
+          - bit=1 (按下): 派车 dispatch → 同层开门 / 发起 MOVE + 通知 PM
+          - bit=0 (松开): 通知 PM 启动关门 cron（长按保持开门逻辑）
+        """
+        if not self._usermode:
+            return
+
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None:
+            return
+        car_id, signal_name = sig
+        if car_id != 0:  # hall_call 是全局信号 (car_id=0)
+            return
+
+        direction: str | None = None
+        floor: int | None = None
+        if signal_name.startswith('hall_call_up_'):
+            direction = 'up'
+            try:
+                floor = int(signal_name[len('hall_call_up_'):])
+            except ValueError:
+                return
+        elif signal_name.startswith('hall_call_down_'):
+            direction = 'down'
+            try:
+                floor = int(signal_name[len('hall_call_down_'):])
+            except ValueError:
+                return
+        else:
+            return
+
+        if event.bit == 1:
+            await self._on_hall_call_rising(floor, direction)
+        else:
+            await self._on_hall_call_falling(floor, direction)
+
+    async def _on_hall_call_rising(self, floor: int, direction: str) -> None:
+        """外召按下 → 派车"""
+        target_cid = self._dispatch_hall_call(floor, direction)
+        if target_cid is None:
+            print(f'[hall_call] {direction}@L{floor} 无可用轿厢')
+            return
+
+        # 通知大脑（标记接客、亮灯）
+        await self.pm.on_hall_call_serving(target_cid, floor, direction)
+
+        car = self.cars[target_cid]
+        if car.position == floor:
+            # 车已在目标层 → 开门
+            await self.action_queues[target_cid].put(
+                Action(ActionKind.OPEN_DOOR))
+            print(f'[hall_call] {direction}@L{floor} → car{target_cid} 已在层，开门')
+        else:
+            # 发起 MOVE
+            await self.call_internal(floor, car_id=target_cid, origin='hall')
+            print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
+
+    async def _on_hall_call_falling(self, floor: int, direction: str) -> None:
+        """外召松开 → 通知大脑启动关门 cron"""
+        # 找哪部车在接这层客
+        for cid in self.car_ids:
+            pm_state = self.pm.status_snapshot(cid)
+            if (floor, direction) in pm_state.get('pickup_active', []):
+                await self.pm.on_hall_call_release(cid, floor, direction)
+                return
+
+    async def _on_cabin_button_event(self, event: IOEvent) -> None:
+        """轿内按钮 (bit=1) → human_presence + 门开着缓存 / 门关着直通
+
+        只在 usermode 启用时响应。
         """
         if not self._usermode:
             return
@@ -347,15 +381,64 @@ class App:
         except ValueError:
             return
 
-        # 有人
+        car = self.cars[cid]
+        car.human_presence = 1
+        await self.cron.cancel(self.pm._lights_off_job_name(cid))
+        await self.ui[cid].set_cabin_button_led(floor, True)
+
+        if car.door_state in (DoorState.OPEN, DoorState.OPENING):
+            # 门开着 → 通知大脑缓存
+            await self.pm.on_cabin_button_door_open(cid, floor)
+        else:
+            # 门关着 → 小脑直通 call_internal
+            await self.call_internal(floor, car_id=cid)
+
+    async def _on_door_button_event(self, event: IOEvent) -> None:
+        """门按钮 (bit=1): 开门/关门"""
+        if not self._usermode:
+            return
+        if event.bit != 1:
+            return
+
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None:
+            return
+        cid, signal_name = sig
+        if cid == 0 or cid not in self.car_ids:
+            return
+
         car = self.cars[cid]
         car.human_presence = 1
 
-        # 自毁熄灯 cron
-        await self.cron.cancel(f'car{cid}_lights_off')
+        if signal_name == 'door_open_button':
+            await self.cron.cancel(self.pm._close_door_job_name(cid))
+            if car.door_state in (DoorState.CLOSED, DoorState.CLOSING):
+                await self.action_queues[cid].put(
+                    Action(ActionKind.OPEN_DOOR))
+        elif signal_name == 'door_close_button':
+            await self.cron.cancel(self.pm._close_door_job_name(cid))
+            if car.door_state in (DoorState.OPEN, DoorState.OPENING):
+                await self.action_queues[cid].put(
+                    Action(ActionKind.CLOSE_DOOR))
 
-        # 内召
-        await self.call_internal(floor, car_id=cid)
+    async def _on_light_curtain_event(self, event: IOEvent) -> None:
+        """光幕 (bit=1): human_presence=1 + 通知大脑重调度关门"""
+        if not self._usermode:
+            return
+        if event.bit != 1:
+            return
+
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None:
+            return
+        cid, signal_name = sig
+        if cid == 0 or cid not in self.car_ids:
+            return
+        if signal_name != 'light_curtain':
+            return
+
+        self.cars[cid].human_presence = 1
+        await self.pm.on_light_curtain(cid)
 
     # ===== 协调（按轿厢） =====
 
@@ -393,6 +476,14 @@ class App:
             return
 
         advanced = await self._handle_algorithm_state_change(car_id, last_action)
+
+        # 通知大脑（PassengerManager 需要知道门开/门关完成）
+        if last_action is not None:
+            try:
+                await self.pm.on_action_done(car_id, last_action)
+            except Exception as e:
+                print(f'[app] car{car_id} PM.on_action_done 异常: {e!r}')
+
         if not advanced:
             await self._tick(car_id)
 
@@ -450,6 +541,7 @@ class App:
             self.pending_calls[car_id].clear()
             self.cars[car_id].target_floor = None
             self.manual_mode[car_id] = False
+            await self.pm.on_emergency(car_id)
             print(f'[emergency] car {car_id} 紧急停止')
         return on_emergency
 
@@ -624,11 +716,13 @@ class App:
         exe._relevel_future = None
         exe._auto_seek_active = False
         self._door_busy[cid] = False
-        await self.cron.cancel(f'car{cid}_close_door')
-        await self.cron.cancel(f'car{cid}_lights_off')
+        # PM cron 由 self.pm.reset(cid) 在 _reset_state 中取消
+        # 此处只取消小脑的兜底 cron
         await self.cron.cancel(f'door_timeout_{cid}_open')
         await self.cron.cancel(f'door_timeout_{cid}_close')
         self.pending_call_origin[cid].clear()
+        # 重置大脑状态
+        await self.pm.reset(cid)
         self.cars[cid].human_presence = -1
         # 重置 UI 状态(逻辑状态清零 + 同步到 IO)
         self.cars[cid].ui = IndicatorState()

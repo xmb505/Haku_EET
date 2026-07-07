@@ -1,0 +1,21 @@
+# ui_config.yaml —— 电梯 UI 及乘客交互配置
+#
+# 与 config.yaml 分离：UI 参数（灯闪、关门间隔等）独立管理。
+# /reload 时同时重载此文件。
+
+passenger:
+  # 队列模式: 'discard' | 'keep'
+  #   discard: 顺向接、已过站丢弃（家用电梯模式）
+  #   keep:    全部保留，到达终点后继续处理（商用电梯模式）
+  queue_mode: discard
+
+  # 关门延时(秒): 开门后外召按钮释放、等待多久关门
+  #   设为 0 = 按钮释放后下一 tick 立即关门
+  door_close_delay: 10
+
+  # 熄灯节能延时(秒): 关门后等待多久自动熄灯
+  light_off_delay: 600
+
+  # 外召指示灯闪烁间隔(毫秒)
+  #   车减速靠近目标层时，外召灯按此频率闪烁
+  flash_interval_ms: 500
