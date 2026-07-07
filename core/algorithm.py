@@ -57,6 +57,13 @@ class SimpleInternalCall(ElevatorAlgorithm):
         if car.state == CarState.FAULT or car.fault.any_active():
             return []
 
+        # [未来计划] 算法作为"大脑"应主动检测门状态再推 MOVE：
+        #   if car.door_state != DoorState.CLOSED:
+        #       return []  # 门没关好，不安全调度
+        # 当前由控制层兜底——OPEN_DOOR 完成时 _handle_algorithm_state_change
+        # 返回 True 阻止 _tick 运行。等门关了（/door close 或未来 passenger_flow
+        # 关门）CLOSE_DOOK 完成后 _tick 才恢复调度。
+
         # 优先使用 call_internal 设的"立即目标" target_floor；
         # 没有再退回 pending_calls 取一个（队列非空）。
         # 用 target_floor 而非 pending[0] 是关键——call 命令刚下时

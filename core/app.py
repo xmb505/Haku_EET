@@ -437,6 +437,12 @@ class App:
                 return True
             return False
 
+        # 门动作完成不推 MOVE（安全约束）
+        # 开门 → 阻止 _tick（门开着不能跑算法，等手动 /door close 或
+        # 未来 passenger_flow 关门后 CLOSE_DOOK 才恢复调度）
+        if kind == ActionKind.OPEN_DOOR:
+            return True
+
         return False
 
     def _make_on_emergency_stop(self, car_id: int):
@@ -452,6 +458,8 @@ class App:
     async def call_internal(self, floor: int, car_id: int | None = None,
                             origin: str = 'internal') -> None:
         cid = car_id if car_id is not None else self.current_car_id
+        if self.cars[cid].door_state != DoorState.CLOSED:
+            return   # 门没关好不接受新召唤
         if floor in self.pending_calls[cid]:
             return
         # 车空闲时已在目标层 → 不残留 stale 条目（否则 call 当前层再 call 别层
