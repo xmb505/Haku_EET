@@ -45,6 +45,8 @@ class ActionExecutor:
         bottom_base_floor: int = -1,
         on_action_done: Callable[[Action], Awaitable[None]] | None = None,
         on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
+        on_breach: Callable[[], Awaitable[None]] | None = None,
+        on_light_curtain: Callable[[], Awaitable[None]] | None = None,
         io_write: IOClient | None = None,
         station_seek_enabled: bool = False,
         action_queue: ActionQueue | None = None,
@@ -70,7 +72,9 @@ class ActionExecutor:
         #   S7 read-modify-write 顺序 = 车号顺序,接触器建立时间错开("偏了但没偏太多")。
         # 单车 / 测试场景传 None,回退到 io。
         self.motor = MotorController(io, mapper, car_id, io_write=io_write)
-        self.door = DoorController(io, mapper, car_id, io_write=io_write)
+        self.door = DoorController(io, mapper, car_id, io_write=io_write,
+                                   on_breach=on_breach,
+                                   on_light_curtain=on_light_curtain)
 
         # 日志回调（外部可注入，让 REPL 能正确显示后台任务的 print）
         # 默认走 stderr（不会被 prompt_toolkit 吞掉）
@@ -122,6 +126,8 @@ class ActionExecutor:
         # Auto-seek 状态:active 时车在下跑找 (↑1↓1),找到了就停 + 激活 hold,
         # 撞 bottom_limit_1 就 fallback 入队 INITIALIZE down 1
         self._auto_seek_active: bool = False
+        # flag set by _emergency_stop to prevent stale _start_action completion after door.cancel()
+        self._emergency_stop_flag: bool = False
 
     # ===== 主循环 =====
 
@@ -388,6 +394,8 @@ class ActionExecutor:
         # 如果有当前动作也清掉（不再等传感器）
         self.current_action = None
         self.waiting_sensor = None
+        self.door.cancel()  # force-complete pending door action
+        self._emergency_stop_flag = True  # prevent stale _start_action completion
         # 站点吸附同步清场:否则下一次 IO event 还会触发 hold 反冲,电机重启撞限位
         self._level_seek_active = False
         self._level_seek_skip_next = False
@@ -622,14 +630,34 @@ class ActionExecutor:
                 await self._start_move_down()
 
             case ActionKind.OPEN_DOOR:
-                await self.door.open()
                 self.car.door_state = DoorState.OPENING
-                self.waiting_sensor = ('door_open_done', 1)
+                self.door.set_car_position(self.car.position)
+                await self.door.open()
+                result = await self.door.wait_done()
+                if self._emergency_stop_flag:
+                    return  # emergency stop cancelled the door action
+                if result == 'wrong_floor':
+                    print(f'[exec] car{self.car_id} OPEN wrong floor, emergency close')
+                    await self.door.close()
+                    await self.door.wait_done()
+                    self.car.door_state = DoorState.CLOSED
+                else:
+                    self.car.door_state = DoorState.OPEN
+                await self._complete_action()
 
             case ActionKind.CLOSE_DOOR:
-                await self.door.close()
                 self.car.door_state = DoorState.CLOSING
-                self.waiting_sensor = ('door_close_done', 1)
+                await self.door.close()
+                result = await self.door.wait_done()
+                if self._emergency_stop_flag:
+                    return  # emergency stop cancelled the door action
+                if result == 'breach':
+                    self.car.door_state = DoorState.OPEN
+                    # breach reverses to open — report as OPEN_DOOR completion
+                    self.current_action = Action(ActionKind.OPEN_DOOR)
+                else:
+                    self.car.door_state = DoorState.CLOSED
+                await self._complete_action()
 
             case ActionKind.SET_DISPLAY:
                 if action.glyph is not None:
@@ -806,11 +834,6 @@ class ActionExecutor:
                 # MOVE_UP/MOVE_DOWN 完成时，_on_level_reached 已停车并更新 position
                 # 这里只需要重置 decel_state
                 self.decel_state = ''
-
-            case ActionKind.OPEN_DOOR:
-                self.car.door_state = DoorState.OPEN
-            case ActionKind.CLOSE_DOOR:
-                self.car.door_state = DoorState.CLOSED
 
             case _:
                 pass

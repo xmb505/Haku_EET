@@ -536,7 +536,10 @@ async def test_open_door_completes_on_door_open_done(setup):
     assert io.get_output(mapper.addr_output('door_close_relay', 1)) == 0
     assert car.door_state == DoorState.OPENING
 
-    await executor.on_io_event(i_to_event(mapper, 'door_open_done', 1))
+    # DoorController manages its own door_open_done listener via IOClient dispatch
+    db = mapper.addr_input('door_open_done', 1)
+    i_addr = mapper.db_to_i(db)
+    io.simulate_input(i_addr, 1)
     await asyncio.sleep(0.02)
 
     assert car.door_state == DoorState.OPEN

@@ -17,26 +17,19 @@ PLC 刹车接法（代码假设,验证现场硬件后确认）:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+from typing import Callable, Awaitable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .io_client import IOClient
+    from .io_client import IOClient, IOEvent
     from .io_mapper import IOMapper
 
 
 class MotorController:
-    """电机/接触器/刹车控制器"""
+    """motor / contactor / brake controller"""
 
     def __init__(self, io: IOClient, mapper: IOMapper, car_id: int,
                  io_write: IOClient | None = None) -> None:
-        """
-        Args:
-            io: 读取用的 IOClient(on_io_event / observe_input)
-            io_write: 写入用的 IOClient;默认用 io。
-                多车场景下 App 给每部电梯独立的 io_write,避免 6 部车共享一个
-                write_buffer 导致 tick flush 时一次 POST 30+ 个地址,S7 处理
-                顺序就是车号顺序,各车接触器实际建立时间错开("偏了但没偏太多")。
-        """
         self.io = io
         self.io_write = io_write if io_write is not None else io
         self.mapper = mapper
@@ -44,7 +37,6 @@ class MotorController:
 
     async def start(self, high_speed: bool = True,
                     direction: str | None = None) -> None:
-        """启动电机：方向接触器 + 速度 + 电机"""
         up = 0
         down = 0
         if direction == 'up':
@@ -62,12 +54,6 @@ class MotorController:
         })
 
     async def stop(self) -> None:
-        """停电机 + 清接触器（不动刹车状态）
-
-        刹车状态由调用方显式管理：
-            - 自动模式：start 前 release_brakes，stop 后保持
-            - 手动模式：用户设档位 set_brake_level，退出时 release_brakes
-        """
         await self.io_write.set_many({
             self.mapper.addr_output('up_contactor', self.car_id): 0,
             self.mapper.addr_output('down_contactor', self.car_id): 0,
@@ -77,22 +63,9 @@ class MotorController:
         })
 
     async def release_brakes(self) -> None:
-        """释放所有刹车（设为默认状态 000）
-
-        调用场景：
-            - 启动电机前（确保刹车松开让电机能驱动）
-            - 手动模式退出后（恢复到默认释放态）
-        """
         await self.set_brakes(0, 0, 0)
 
     async def hold_stop(self) -> None:
-        """单次写入:全刹(7档)+停电机+清接触器,同时到 PLC
-
-        这是"到站停车"的专用方法:刹车和电机停在一笔 HTTP POST 里,
-        防止分两次写入时(刹车在 tick N,停电机在 tick N+1)之间 20ms 的自由滑行。
-
-        手动模式 / _all_outputs_off 等不应使用此方法(需分开控制)。
-        """
         await self.io_write.set_many({
             self.mapper.addr_output('up_contactor', self.car_id): 0,
             self.mapper.addr_output('down_contactor', self.car_id): 0,
@@ -105,13 +78,6 @@ class MotorController:
         })
 
     async def set_direction_indicator(self, direction: str | None) -> None:
-        """设置上下行方向指示灯
-
-        direction:
-            'up'   → 上行灯亮,下行灯灭
-            'down' → 下行灯亮,上行灯灭
-            None   → 两个灯都灭(默认状态)
-        """
         up = 1 if direction == 'up' else 0
         down = 1 if direction == 'down' else 0
         await self.io_write.set_many({
@@ -120,7 +86,6 @@ class MotorController:
         })
 
     async def set_speed(self, high_speed: bool) -> None:
-        """切换速度接触器（运行时）"""
         await self.io_write.set_many({
             self.mapper.addr_output('high_speed_contactor', self.car_id): 1 if high_speed else 0,
             self.mapper.addr_output('low_speed_contactor', self.car_id): 0 if high_speed else 1,
@@ -128,7 +93,6 @@ class MotorController:
         })
 
     async def set_brakes(self, b1: int = 0, b2: int = 0, b3: int = 0) -> None:
-        """设置刹车（运行时）"""
         await self.io_write.set_many({
             self.mapper.addr_output('brake_1', self.car_id): b1,
             self.mapper.addr_output('brake_2', self.car_id): b2,
@@ -136,14 +100,12 @@ class MotorController:
         })
 
     async def set_brake_level(self, level: int) -> None:
-        """8 档刹车（0=释放, 1-7=不同组合）"""
         b1 = 1 if (level & 0b001) else 0
         b2 = 1 if (level & 0b010) else 0
         b3 = 1 if (level & 0b100) else 0
         await self.set_brakes(b1, b2, b3)
 
     async def all_off(self) -> None:
-        """紧急清理：全体电机接触器+刹车+电机供电为 0"""
         await self.io_write.set_many({
             self.mapper.addr_output('up_contactor', self.car_id): 0,
             self.mapper.addr_output('down_contactor', self.car_id): 0,
@@ -157,36 +119,140 @@ class MotorController:
 
 
 class DoorController:
-    """门继电器控制器"""
+    """door relay controller with self-managed IO listeners
+
+    Manages its own sensor listening during open/close cycles:
+      - open:  listens for door_open_done (completion) + floor_door_lock (wrong-floor check)
+      - close: listens for door_close_done (completion) + light_curtain (breach reversal)
+
+    Callers push open()/close() then await wait_done() for the result:
+      'done'        — normal completion
+      'breach'      — light curtain triggered during close; door reversed to open
+      'wrong_floor' — floor door lock mismatch on open
+
+    on_breach callback fires when light_curtain interrupts closing.
+    on_light_curtain callback fires on any light_curtain=true during open/close cycles.
+    """
 
     def __init__(self, io: IOClient, mapper: IOMapper, car_id: int,
-                 io_write: IOClient | None = None) -> None:
+                 io_write: IOClient | None = None,
+                 on_breach: Callable[[], Awaitable[None]] | None = None,
+                 on_light_curtain: Callable[[], Awaitable[None]] | None = None) -> None:
         self.io = io
         self.io_write = io_write if io_write is not None else io
         self.mapper = mapper
         self.car_id = car_id
+        self._on_breach = on_breach
+        self._on_light_curtain = on_light_curtain
+
+        self._done = asyncio.Event()
+        self._result: str = 'done'
+        self._listeners: list[Callable] = []
+        self._car_pos: int | None = None
+
+    # ---- public API ----
 
     async def open(self) -> None:
-        """开门继电器 ON，关门继电器 OFF"""
+        """initiate door open; caller awaits wait_done() for result"""
+        self._done.clear()
+        self._result = 'done'
+        self._remove_listeners()
+        self._listeners.append(self.io.add_listener(self._on_open_event))
         await self.io_write.set_many({
             self.mapper.addr_output('door_open_relay', self.car_id): 1,
             self.mapper.addr_output('door_close_relay', self.car_id): 0,
         })
 
     async def close(self) -> None:
-        """关门继电器 ON，开门继电器 OFF"""
+        """initiate door close; caller awaits wait_done() for result"""
+        self._done.clear()
+        self._result = 'done'
+        self._remove_listeners()
+        self._listeners.append(self.io.add_listener(self._on_close_event))
         await self.io_write.set_many({
             self.mapper.addr_output('door_open_relay', self.car_id): 0,
             self.mapper.addr_output('door_close_relay', self.car_id): 1,
         })
 
-    async def idle(self) -> None:
-        """两个继电器都关"""
+    async def wait_done(self) -> str:
+        """await door action completion; returns 'done' | 'breach' | 'wrong_floor'"""
+        await self._done.wait()
+        return self._result
+
+    def cancel(self) -> None:
+        """force-complete current door action (for emergency stop)"""
+        self._remove_listeners()
+        self._done.set()
+
+    async def all_off(self) -> None:
+        """clear all door relays"""
+        self._remove_listeners()
         await self.io_write.set_many({
             self.mapper.addr_output('door_open_relay', self.car_id): 0,
             self.mapper.addr_output('door_close_relay', self.car_id): 0,
         })
 
-    async def all_off(self) -> None:
-        """紧急清理：清所有门继电器"""
-        await self.idle()
+    # ---- internal IO event handlers ----
+
+    async def _on_open_event(self, event: IOEvent) -> None:
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None or sig[0] != self.car_id:
+            return
+        name = sig[1]
+
+        if name == 'door_open_done' and event.bit == 1:
+            self._remove_listeners()
+            self._done.set()
+
+        elif name == 'light_curtain' and event.bit == 1:
+            if self._on_light_curtain is not None:
+                await self._on_light_curtain()
+
+        elif name.startswith('floor_door_lock_') and event.bit == 0:
+            # floor lock released — check if it matches car position
+            try:
+                lock_floor = int(name[len('floor_door_lock_'):])
+            except ValueError:
+                return
+            car_pos = self._car_pos
+            if car_pos is not None and lock_floor != car_pos:
+                self._result = 'wrong_floor'
+                self._remove_listeners()
+                self._done.set()
+
+    async def _on_close_event(self, event: IOEvent) -> None:
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None or sig[0] != self.car_id:
+            return
+        name = sig[1]
+
+        if name == 'door_close_done' and event.bit == 1:
+            self._remove_listeners()
+            self._done.set()
+
+        elif name == 'light_curtain' and event.bit == 1:
+            print(f'[door] car{self.car_id} breach, reversing to open')
+            # breach: reverse to open
+            self._remove_listeners()
+            self._result = 'breach'
+            # cut close relay, engage open relay
+            await self.io_write.set_many({
+                self.mapper.addr_output('door_open_relay', self.car_id): 1,
+                self.mapper.addr_output('door_close_relay', self.car_id): 0,
+            })
+            # broadcast breach event to upper layers
+            if self._on_breach is not None:
+                await self._on_breach()
+            # register open listener and wait for door_open_done
+            self._listeners.append(self.io.add_listener(self._on_open_event))
+
+    # ---- internal helpers ----
+
+    def _remove_listeners(self) -> None:
+        for fn in self._listeners:
+            self.io.remove_listener(fn)
+        self._listeners.clear()
+
+    def set_car_position(self, pos: int | None) -> None:
+        """set car position for wrong-floor check during open"""
+        self._car_pos = pos

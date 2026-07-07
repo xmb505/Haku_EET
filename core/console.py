@@ -209,7 +209,7 @@ class Console:
 
             cmds = sorted([f'/{c}' for c in self._commands])
             commands_with_subs: dict[str, list[str]] = {
-                '/car': ['init', 'call', 'change', 'fireman', 'status', 'manual', 'auto'],
+                '/car': ['init', 'call', 'change', 'fireman', 'status', 'manual', 'auto', 'stop'],
                 '/debug': ['show'],
                 '/door': ['open', 'close'],
                 '/module': ['station_seek'],
@@ -641,14 +641,17 @@ class Console:
         ]
         print(f'故障:        {", ".join(active_faults) if active_faults else "无"}')
         # 大脑状态
-        pm = self.app.pm.status_snapshot(requested)
-        if self.app.usermode_enabled:
-            print(f'大脑:        启用 | 模式={pm["queue_mode"]}')
-            print(f'  内召缓存:  {pm["button_cache"]}')
-            print(f'  请求队列:  {pm["passenger_queue"]}')
-            print(f'  接客中:    {pm["pickup_active"]}')
+        if self.app.pm is not None:
+            pm = self.app.pm.status_snapshot(requested)
+            if self.app.usermode_enabled:
+                print(f'大脑:        启用 | 模式={pm["queue_mode"]}')
+                print(f'  内召缓存:  {pm["button_cache"]}')
+                print(f'  请求队列:  {pm["passenger_queue"]}')
+                print(f'  接客中:    {pm["pickup_active"]}')
+            else:
+                print(f'大脑:        禁用')
         else:
-            print(f'大脑:        禁用')
+            print(f'大脑:        未加载')
 
     async def cmd_cars(self, args: list[str]) -> None:
         print('已启用的轿厢:')
@@ -680,8 +683,12 @@ class Console:
                 await self._do_call_batch(car_ids, sub_args)
             elif sub_action == 'manual':
                 await self._run_manual(car_ids)
+            elif sub_action == 'stop':
+                for cid in car_ids:
+                    await self.app.async_stop(car_id=cid)
+                print(f'[stop] car{",".join(str(c) for c in car_ids)} 已紧急停止')
             else:
-                print(f'批量命令只支持 init/call/manual，不支持 {sub_action}')
+                print(f'批量命令只支持 init/call/manual/stop，不支持 {sub_action}')
             return
 
         # 单 car
@@ -710,10 +717,18 @@ class Console:
             await self._run_manual([car_id])
         elif sub_action == 'auto':
             await self.app.manual_auto(car_id=car_id)
+        elif sub_action == 'stop':
+            await self._do_stop([car_id])
         elif sub_action == 'goto':
             await self._do_call(sub_args)
         else:
             print(f'未知子命令: {sub_action}')
+
+    async def _do_stop(self, car_ids: list[int]) -> None:
+        """emergency stop + forget position"""
+        for cid in car_ids:
+            await self.app.async_stop(car_id=cid)
+            print(f'car {cid} 已紧急停止')
 
     async def _run_manual(self, car_ids: list[int]) -> None:
         """
@@ -1070,12 +1085,19 @@ class Console:
             return
 
         parts: list[str] = []
+        rejected: list[str] = []
         for cid, f in zip(car_ids, floors):
             if self.app.manual_mode.get(cid, False):
                 await self.app.manual_auto(car_id=cid)
-            await self.app.call_internal(f, car_id=cid)
-            parts.append(f'car{cid}→L{f}')
-        print(f'[batch call] {", ".join(parts)}')
+            ok = await self.app.call_internal(f, car_id=cid)
+            if ok:
+                parts.append(f'car{cid}→L{f}')
+            else:
+                rejected.append(f'car{cid}')
+        if parts:
+            print(f'[batch call] {", ".join(parts)}')
+        if rejected:
+            print(f'[batch call] 拒绝: {", ".join(rejected)}（门未关或其他原因）')
 
     async def _do_call(self, args: list[str]) -> None:
         if not args:
@@ -1095,8 +1117,11 @@ class Console:
         # 手动模式下自动切回 auto 再发内召
         if self.app.manual_mode.get(self.current_car_id, False):
             await self.app.manual_auto(car_id=self.current_car_id)
-        await self.app.call_internal(floor, car_id=self.current_car_id)
-        print(f'car {self.current_car_id} 已内召 L{floor}')
+        ok = await self.app.call_internal(floor, car_id=self.current_car_id)
+        if ok:
+            print(f'car {self.current_car_id} 已内召 L{floor}')
+        else:
+            print(f'car {self.current_car_id} 内召 L{floor} 被拒绝')
 
     async def _do_change(self, args: list[str]) -> None:
         """/car N change <floor> — 中途改目的地"""
@@ -1482,13 +1507,10 @@ class Console:
             print('当前支持: station_seek, queue')
 
     async def _cmd_queue_mode(self, args: list[str]) -> None:
-        """乘客队列模式切换
-
-        用法:
-          /module queue             显示当前模式
-          /module queue discard     切换为丢弃模式
-          /module queue keep        切换为保留模式
-        """
+        """乘客队列模式切换"""
+        if self.app.pm is None:
+            print('大脑模块未加载，不可切换队列模式')
+            return
         pm = self.app.pm
         if not args:
             print(f'queue_mode(乘客队列): {pm.queue_mode}')
@@ -1498,9 +1520,7 @@ class Console:
             print(f'未知模式: {mode}（需要 discard 或 keep）')
             return
         # 更新所有车队列的模式
-        from core.passenger import PassengerQueue
-        for cid in self.app.car_ids:
-            pm._passenger_queue[cid].mode = mode
+        pm.set_queue_mode(mode)
         print(f'queue_mode 已切换为 {mode}')
 
     def _show_module_status(self) -> None:
@@ -1509,7 +1529,7 @@ class Console:
         print(f'station_seek(站点吸附): {"启用" if enabled else "禁用"}')
         usermode = self.app.usermode_enabled
         print(f'usermode(用户模式):    {"启用" if usermode else "禁用"}')
-        qmode = self.app.pm.queue_mode
+        qmode = self.app.pm.queue_mode if self.app.pm is not None else 'N/A'
         print(f'queue(乘客队列模式):  {qmode}')
 
     async def cmd_usermode(self, args: list[str]) -> None:
@@ -1526,6 +1546,9 @@ class Console:
 
         arg = args[0].lower()
         if arg == 'true':
+            if self.app.pm is None:
+                print('[usermode] 错误：大脑模块（passenger.py）未加载，无法启用用户模式')
+                return
             result = await self.app.set_usermode(True)
             blocked = result.get('blocked', [])
             if blocked and isinstance(blocked, list) and len(blocked) > 0:

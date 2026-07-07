@@ -174,43 +174,103 @@ class PassengerManager:
     def queue_mode(self) -> str:
         return self._queue_mode()
 
-    # ===== 大脑流程方法（由小脑 app.py 调用） =====
+    def set_queue_mode(self, mode: str) -> None:
+        """切换队列模式并写回 ui_config.yaml"""
+        if mode not in ('discard', 'keep'):
+            raise ValueError(f"队列模式必须为 'discard' 或 'keep'，收到 {mode!r}")
+        for cid in self._app.car_ids:
+            self._passenger_queue[cid].mode = mode
+        # 写回文件
+        self._ui_config.setdefault('passenger', {})['queue_mode'] = mode
+        with self._ui_config_path.open('w', encoding='utf-8') as f:
+            yaml.safe_dump(self._ui_config, f, allow_unicode=True)
 
-    async def on_hall_call_serving(self, car_id: int, floor: int,
-                                    direction: str) -> None:
-        """外召已派车给某车 → 标记接客中、亮外召灯
+    # ===== 大脑决策方法（由小脑 app.py 转发 IO 事件） =====
 
-        由 app.py 在 dispatch 确定目标车后调用。
+    async def on_hall_call(self, floor: int, direction: str, bit: int) -> None:
+        """hall call button event (forwarded from app.py IO parser)
+
+        bit=1: dispatch car → open door if at floor, else call_internal
+        bit=0: start close-door cron if door is open
         """
-        self._pickup_active[car_id][(floor, direction)] = True
-        await self._app.set_hall_indicator(floor, direction, True)
+        if bit == 1:
+            target_cid = self._app._dispatch_hall_call(floor, direction)
+            if target_cid is None:
+                print(f'[hall_call] {direction}@L{floor} no available car')
+                return
+            # mark pickup, light indicator
+            self._pickup_active[target_cid][(floor, direction)] = True
+            await self._app.set_hall_indicator(floor, direction, True)
+            car = self._app.cars[target_cid]
+            if car.position == floor:
+                await self._app.action_queues[target_cid].put(
+                    Action(ActionKind.OPEN_DOOR))
+                print(f'[hall_call] {direction}@L{floor} → car{target_cid} at floor, opening')
+            else:
+                await self._app.call_internal(floor, car_id=target_cid, origin='hall')
+                print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
+        else:
+            # bit=0: find car serving this pickup → start close cron
+            for cid in self._app.car_ids:
+                if self._pickup_active.get(cid, {}).get((floor, direction), False):
+                    car = self._app.cars[cid]
+                    if car.door_state == DoorState.OPEN:
+                        await self._start_close_door_cron(cid, floor, direction)
+                    return
 
-    async def on_hall_call_release(self, car_id: int, floor: int,
-                                    direction: str) -> None:
-        """外召按钮松开 (bit=0) → 启动关门倒计时 cron
+    async def on_cabin_button(self, cid: int, floor: int) -> None:
+        """cabin button: door open → cache; door closed → call_internal"""
+        car = self._app.cars[cid]
+        if car.door_state in (DoorState.OPEN, DoorState.OPENING):
+            self._button_cache[cid].add(floor)
+            await self._app.cron.cancel(self._close_door_job_name(cid))
+        else:
+            await self._app.call_internal(floor, car_id=cid)
 
-        只在门开着时生效——关闭的 cron 会在按钮再次按下时自毁，
-        实现「长按保持开门」效果。
-        """
+    async def on_door_button(self, cid: int, signal: str) -> None:
+        """door button: open/close relay directly"""
+        car = self._app.cars[cid]
+        if signal == 'door_open_button':
+            await self._app.cron.cancel(self._close_door_job_name(cid))
+            if car.door_state in (DoorState.CLOSED, DoorState.CLOSING):
+                await self._app.action_queues[cid].put(
+                    Action(ActionKind.OPEN_DOOR))
+        elif signal == 'door_close_button':
+            await self._app.cron.cancel(self._close_door_job_name(cid))
+            if car.door_state in (DoorState.OPEN, DoorState.OPENING):
+                await self._app.action_queues[cid].put(
+                    Action(ActionKind.CLOSE_DOOR))
+
+    # ===== 小脑回调方法 =====
+
+    async def on_light_curtain(self, car_id: int) -> None:
+        """light curtain triggered → reschedule close cron (preserving hall signals)"""
+        await self._app.cron.cancel(self._close_door_job_name(car_id))
+        hall = [(f, d) for (f, d), a in self._pickup_active[car_id].items() if a]
+        await self._schedule_close_door_cron_job(
+            car_id, self._close_door_job_name(car_id),
+            hall_signals=hall if hall else None)
+
+    async def on_light_curtain_release(self, car_id: int) -> None:
+        """light curtain released → re-arm close cron if door is open"""
         car = self._app.cars[car_id]
         if car.door_state != DoorState.OPEN:
             return
-        if not self._pickup_active.get(car_id, {}).get((floor, direction), False):
-            return  # 不是本车在接这层客
+        hall = [(f, d) for (f, d), a in self._pickup_active[car_id].items() if a]
+        await self._schedule_close_door_cron_job(
+            car_id, self._close_door_job_name(car_id),
+            hall_signals=hall if hall else None)
 
-        await self._start_close_door_cron(car_id, floor, direction)
-
-    async def on_cabin_button_door_open(self, car_id: int, floor: int) -> None:
-        """门开着时内召 → 缓存 + 自毁关门 cron（让人多按几个）"""
-        self._button_cache[car_id].add(floor)
-        await self._app.cron.cancel(self._close_door_job_name(car_id))
-
-    async def on_light_curtain(self, car_id: int) -> None:
-        """光幕触发 → 重调度关门 cron"""
-        await self._app.cron.cancel(self._close_door_job_name(car_id))
-        if self._pickup_active.get(car_id):
-            await self._schedule_close_door_cron_job(
-                car_id, self._close_door_job_name(car_id))
+    async def on_breach(self, car_id: int) -> None:
+        """breach event: light curtain triggered during close → door reversed to open
+        
+        Register close cron with light-curtain-based self-destruct.
+        The cron will only fire when the light curtain is clear at dispatch time.
+        """
+        hall = [(f, d) for (f, d), a in self._pickup_active[car_id].items() if a]
+        await self._schedule_close_door_cron_job(
+            car_id, self._close_door_job_name(car_id),
+            hall_signals=hall if hall else None)
 
     # ===== 门流程（由 on_action_done 驱动） =====
 
@@ -224,23 +284,25 @@ class PassengerManager:
             await self._on_move_done(car_id)
 
     async def _on_move_done(self, car_id: int) -> None:
-        """MOVE 到站 → 标记服务完成 + 队列还有剩余则开门接客"""
+        """MOVE 到站 → 标记服务完成 + 队列还有剩余则开门接客
+
+        用 car.position 与乘客队列匹配，不依赖 car.target_floor
+        （因为 _handle_algorithm_state_change 会先清 target_floor）。
+        """
         car = self._app.cars[car_id]
         pq = self._passenger_queue[car_id]
         if not pq:
             return
-        target = car.target_floor
-        if target is not None and car.position == target:
-            pq.mark_served(target)
+        pos = car.position
+        if pos is not None and pos in set(pq.items):
+            pq.mark_served(pos)
             if pq:
-                # 还有后续请求 → 开门（送客 + 接新客）
                 await self._app.action_queues[car_id].put(
                     Action(ActionKind.OPEN_DOOR))
 
     async def _on_door_opened(self, car_id: int) -> None:
-        """门已打开 → 灭灯、停闪、清缓存、启动关门 cron"""
+        """door opened → clear indicators and button cache only"""
         app = self._app
-        hall_signals: list[tuple[int, str]] = []
         for (floor, direction), active in list(
                 self._pickup_active[car_id].items()):
             if active:
@@ -249,12 +311,7 @@ class PassengerManager:
                 task = self._flash_tasks[car_id].pop(flash_key, None)
                 if task is not None and not task.done():
                     task.cancel()
-                hall_signals.append((floor, direction))
         self._button_cache[car_id] = set()
-        # 启动关门 cron（事件规则处理自毁/重调度）
-        await self._schedule_close_door_cron_job(
-            car_id, self._close_door_job_name(car_id),
-            hall_signals=hall_signals if hall_signals else None)
 
     async def _on_door_closed(self, car_id: int) -> None:
         """门已关闭 → 清接客状态、合并队列 → 出发或熄灯"""
@@ -303,7 +360,6 @@ class PassengerManager:
         event_rules = [
             EventRule('door_open_button', car_id, 'cancel', 0),
             EventRule('door_close_button', car_id, 'cancel', 0),
-            EventRule('light_curtain', car_id, 'reschedule', delay),
         ]
         # 外召按下 → 自毁关门 cron（长按保持开门）
         if hall_signals:
@@ -316,8 +372,21 @@ class PassengerManager:
 
         async def _close_door_action():
             car = self._app.cars[car_id]
-            if car.door_state in (DoorState.OPEN, DoorState.OPENING):
-                await self._app.action_queues[car_id].put(
+            if car.door_state not in (DoorState.OPEN, DoorState.OPENING):
+                return
+            # check light curtain before closing: if still blocked, reschedule
+            try:
+                lc_addr = self._app.mapper.db_to_i(
+                    self._app.mapper.addr_input('light_curtain', car_id))
+                if self._app.io.get_input(lc_addr) == 1:
+                    await self._app.cron.cancel(job_name)
+                    await self._schedule_close_door_cron_job(
+                        car_id, job_name, floor, direction,
+                        hall_signals=hall_signals)
+                    return
+            except KeyError:
+                pass
+            await self._app.action_queues[car_id].put(
                     Action(ActionKind.CLOSE_DOOR))
 
         await self._app.cron.schedule(CronJob(
