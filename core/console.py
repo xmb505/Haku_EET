@@ -161,7 +161,7 @@ class Console:
         for f in floors:
             if not (1 <= f <= 10):
                 raise ValueError(f'楼层超出范围: {f}（应为 1-10）')
-        return floors
+        return sorted(set(floors))
 
     @staticmethod
     def _format_floors(floors: list[int]) -> str:

@@ -50,39 +50,43 @@ class UiController:
         self.car_id = car_id
         self.car = car
 
+    def _addr(self, signal: str) -> str | None:
+        """查信号地址，缺信号时打印警告返回 None"""
+        try:
+            return self.mapper.addr_output(signal, self.car_id)
+        except KeyError:
+            print(f'[ui:car{self.car_id}] 信号 {signal} 未在 io_config 中配置，跳过')
+            return None
+
     # ===== 轿厢状态指示灯 =====
 
     async def set_full_load(self, on: bool) -> None:
         """满载指示灯"""
         self.car.ui.full_load = on
-        await self.io_write.set(
-            self.mapper.addr_output('full_load_indicator', self.car_id),
-            1 if on else 0,
-        )
+        addr = self._addr('full_load_indicator')
+        if addr is not None:
+            await self.io_write.set(addr, 1 if on else 0)
 
     async def set_fault(self, on: bool) -> None:
         """故障指示灯"""
         self.car.ui.fault = on
-        await self.io_write.set(
-            self.mapper.addr_output('fault_indicator', self.car_id),
-            1 if on else 0,
-        )
+        addr = self._addr('fault_indicator')
+        if addr is not None:
+            await self.io_write.set(addr, 1 if on else 0)
 
     async def set_light(self, on: bool) -> None:
         """照明(电梯内灯)"""
         self.car.ui.light = on
-        await self.io_write.set(
-            self.mapper.addr_output('light_indicator', self.car_id),
-            1 if on else 0,
-        )
+        addr = self._addr('light_indicator')
+        if addr is not None:
+            await self.io_write.set(addr, 1 if on else 0)
 
     async def set_fan(self, on: bool) -> None:
         """风扇"""
         self.car.ui.fan = on
-        await self.io_write.set(
-            self.mapper.addr_output('fan_indicator', self.car_id),
-            1 if on else 0,
-        )
+        addr = self._addr('fan_indicator')
+        if addr is not None:
+            await self.io_write.set(addr, 1 if on else 0)
 
     # ===== 轿内按钮指示灯 =====
 
@@ -94,10 +98,9 @@ class UiController:
             on: True=亮, False=灭
         """
         self.car.ui.cabin_button_leds[floor] = on
-        await self.io_write.set(
-            self.mapper.addr_output(f'cabin_button_led_{floor}', self.car_id),
-            1 if on else 0,
-        )
+        addr = self._addr(f'cabin_button_led_{floor}')
+        if addr is not None:
+            await self.io_write.set(addr, 1 if on else 0)
 
     # ===== 批量同步 =====
 
@@ -116,20 +119,14 @@ class UiController:
             ('fan_indicator', self.car.ui.fan),
         ]
         for sig, on in sigs:
-            try:
-                addr = self.mapper.addr_output(sig, self.car_id)
+            addr = self._addr(sig)
+            if addr is not None:
                 writes[addr] = 1 if on else 0
-            except KeyError:
-                continue  # io_config 缺该信号时跳过(不抛)
         # 轿内按钮 LED
         for floor, on in self.car.ui.cabin_button_leds.items():
-            try:
-                addr = self.mapper.addr_output(
-                    f'cabin_button_led_{floor}', self.car_id
-                )
+            addr = self._addr(f'cabin_button_led_{floor}')
+            if addr is not None:
                 writes[addr] = 1 if on else 0
-            except KeyError:
-                continue
 
         if writes:
             await self.io_write.set_many(writes)

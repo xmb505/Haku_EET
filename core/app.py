@@ -623,8 +623,11 @@ class App:
             exe._relevel_future.cancel()
         exe._relevel_future = None
         exe._auto_seek_active = False
+        self._door_busy[cid] = False
         await self.cron.cancel(f'car{cid}_close_door')
         await self.cron.cancel(f'car{cid}_lights_off')
+        await self.cron.cancel(f'door_timeout_{cid}_open')
+        await self.cron.cancel(f'door_timeout_{cid}_close')
         self.pending_call_origin[cid].clear()
         self.cars[cid].human_presence = -1
         # 重置 UI 状态(逻辑状态清零 + 同步到 IO)
@@ -906,6 +909,12 @@ class App:
             raise ValueError(
                 f"direction 必须是 'up' 或 'down',got {direction!r}"
             )
+        max_f = self.config['building']['max_floor']
+        min_f = self.config['building']['min_floor']
+        if direction == 'up' and not (min_f <= floor < max_f):
+            raise ValueError(f'上行指示灯仅 {min_f}-{max_f - 1} 层，收到 {floor}')
+        if direction == 'down' and not (min_f + 1 <= floor <= max_f):
+            raise ValueError(f'下行指示灯仅 {min_f + 1}-{max_f} 层，收到 {floor}')
         self._hall_indicator_state[(floor, direction)] = on
         sig = f'hall_indicator_{direction}_{floor}'
         await self.io.set(self.mapper.addr_output(sig, 0), 1 if on else 0)
@@ -984,6 +993,11 @@ class App:
             - 'force_done': force 模式已拉 relay
             - 'rejected' / 'busy': 命令级错误,命令立即打印
         """
+        if car_id not in self.car_ids:
+            return {'status': 'rejected', 'message': f'无效轿厢 ID: {car_id}'}
+        if action not in ('open', 'close'):
+            return {'status': 'rejected', 'message': f"action 必须是 'open' 或 'close', got {action!r}"}
+
         door = self.executors[car_id].door
         mapper = self.mapper
         io = self.io
@@ -1092,7 +1106,7 @@ class App:
             ))
         except Exception:
             # 兜底调度失败不应影响主流程(派发已成功,后台 task 仍在跟踪)
-            pass
+            print(f'[car {car_id}] 警告: 门超时兜底 cron 调度失败,超时保护未生效')
 
         # 8. 立即返回,不阻塞 REPL
         return {
