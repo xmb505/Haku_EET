@@ -59,8 +59,17 @@ class DisplayEncoder:
     # ---- 核心 IO API：传入数字，直接写 IO ---- #
 
     async def show_number(self, number: int, car_id: int) -> None:
-        """显示一个数字 → 自动计算笔画 → 写 IO（经 tick 缓冲区）"""
-        await self._write_segments(self.number_to_segments(number), car_id)
+        """显示一个数字 → 优先查 floor_display 映射 → 写 IO（经 tick 缓冲区）"""
+        # 优先使用 floor_display 配置映射（允许自定义字符显示）
+        if number in self.floor_display:
+            glyph = self.floor_display[number]
+            if glyph.isdigit() and len(glyph) == 1:
+                await self._write_segments(self.number_to_segments(number), car_id)
+            else:
+                # 自定义字符（A、F 等）→ 用 get_segments_for_floor 处理
+                await self._write_segments(self.get_segments_for_floor(number), car_id)
+        else:
+            await self._write_segments(self.number_to_segments(number), car_id)
 
     async def show_glyph(self, glyph_name: str, car_id: int) -> None:
         """显示一个命名字符（up/down/fault/blank 等），十位补 0"""

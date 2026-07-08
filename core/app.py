@@ -38,6 +38,22 @@ except ImportError:
 DEFAULT_CAR_IDS = [1, 2, 3, 4, 5, 6]
 
 
+def _fire_and_forget(coro, *, name: str = '') -> asyncio.Task:
+    """创建后台 task 并附加异常日志回调（防止 create_task 吞异常）"""
+    task = asyncio.create_task(coro, name=name or None)
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            label = f' ({name})' if name else ''
+            print(f'[app] 后台 task{label} 异常: {exc!r}')
+
+    task.add_done_callback(_on_done)
+    return task
+
+
 class App:
     def __init__(
         self,
@@ -245,7 +261,7 @@ class App:
     async def _on_io_event(self, event: IOEvent) -> None:
         """IO 变化事件 → 查找归属轿厢 → 交给对应 executor"""
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
-        cid = sig[0] if sig and sig[0] else self.current_car_id
+        cid = sig[0] if sig and sig[0] is not None else self.current_car_id
         if cid in self.executors:
             await self.executors[cid].on_io_event(event)
 
@@ -447,6 +463,12 @@ class App:
         # 开门 → 阻止 _tick（门开着不能跑算法，等手动 /door close 或
         # 未来 passenger_flow 关门后 CLOSE_DOOK 才恢复调度）
         if kind == ActionKind.OPEN_DOOR:
+            return True
+
+        # 关门完成：如果 passenger manager 已启用，它已在 pm.on_action_done 中
+        # 触发了 _on_door_closed → call_internal → _tick，这里不能再跑 _tick
+        # 否则会产生双重 MOVE dispatch
+        if kind == ActionKind.CLOSE_DOOR and self.pm is not None:
             return True
 
         return False
@@ -728,7 +750,7 @@ class App:
             except KeyError:
                 # 没有 level 信号（异常配置）→ 仅激活 hold,让下次 IO 事件触发检查
                 exe._level_seek_active = True
-                asyncio.create_task(exe._level_seek_check())
+                _fire_and_forget(exe._level_seek_check(), name=f'level_seek_car{cid}')
                 activate_count += 1
                 continue
 
@@ -743,7 +765,7 @@ class App:
             else:
                 # 已在平层区(含偏离 1,0 / 0,1),立即激活 hold
                 exe._level_seek_active = True
-                asyncio.create_task(exe._level_seek_check())
+                _fire_and_forget(exe._level_seek_check(), name=f'level_seek_car{cid}')
                 activate_count += 1
 
         return {
@@ -1110,14 +1132,13 @@ class App:
             raise
 
         # 6. 后台 task 跟踪完成 + 错层检测
-        # 注意:create_task 不阻塞当前 coroutine
-        asyncio.create_task(self._door_track_completion(
+        _fire_and_forget(self._door_track_completion(
             car_id=car_id,
             action=action,
             listener=listener,
             done_event=done_event,
             wrong_floor=wrong_floor,
-        ))
+        ), name=f'door_track_car{car_id}')
 
         # 7. cron 兜底:PLC 异常不发 done 信号时,timeout 秒后强制释放 mutex
         # 无 sleep / wait_for,完全由 cron 事件循环驱动

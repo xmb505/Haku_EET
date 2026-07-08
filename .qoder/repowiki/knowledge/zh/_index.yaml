@@ -3,11 +3,11 @@ schema_version: 1
 locale: zh-CN
 branch: master
 nodes_managed: true
-exported_at: "2026-07-08T06:23:55Z"
+exported_at: "2026-07-08T08:12:30Z"
 modules:
     "":
-        dir_name: Haku_EET 电梯控制系统（西门子杯）
-        title: Haku_EET 电梯控制系统（西门子杯）
+        dir_name: 电梯多轿厢控制系统（大脑-小脑-脑干三层架构）
+        title: 电梯多轿厢控制系统（大脑-小脑-脑干三层架构）
         scope:
             - core/__main__.py
             - config/
@@ -31,7 +31,8 @@ modules:
         source_files: []
         children: []
         depends_on: []
-        related_to: []
+        related_to:
+            - path: cerebellum
     cerebellum:
         dir_name: 小脑（电梯运动协调层）
         title: 小脑（电梯运动协调层）
@@ -42,4 +43,5 @@ modules:
         source_files: []
         children: []
         depends_on: []
-        related_to: []
+        related_to:
+            - path: brainstem

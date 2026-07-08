@@ -129,6 +129,16 @@ class ActionExecutor:
         # flag set by _emergency_stop to prevent stale _start_action completion after door.cancel()
         self._emergency_stop_flag: bool = False
 
+        # 预解析 level 信号 IO 地址（避免 on_io_event 热路径多次查表）
+        try:
+            self._level_up_i = self.mapper.db_to_i(
+                self.mapper.addr_input('level_up', self.car_id))
+            self._level_down_i = self.mapper.db_to_i(
+                self.mapper.addr_input('level_down', self.car_id))
+        except KeyError:
+            self._level_up_i = None
+            self._level_down_i = None
+
     # ===== 主循环 =====
 
     async def run_loop(self, queue: ActionQueue) -> None:
@@ -179,18 +189,14 @@ class ActionExecutor:
                 # Auto-seek 检查:在 active 时下跑,找 (↑1↓1) 立即停;撞 1 限位 fallback
                 if self._auto_seek_active:
                     if sig2[1] in ('level_up', 'level_down'):
-                        try:
-                            up = self.io.get_input(self.mapper.db_to_i(
-                                self.mapper.addr_input('level_up', self.car_id)))
-                            dn = self.io.get_input(self.mapper.db_to_i(
-                                self.mapper.addr_input('level_down', self.car_id)))
+                        if self._level_up_i is not None and self._level_down_i is not None:
+                            up = self.io.get_input(self._level_up_i)
+                            dn = self.io.get_input(self._level_down_i)
                             if up == 1 and dn == 1:
                                 self._auto_seek_active = False
                                 self._log(f'[exec] car{self.car_id} auto-seek 找到 (↑1↓1) → 停车')
                                 await self._arrive_and_brake()
                                 return
-                        except KeyError:
-                            pass
                     elif sig2[1] in ('bottom_limit_1', 'top_limit_1') and event.bit == 1:
                         # 撞 1 限位 → fallback 入队 INITIALIZE down 1
                         self._auto_seek_active = False
@@ -203,15 +209,11 @@ class ActionExecutor:
             if (sig2 is not None and sig2[0] == self.car_id
                     and sig2[1] in ('level_up', 'level_down') and event.bit == 1
                     and self._relevel_future is not None):
-                try:
-                    up = self.io.get_input(self.mapper.db_to_i(
-                        self.mapper.addr_input('level_up', self.car_id)))
-                    dn = self.io.get_input(self.mapper.db_to_i(
-                        self.mapper.addr_input('level_down', self.car_id)))
+                if self._level_up_i is not None and self._level_down_i is not None:
+                    up = self.io.get_input(self._level_up_i)
+                    dn = self.io.get_input(self._level_down_i)
                     if up == 1 and dn == 1:
                         self._relevel_future.set_result(True)
-                except KeyError:
-                    pass
             # 事件驱动平层检测:level_up/level_down 变化 → 检查偏离启动反冲
             await self._level_seek_check()
             return

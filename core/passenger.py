@@ -441,8 +441,17 @@ class PassengerManager:
             except asyncio.CancelledError:
                 pass
 
-        self._flash_tasks[car_id][flash_key] = asyncio.create_task(
-            _flash_loop())
+        task = asyncio.create_task(_flash_loop())
+
+        def _on_flash_done(t):
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                print(f'[passenger] flash_loop car{car_id} 异常: {exc!r}')
+
+        task.add_done_callback(_on_flash_done)
+        self._flash_tasks[car_id][flash_key] = task
 
     # ===== 状态查询 =====
 

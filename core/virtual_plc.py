@@ -243,7 +243,9 @@ class VirtualPLC:
                 self.io.simulate_input(i_addr, 0)
             except asyncio.CancelledError:
                 pass
-        asyncio.create_task(reset_later())
+        asyncio.create_task(reset_later()).add_done_callback(
+            lambda t: None if t.cancelled() or not t.exception()
+            else print(f'[vplc] reset_later({signal}) 异常: {t.exception()!r}'))
 
     def _simulate_door_sensors(self) -> None:
         """检测门继电器变化 → 模拟 door_open_done / door_close_done + 门锁状态
@@ -315,7 +317,9 @@ class VirtualPLC:
                     self.io.simulate_input(floor_lock_addr, target_bit)
             except asyncio.CancelledError:
                 pass
-        asyncio.create_task(trigger())
+        asyncio.create_task(trigger()).add_done_callback(
+            lambda t: None if t.cancelled() or not t.exception()
+            else print(f'[vplc] trigger({_schedule_door_locks}) 异常: {t.exception()!r}'))
 
     def _schedule_door_done(self, signal: str, delay: float) -> None:
         """延时后 fire door_*_done = 1/0

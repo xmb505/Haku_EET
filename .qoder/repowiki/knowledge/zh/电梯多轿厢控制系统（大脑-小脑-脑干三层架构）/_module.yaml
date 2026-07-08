@@ -1,6 +1,6 @@
 schema_version: 1
 module_path: ""
-title: Haku_EET 电梯控制系统（西门子杯）
+title: 电梯多轿厢控制系统（大脑-小脑-脑干三层架构）
 scope:
     - core/__main__.py
     - config/

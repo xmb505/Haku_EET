@@ -67,6 +67,10 @@ class ActionQueue:
     async def get(self) -> Action:
         return await self._q.get()
 
+    def get_nowait(self) -> Action:
+        """非阻塞取出（用于 /reset 清空队列）"""
+        return self._q.get_nowait()
+
     def qsize(self) -> int:
         return self._q.qsize()
 

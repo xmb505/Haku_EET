@@ -138,6 +138,10 @@ class Cron:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
+        # 移除 IO listener 防止泄漏（reload 后 start 会重新注册）
+        if self._listener_ref is not None and self._io is not None:
+            self._io.remove_listener(self._listener_ref)
+            self._listener_ref = None
         self._jobs.clear()
         self._heap.clear()
         self._event_idx.clear()

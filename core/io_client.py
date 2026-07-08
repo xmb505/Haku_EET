@@ -244,15 +244,32 @@ class IOClient:
         # 所以 bitmap 也派发；用 _known_i_addrs 过滤避免 800 位全 dispatch
         known = getattr(self, '_known_i_addrs', None)
         changed_events: list[IOEvent] = []
-        for byte_idx, byte_val in enumerate(data):
-            for bit_idx in range(8):
-                bit = (byte_val >> bit_idx) & 1
-                i_addr = f'I{byte_idx}.{bit_idx}'
+
+        if known is not None:
+            # 快速路径：只扫描已注册的地址（通常 <50 个 vs 800 位全扫描）
+            for i_addr in known:
+                # 解析 I{byte_idx}.{bit_idx} → byte_idx, bit_idx
+                dot = i_addr.index('.')
+                byte_idx = int(i_addr[1:dot])
+                bit_idx = int(i_addr[dot + 1:])
+                if byte_idx >= len(data):
+                    continue
+                bit = (data[byte_idx] >> bit_idx) & 1
                 if self._input_cache.get(i_addr) != bit:
                     self._input_cache[i_addr] = bit
                     updated += 1
-                    if known is None or i_addr in known:
+                    changed_events.append(IOEvent(i_addr=i_addr, bit=bit))
+        else:
+            # 慢路径：全 800 位扫描（首次连接 / 未注册已知地址时）
+            for byte_idx, byte_val in enumerate(data):
+                for bit_idx in range(8):
+                    bit = (byte_val >> bit_idx) & 1
+                    i_addr = f'I{byte_idx}.{bit_idx}'
+                    if self._input_cache.get(i_addr) != bit:
+                        self._input_cache[i_addr] = bit
+                        updated += 1
                         changed_events.append(IOEvent(i_addr=i_addr, bit=bit))
+
         if self.debug and updated > 0:
             print(f'[io:ws] bitmap 更新 {updated} 位（总 {len(data) * 8} 位），'
                   f'dispatch {len(changed_events)} 个事件')
@@ -321,6 +338,8 @@ class IOClient:
             except asyncio.CancelledError:
                 self.ws_connected = False
                 raise
-            except Exception:
+            except Exception as e:
                 self.ws_connected = False
+                if self.debug:
+                    print(f'[io:ws] 连接断开: {e!r}，{self.reconnect_delay}s 后重连')
                 await asyncio.sleep(self.reconnect_delay)
