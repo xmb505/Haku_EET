@@ -2,50 +2,53 @@
 
 > 用 Python + asyncio 实现的电梯控制程序，模仿 MC 服务端的本地 REPL 风格，把电梯当作"玩家"驱动。
 
-## 设计原则
+> **文档导航：** 想理解设计哲学与完整规格 → [SPEC.md](./SPEC.md) | 想交接入门 → [HANDOVER.md](./HANDOVER.md) | 想查命令 → [COMMAND_MANUAL.md](./COMMAND_MANUAL.md) | 想对照点位 → [IO_UI.md](./IO_UI.md)
+>
+> 本 README 是快速上手起点；架构 / 设计哲学 / 路线图以 SPEC.md 为真相来源。
 
-1. **电梯 = 玩家**（`core/player.py`）：只保留现实状态（楼层 / 方向 / 门 / 故障 / human_presence / ui 指示灯状态），不掺杂游戏化包装
-2. **算法 → 硬件严格分层**：
-   - **算法层**只看到 `Car` + `Action`，完全不知道 IO 地址存在
-   - **硬件层**（执行器 FSM）只看到 `Action`，负责把动作展开为具体 IO 操作
-   - 中间通过 `ActionQueue` 异步通信
-3. **控制层只做算法编排**：`_on_action_done` 处理 MOVE/INITIALIZE 完成后的状态转换，乘客流程副作用（关门 cron、熄灯 cron、human_presence 状态迁移）由独立的 passenger_flow 模块通过事件监听机制接入
-4. **UI 模块独立**（`core/ui.py`）：轿厢状态指示灯 + 轿内按钮灯 + 外召灯作为 `Car.ui` 的逻辑状态，`UiController` 负责同步到 IO；UI 模块不参与门控制（PLC 上没有独立的开关门按钮灯）
-5. **7 段数码管编码独立 config**：比赛现场临时改编码或 10 楼显示规则只动 `config/display_config.yaml`
-6. **点位表 → IO 映射自动化**：`tools/gen_io_config.py` 解析 `点位表.md` 生成 `config/io_config.yaml`，点位表改了重跑脚本即可
+## 设计原则（8 条不变量）
+
+完整阐述见 [SPEC.md §1.3](./SPEC.md)。以下是速览版：
+
+1. **三层分离**：大脑（决策层）/ 小脑（物理层：运动+用户交互）/ 脑干（IO 层）严格分离，不允许跳层
+2. **电梯 = 玩家**：`Car` 是游戏实体，有属性有数值有状态，不掺杂 IO 地址
+3. **游戏属性驱动**：大脑改 `Car` 属性，小脑自动同步到物理世界
+4. **算法层是调度员**：只输出"谁去哪 / 谁变更目的地"，不碰运动学
+5. **事件驱动**：每一层广播自己的消息、监听别人的消息，没有 `time.sleep`、没有轮询
+6. **cron 是外置耳机**：不属于任何层，通过 EventRule 做 reschedule / cancel
+7. **不外设逻辑不污染调度**：用户交互模块只翻译需求，算法层只做调度
+8. **点位表 = IO 真相来源**：`gen_io_config.py` 解析 `点位表.md`
 
 ---
 
-## 三层架构
+## 三层架构（大脑 / 小脑 / 脑干）
+
+完整架构图与设计哲学见 [SPEC.md §1](./SPEC.md)。
 
 ```
-┌────────────────────────────────────┐
-│ 算法层（高层）                        │
-│ ─ 看 Car + Calls → 输出 Action 列表 │
-│ ─ 不知道 Q/I/M 是什么                 │
-└────────────────┬───────────────────┘
-                 │ push Action
-                 ↓
-┌────────────────────────────────────┐
-│ 控制层（事件分发）                    │
-│ ─ _on_action_done 只做算法编排        │
-│ ─ 开/关门是另一个独立子系统            │
-└────────────────┬───────────────────┘
-                 │ pop Action
-                 ↓
-┌────────────────────────────────────┐
-│ 硬件层（执行器 FSM）                  │
-│ ─ pop Action → 展开为 IO 序列       │
-│ ─ 等传感器确认 → 标记 done → 取下一条│
-└────────────────┬───────────────────┘
-                 │ 实际 IO
-                 ↓
-┌────────────────────────────────────┐
-│ 物理层（io_client + io_mapper）       │
-└────────────────────────────────────┘
+大脑（决策层）
+  ├─ 用户交互模块 — 赋予外设逻辑，管理 cron 闹钟，修改 Car 属性
+  ├─ 算法层（调度员）— 全局状态+需求 → 谁去哪
+  └─ REPL 控制台 — 文本命令 → 需求
+       ↓
+小脑（物理层：运动+用户交互）
+  ├─ executor FSM — 运动控制，更新 Car 位置/门
+  ├─ UI 模块 — 灯/按钮/显示（用户交互）
+  └─ controllers — 电机/门硬件封装
+       ↓
+       把电梯物理参数（电机、接触器、刹车、反冲等）隐藏掉，让 /car 1 call 5 成为简单高层命令
+       ↓
+脑干（IO 抽象层）
+  ├─ io_client — WS bitmap + HTTP 写合并（含 tick flush，默认 20ms）
+  ├─ io_mapper — DB <-> I 地址映射
+  └─ virtual_plc — 模拟 PLC
+
+cron（外置耳机）— 不属于任何层，定闹钟 + EventRule
+
+> **设计哲学参考**：完整设计哲学清单（16+ 条代码嵌入式哲学）见 [SPEC.md §13](./SPEC.md#13-代码嵌入的设计哲学)。
 ```
 
-乘客流程（passenger flow）和 UI 同步等上层应用逻辑通过 Listener + EventRule 机制接入，与控制层解耦。
+游戏化编程哲学：大脑只操作 `Car` 实体属性，小脑自动把属性变化同步到物理 IO，脑干只做物理传输。没有跨层硬调用。
 
 ---
 
@@ -101,7 +104,9 @@ python3 -m core
 
 ```
 Haku_EET/
+├── SPEC.md                    # 设计规格真相来源（架构+契约+路线图）
 ├── README.md                  # 本文件
+├── HANDOVER.md                # 交接文档（入门总纲）
 ├── COMMAND_MANUAL.md          # REPL 命令手册
 ├── IO_UI.md                   # 输出 IO 与 UI 模块信号映射
 ├── 点位表.md                   # IO 信号原始表（IO 真相来源）
@@ -113,22 +118,24 @@ Haku_EET/
 │   └── display_config.yaml    # 7 段数码管编码
 ├── tools/
 │   └── gen_io_config.py       # 点位表 → io_config.yaml 解析脚本
-├── core/                      # 主程序
-│   ├── player.py              # 玩家抽象（Car / Direction / DoorState / FaultFlags / IndicatorState）
-│   ├── actions.py             # 动作枚举 + ActionQueue（不含手动标记）
-│   ├── algorithm.py           # 高层算法（基类 + 首版 SimpleInternalCall）
-│   ├── cron.py                # 事件驱动延时定时器（reschedule / cancel）
-│   ├── ui.py                  # UI 模块 — 指示灯 / 按钮灯 / 外召灯逻辑状态 + IO 同步
-│   ├── executor.py            # 硬件层 FSM（动作→IO + 等传感器）
-│   ├── display.py             # 7 段数码管查表
-│   ├── io_mapper.py           # DB 地址 ↔ I 地址 + 逻辑信号名查表
-│   ├── io_client.py           # 异步 IO2HTTP 客户端（aiohttp + websockets）
-│   ├── controllers.py         # MotorController / DoorController 硬件封装
-│   ├── virtual_plc.py         # 模拟 PLC（--simulate 模式用）
-│   ├── app.py                 # 装配 + 主协调循环（控制层，不含 passenger flow）
-│   ├── console.py             # REPL 控制台
+├── core/
+│   ├── player.py              # Car 游戏实体（属性/数值/状态）
+│   ├── actions.py             # Action 枚举 + ActionQueue
+│   ├── algorithm.py           # 大脑：算法层/调度员
+│   ├── app.py                 # 大脑：装配 + 用户交互 + 主协调
+│   ├── console.py             # 大脑：REPL 控制台
+│   ├── passenger.py           # 大脑：乘客行为抽象（可选）
+│   ├── executor.py            # 小脑：运动 FSM
+│   ├── controllers.py         # 小脑：电机/门控制
+│   ├── ui.py                  # 小脑：Car.ui ↔ IO 同步
+│   ├── display.py             # 小脑：7 段数码管
+│   ├── cron.py                # 外置：事件驱动闹钟
+│   ├── io_mapper.py           # 脑干：DB ↔ I 映射
+│   ├── io_client.py           # 脑干：WS + HTTP 客户端
+│   ├── virtual_plc.py         # 脑干：模拟 PLC
+│   ├── __init__.py
 │   └── __main__.py            # CLI 入口
-└── tests/                     # pytest 单测（231 个用例）
+└── tests/                     # pytest 单测（266 个用例）
 ```
 
 ---
@@ -165,7 +172,7 @@ haku> /debug off   # 关闭
 ## 测试
 
 ```bash
-pytest tests/                        # 跑全部单测（231 个）
+pytest tests/                        # 跑全部单测（266 个）
 pytest tests/test_executor.py -v     # 单跑 executor
 ```
 
@@ -188,11 +195,11 @@ pytest tests/test_executor.py -v     # 单跑 executor
 
 ## 不在本期范围（明确剔除）
 
-- ❌ 6 部电梯群控（首版 1 部 / 已支持多轿厢但不做全局调度）
+- ❌ 6 部电梯群控（首版支持多轿厢但不做全局调度）
 - ❌ 集选/节能算法（首版 SimpleInternalCall）
 - ❌ VVVF 变频曲线（点位表是双速 + 3 级减速）
 - ❌ 远程 Web 控制台（已选本地 REPL）
-- ❌ 上层 passenger_flow 模块（开门后自动关门 cron、熄灯 cron、human_presence 状态迁移）——目前未实现，门一旦开了不会自动关，由后续脚本或外接控制决定
+- ❌ 上层 passenger_flow 模块（开门后自动关门 cron、熄灯 cron、human_presence 状态迁移）——待实现，详见 [SPEC.md §11 路线图](./SPEC.md#11-待办与路线图)
 
 ---
 

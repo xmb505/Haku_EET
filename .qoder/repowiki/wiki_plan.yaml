@@ -1,0 +1,116 @@
+version: 1
+scope:
+  include:
+    - core/**
+    - config/**
+    - tools/**
+    - 点位表.md
+    - SPEC.md
+    - HANDOVER.md
+  exclude:
+    - __pycache__/**
+    - .pytest_cache/**
+    - "**/*.pyc"
+
+repowiki:
+  template: architecture
+
+  notes:
+    - text: >-
+        三层架构：大脑（决策层：用户交互 + 算法 + REPL）、小脑（物理层：运动 FSM + UI + 硬件控制）、脑干（IO 层：WS + HTTP + 映射）。
+        不允许跳层调用，每层通过事件广播总线沟通。
+      author: architect
+    - text: >-
+        游戏化编程范式："电梯 = 玩家"，Car 是游戏实体有属性有状态有数值，不接触 IO 地址。
+        大脑改 Car 属性，小脑自动同步到物理 IO。
+      author: architect
+    - text: >-
+        大脑不注册任何 IO 监听器，不接触任何 IO 事件。大脑只通过 app.py API 交互。
+        PassengerQueue 独立于算法 pending_calls，三步工作流：collect -> compile -> consume。
+        两种模式：discard（顺向接受/已过站丢弃）/ keep（全部保留）。
+      author: architect
+    - text: >-
+        UI 不自动绑定事件（cabin_button_X 按下不自动亮 LED，上层逻辑自行决定）。
+        所有 UI 写操作走 set_many 单一路径，由 IOClient tick 自动合并。
+      author: architect
+    - text: >-
+        硬件契约要点：PLC 刹车假设"通电刹死/失电释放"（brake=0释放，brake=1刹死）。
+        若现场接法相反，改 set_brakes 一处映射即可。需现场验证。
+      author: architect
+    - text: >-
+        executor 设计哲学：cache 而非 _last_* 字段用于多信号同步判定；INITIALIZE 两段式（基站段低速/客运段复用标准减速）；
+        NOOP 不退出保持模式；EMERGENCY_STOP 同步清场所有长寿命状态；_arrive_and_brake 统一刹车流程避免三处重复代码；
+        LIGHT_OFF/LIGHT_ON 保留 handler 但不 dispatch（为未来 passenger_flow 预留）。
+      author: architect
+    - text: >-
+        工程哲学例外：brake-before-stop 100ms sleep 违反"零 sleep"哲学，但实机实测需要。
+        不可改为 cron 或删除，除非有 PLC 反馈信号替代方案。
+      author: architect
+    - text: >-
+        passenger_flow 模块（自动关门/熄灯 cron、human_presence 状态迁移）尚未实现，列为路线图。
+      author: architect
+
+  documents:
+    - title: 系统架构概览
+      goal: 呈现大脑/小脑/脑干三层架构总图，标注各层核心职责与通信方式
+      hints: 包含架构图 ASCII、分层定位表、数据流方向
+
+    - title: 设计哲学
+      goal: 汇总全部设计哲学（8 条不变量 + 代码嵌入式哲学）
+      parent: 系统架构概览
+      template: |-
+        ## 设计原则不变量
+        ## 代码嵌入式设计哲学
+        ## 工程哲学例外
+
+    - title: 大脑模块
+      goal: 描述决策层的三个子模块：用户交互、算法调度员、REPL 控制台
+      hints: 含 PassengerQueue 设计、算法接口、app.py 装配逻辑
+
+    - title: 小脑模块
+      goal: 描述物理层的运动 FSM、UI 同步、硬件控制三个子模块
+      template: |-
+        ## executor 运动 FSM
+        ## executor 设计哲学清单
+        ## UI 模块
+        ## 硬件控制（controllers）
+        ## PLC 硬件契约（赛前必验）
+
+    - title: 脑干模块
+      goal: 描述 IO 抽象层的 WS 客户端、HTTP 写合并、虚拟 PLC
+      hints: 含 tick 写合并机制、IO 映射表
+
+    - title: 接口契约
+      goal: 定义 Action 枚举、完成判据、状态机概览、cron 接口
+      hints: 以 Action 枚举表和状态迁移图为核心
+
+    - title: 路线图与未对齐项
+      goal: 记录未实现功能（passenger_flow、群控等）和已知未对齐问题
+      hints: 来自 SPEC.md §10-§11
+
+knowledgecard:
+  notes:
+    - text: >-
+        模块边界：passenger.py 属于大脑层，其 PassengerQueue 与 algorithm 的 pending_calls 是独立队列。
+        passenger 不接触 IO，只通过 app.py API 与小脑交互。
+      author: architect
+    - text: >-
+        模块边界：ui.py 属于小脑层，是纯粹的 IO 写映射器，不包含业务逻辑。
+        它从 Car.ui 读状态，通过 set_many 写入 IO。按钮事件由 app.py 处理，ui.py 不监听。
+      author: architect
+    - text: >-
+        模块边界：controllers.py 属于小脑层，直接封装 PLC 硬件信号。
+        它假设电磁刹车"通电刹死/失电释放"；若现场相反，改 set_brakes 内部映射。
+      author: architect
+    - text: >-
+        模块边界：executor.py 是小脑的运动 FSM，包含 7 个状态（IDLE/MOVE/INITIALIZE/DOOR/...）。
+        关键设计原则：多信号同步判定用 cache、急停需重置所有长寿命状态、非 NOOP 动作才退出保持模式。
+      author: architect
+    - text: >-
+        已知未对齐：executor.py 包含一个 asyncio.sleep(0.1) 违反零 sleep 哲学，是 PLC 物理时序硬要求。
+        这不是代码质量问题，是有文档记录的工程哲学例外。
+      author: architect
+    - text: >-
+        依赖关系：大脑 -> 小脑 -> 脑干 单向依赖，不允许反向。
+        cron 是外置耳机不属任何层，通过 EventRule 做 reschedule/cancel。
+      author: architect

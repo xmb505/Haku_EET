@@ -1,0 +1,10 @@
+schema_version: 1
+module_path: brainstem
+title: IO 抽象层（脑干）：IOClient / IOMapper / DisplayEncoder
+scope:
+    - core/io_client.py
+    - core/io_mapper.py
+    - core/display.py
+source_files: []
+depends_on: []
+related_to: []

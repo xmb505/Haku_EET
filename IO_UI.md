@@ -144,7 +144,21 @@
 | `set_hall_indicator(floor, 'up', on)` | `hall_indicator_up_{floor}` |
 | `set_hall_indicator(floor, 'down', on)` | `hall_indicator_down_{floor}` |
 
+## UI 模块在架构中的定位
+
+UI 模块（`core/ui.py`）属于**小脑（物理层）**。
+
+**设计哲学：**
+- UI 模块处理灯和按钮信号（用户交互）——它把 `Car.ui` 属性同步到物理 IO 输出，也把 IO 输入的变化反映到 `Car` 属性
+- 大脑（用户交互模块）决定"什么时候亮什么灯"，但**不直接操作 IO**
+- 大脑修改 `Car.ui` 属性（如 `car.ui.fault = True`），UI 模块自动把变化刷到物理 IO
+
+**关键约束：**
+- 严禁直接赋值 `car.ui.fault = True` 等——那只会改逻辑状态不同步 IO
+- 必须通过 `UiController` 方法（如 `app.ui[cid].set_fault(True)`）——它会同时改逻辑状态和触发 IO 写入
+
 ## 注意事项
 
 - **开门/关门不在 UI 模块管辖**：由 `DoorController.open()/close()` 控制 `door_open_relay` / `door_close_relay`，UI 模块不参与。
 - **PLC 上没有开关门按钮 LED**：想点亮的"开门/关门"视觉显示就靠电机继电器本身（硬件物理效果），不需要额外 IO。
+- **floor_display 配置必须是活的**：当前 `show_number()` 不查 `display_config.floor_display`（致命缺陷 #3），修复后配置改 10→'A' 才能生效。

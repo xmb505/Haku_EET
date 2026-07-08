@@ -1,0 +1,45 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: master
+nodes_managed: true
+exported_at: "2026-07-08T06:23:55Z"
+modules:
+    "":
+        dir_name: Haku_EET 电梯控制系统（西门子杯）
+        title: Haku_EET 电梯控制系统（西门子杯）
+        scope:
+            - core/__main__.py
+            - config/
+            - tools/
+            - 点位表.md
+            - HANDOVER.md
+            - SPEC.md
+        source_files: []
+        children:
+            - brainstem
+            - cerebellum
+        depends_on: []
+        related_to: []
+    brainstem:
+        dir_name: IO 抽象层（脑干）：IOClient _ IOMapper _ DisplayEncoder
+        title: IO 抽象层（脑干）：IOClient / IOMapper / DisplayEncoder
+        scope:
+            - core/io_client.py
+            - core/io_mapper.py
+            - core/display.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    cerebellum:
+        dir_name: 小脑（电梯运动协调层）
+        title: 小脑（电梯运动协调层）
+        scope:
+            - core/app.py
+            - core/executor.py
+            - core/controllers.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

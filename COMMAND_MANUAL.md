@@ -2,6 +2,28 @@
 
 所有命令以 `/` 开头（MC 风格）。输入 `/help` 随时查看。
 
+> 设计规格真相来源：[SPEC.md](./SPEC.md) | 架构总纲：[HANDOVER.md](./HANDOVER.md)
+
+## 目录
+
+**命令速查（上半篇）**
+- [轿厢控制 `/car`](#轿厢控制-car)
+- [调试控制](#调试控制)
+- [UI 模块 `/ui` `/buttonui`](#ui-模块-ui-buttonui)
+- [手动门 `/door`](#手动门-door)
+- [模块开关 `/module`](#模块开关-module)
+- [退出](#退出)
+- [`/help`](#help)
+- [典型调试会话](#典型调试会话)
+
+**架构奇技淫巧（下半篇）**
+- [大脑/小脑/脑干 —— 分层承诺](#大脑小脑脑干--分层承诺)
+- [Action 契约表](#action-契约表)
+- [Cron —— 事件驱动闹钟（外置耳机）](#cron--事件驱动闹钟外置耳机)
+- [human_presence —— 人类存在推测（Car 属性）](#human_presence--人类存在推测car-属性)
+- [事件广播总线](#事件广播总线)
+- [为什么不用 time.sleep](#为什么不用-timesleep)
+
 ---
 
 ## 轿厢控制 `/car`
@@ -245,20 +267,98 @@ haku> /debug on           # 观察每个 tick 输出
 
 ---
 
-# 架构奇技淫巧
+ 架构奇技淫巧（基于大脑/小脑/脑干三层）
 
-## Cron —— 事件驱动延时定时器
+完整设计规格见 [SPEC.md](./SPEC.md)。
 
-`core/cron.py` 是一个纯事件驱动的内部定时器，不是普通的 `asyncio.sleep`。
+## 大脑/小脑/脑干 —— 分层承诺
+
+每一层都是单向、不可跳过的：
+
+```
+IO电平变化
+  → 脑干处理（信号名解析）→ 广播事件
+    → 小脑 UI 模块更新 Car 属性 → 广播属性变化
+      → 大脑用户交互模块翻译为需求事件 → 广播
+        → 大脑算法层调度 → Action → 入 ActionQueue
+          → 小脑 executor 展开 FSM → IO 操作
+            → 脑干写入（HTTP POST）
+```
+
+各层承诺：
+- **大脑只改 `Car` 属性** —— 不碰 IO 地址，不直接调小脑
+- **小脑负责双向同步** —— IO 电平变化 → `Car` 属性更新 / `Car` 属性变化 → IO 写入
+- **脑干只做物理传输** —— WS bitmap 收 / HTTP 发，不触碰任何电梯语义
+
+> 例：按下 5 楼内召
+> → 脑干收 WS → 广播 IO 事件
+> → 小脑更新 Car 属性 → 广播属性变化
+> → 大脑用户交互模块翻译为需求 → 广播
+> → 大脑算法层 decide() → Action(MOVE_UP) → ActionQueue
+> → 小脑 executor 展开 → 拉接触器 → 启电机 → 追平层
+>
+> 全程没有跨层硬调用，没有 time.sleep，没有轮询。
+
+---
+
+## Action 契约表
+
+Action 是大脑（算法层/调度员）的输出语言，也是大脑与小脑之间的通信协议。
+
+来源：`core/actions.py:15-27`
+
+| ActionKind | 发出方 | 完成判据 | timeout |
+|------------|--------|----------|---------|
+| `INITIALIZE` | 大脑算法层（仅当 state==UNKNOWN）| 触限位反向后平层计数完成，state=READY | 隐含 |
+| `MOVE_UP` / `MOVE_DOWN` | 大脑算法层 | 平层匹配目标楼，direction=IDLE | 反冲可能额外几秒 |
+| `OPEN_DOOR` | 大脑用户交互模块 | door_open_done 信号到位 | cron 兜底 8s |
+| `CLOSE_DOOR` | 大脑用户交互模块（cron 闹钟响后）| door_close_done 信号到位 | cron 兜底 8s |
+| `SET_DISPLAY` | 大脑 | IO 写入完成 | 无（同步） |
+| `EMERGENCY_STOP` | 小脑（限位/急停触发）| 全部 output 归零 | 无（立即） |
+| `RESET_FAULT` | 大脑 | FaultFlags 全清 | 无（立即） |
+| `NOOP` | 任意 | 立即 done | 无 |
+
+语义约束：
+- MOVE 不碰门，OPEN_DOOR/CLOSE_DOOR 不碰电机
+- INITIALIZE 期间锁所有其他 Action
+- EMERGENCY_STOP 最高优先级
+
+---
+
+## Cron —— 事件驱动闹钟（外置耳机）
+
+`core/cron.py` 是一个独立的事件驱动闹钟系统。它**不属于任何层**，悬挂在事件广播总线上。
+
+核心哲学：**不是数秒，是定闹钟。**
+
+为什么不是 sleep？
+
+```python
+# 不要这样写 —— 这是数秒，睡死了对外界无感知
+await asyncio.sleep(10)
+await close_door()
+
+# 要这样写 —— 这是定闹钟，可被事件推迟/取消
+cron.schedule(CronJob(
+    trigger_time=time.monotonic() + 10,
+    action=close_door,
+    event_rules=[
+        EventRule(signal_name='light_curtain', car_id=1,
+                  action='reschedule', delay=10),
+        EventRule(signal_name='cabin_button_open_door', car_id=1,
+                  action='cancel'),
+    ],
+))
+```
 
 ### 核心概念
 
 ```
 CronJob（任务）
-  ├─ trigger_time    触发绝对时间
-  ├─ action          触发时执行的回调
-  ├─ auto_remove     自毁：触发后自动清除
-  └─ event_rules     哪些 IO 事件影响它
+  ├─ trigger_time    闹钟响的绝对时间
+  ├─ action          闹钟响时执行的回调
+  ├─ auto_remove     触发后自动清除
+  └─ event_rules     哪些事件影响这个闹钟
 
 EventRule（事件规则）
   ├─ signal_name     IO 信号名（'light_curtain' / 'cabin_button_3'）
@@ -270,14 +370,14 @@ EventRule（事件规则）
 ### 数据结构
 
 ```
-_jobs:          name → CronJob           （所有活跃任务）
-_heap:          [(trigger_time, name)]   （小顶堆，最近要触发的排最前）
+_jobs:          name → CronJob           所有活跃任务
+_heap:          [(trigger_time, name)]   小顶堆，最近要触发的排最前
 _event_idx:     (car_id, sig) → [(job_name, action, delay)]
-                                         （IO 事件直达任务，O(1) 查询）
-_wakeup_event:  asyncio.Event            （零轮询，只有事件才唤醒）
+                                          IO 事件直达任务，O(1) 查询
+_wakeup_event:  asyncio.Event            零轮询，只有事件才唤醒
 ```
 
-### run 循环（纯事件驱动，零轮询）
+### run 循环
 
 ```
 while running:
@@ -290,32 +390,49 @@ while running:
 2. **新任务 schedule**（`wakeup_event.set()`）→ 可能比当前等待更早
 3. **IO 事件触发规则**（`_on_io_event` → `wakeup_event.set()`）→ 重调度/取消
 
-### 两个魔法规则
+### 两种事件规则
 
-**reschedule（延时事件）：** IO 信号触发时，把任务推到 `now + delay`。
+**reschedule（推迟）：** IO 信号触发时，把闹钟推到 `now + delay`。
 
-> 例子：关门定时 10s。光幕被触发 → cron 把关门推迟到「光幕触发那一刻 + 10s」。
+> 场景：关门定时 10s。光幕被挡 → cron 把关门推迟到「光幕触发那一刻 + 10s」。
 > 反复触发光幕 = 反复推迟关门，永远不会在有人穿过时夹到。
 
-**cancel（自毁事件）：** IO 信号触发时，直接销毁任务。
+**cancel（自毁）：** IO 信号触发时，直接销毁任务。
 
-> 例子：熄灯定时 10min。内部按钮按下 → cron 自毁熄灯任务。
-> 有人在轿厢里，灯不该灭。10min 计时归零，等人出去关门后重新计时。
+> 场景：熄灯定时 10min。内部按钮按下 → cron 自毁熄灯任务。
+> 有人在轿厢里，灯不该灭。
 
 ### 生命周期
 
 ```
 schedule(job) → 入堆 + 建 event_idx → wakeup
-cancel(name)  → 删 _jobs + 删 event_idx + 删 _latest_trigger
+cancel(name)  → 删 _jobs + 删 event_idx
                 （heap 里 old entry 懒删除——fire 时看到 name 不在 _jobs 里就跳过）
 stop()        → 清所有数据
 ```
 
+### cron 与各层的关系
+
+cron 不"属于"任何层——它是挂在事件总线上的外置耳机：
+- **监听**：所有层的事件广播 → 通过 EventRule 决定是否 reschedule/cancel
+- **广播**：闹钟到点 → 广播"叮" → 大脑用户交互模块决定怎么处理
+
+关门场景：
+```
+大脑用户交互模块收到"开门完成" → 调度关门闹钟（10s）
+  ├─ 有人按开门按钮 → cancel 闹钟
+  ├─ 按钮松开 → 调度新关门闹钟
+  ├─ 光幕被挡 → reschedule（无限延）
+  └─ 闹钟走到响 → 大脑监听到 → 翻译为"需求：关门"
+```
+
 ---
 
-## human_presence —— 人类存在推测状态机
+## human_presence —— 人类存在推测（Car 属性）
 
-每部电梯的 `Car.human_presence` 推测轿厢内是否有人。不需要摄像头、红外传感器，**纯逻辑推断**。
+`Car.human_presence` 是 Car 实体的一个属性，由**大脑用户交互模块**维护。
+
+不需要摄像头、红外传感器，**纯逻辑推断**。
 
 ### 三态定义
 
@@ -325,52 +442,43 @@ stop()        → 清所有数据
 | `0` | 不确定 | 由 passenger_flow 模块推算 |
 | `1` | 确定有人 | 内部按钮被按下 |
 
-### 控制层（app.py）只负责两处更新
+### 当前更新逻辑
 
 ```
 INITIALIZE 完成                              → -1（车厢空的）
-
 cabin_button_X 上升沿（IO listener）         → +1  = 1
 ```
 
-其余过渡（关门后 → 0、熄灯 → -1 等）由上层 **passenger_flow 模块** 通过事件监听处理。当前 passenger_flow 模块尚未实现，所以：
-- INIT 后轿厢自动视为无人
-- 按过内部按钮之后轿厢视为有人，直到下一次 INIT
-
-**实现 passenger_flow 时**：观察 `_on_action_done`（动作完成事件）和 IO 事件，注册 cron job 即可。可以参考此前的 `_schedule_close_door` / `_schedule_lights_off` 设计（已从 app.py 移除）。
+其余过渡（关门后 → 0、熄灯 → -1 等）由上层 **passenger_flow 模块** 通过事件监听处理。当前 passenger_flow 模块尚未实现，详见 [SPEC.md §11 路线图](./SPEC.md#11-待办与路线图)。
 
 ---
 
-## 分层承诺 —— 不允许跳层
+## 事件广播总线
 
-每一层都是单向、不可跳过的：
+所有层之间通过事件广播通信，不直接调用。事件总线通过 Listener 模式实现。
 
+### 事件类型
+
+| 事件类型 | 发出方 | 消费者 |
+|----------|--------|--------|
+| IO 电平变化 | 脑干 | 小脑 → 大脑 |
+| 需求事件 | 大脑用户交互模块 | 大脑算法层 |
+| Action | 大脑算法层 → ActionQueue | 小脑 executor |
+| Action 完成 | 小脑 executor | 大脑用户交互模块 |
+| 闹钟响 | cron | 大脑用户交互模块 |
+| Car 属性变化 | 小脑 | 大脑 |
+
+### Listener 注册
+
+```python
+# 小脑注册监听 IO 信号
+io.add_listener(signal_name='cabin_button_5', car_id=1, callback=...)
+
+# 大脑注册监听 Action 完成
+executor.on_action_done = user_interaction._on_action_done
 ```
-IOEvent（电平变化）
-  → Listener（事件监听器，不摸 IO）
-    → App API（高层函数，如 call_internal）
-      → ActionQueue（异步队列）
-        → Executor（硬件 FSM，展开动作为 IO 序列）
-          → Controller（MotorController / DoorController）
-            → IOClient（写合并缓冲区，tick flush）
-              → HTTP POST（物理 IO）
-```
 
-- **Listener 是纯事件驱动** —— 不主动 poll、不直接读写 IO
-- **App API 是电梯函数** —— 只传「去哪里、干什么」，不管 IO 地址
-- **Executor 是 FSM** —— 把「开门」展开为「设继电器 → 等传感器到位」
-- **Controller 是硬件封装** —— 不单独写接触器位，调 `motor.start(direction, speed)`
-- **IOClient 是物理层** —— tick 合并写、WS bitmap 解析，上层不碰
-
-> 例：按下 1 楼外召 → `_on_hall_call_event`（不摸 IO）
-> → `_dispatch_hall_call`（纯函数）
-> → `call_internal(1, origin='hall')`（加 pending）
-> → `_tick` → `algorithm.decide` → `ActionQueue`
-> → executor MOVE → 到站 → push OPEN_DOOR → executor open → `_on_action_done`
-> → `_handle_algorithm_state_change`（清 pending，不做 passenger flow）
->
-> 全程没有任何地方直接写 IO 地址、没有任何 `time.sleep`、没有任何轮询 while 循环。
-> 乘客流程（自动关门、自动熄灯）由 passenger_flow 模块通过事件监听自行注入——它有权看到一切 IO 事件和动作事件，但它不属于控制层。
+Listener 是纯事件驱动的——不主动 poll、不直接读写 IO。
 
 ---
 
