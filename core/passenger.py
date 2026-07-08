@@ -194,9 +194,48 @@ class PassengerManager:
         bit=0: start close-door cron if door is open
         """
         if bit == 1:
+            # 快捷路径：已有车在该层且门开着/正在关 → 亮灯 + 取消关门 + 必要时重开
+            for cid in self._app.car_ids:
+                car = self._app.cars[cid]
+                if car.position != floor:
+                    continue
+                if car.door_state in (DoorState.OPEN, DoorState.OPENING):
+                    # 门已开/正在开 → 只亮灯 + 取消关门 cron
+                    self._pickup_active[cid][(floor, direction)] = True
+                    await self._app.set_hall_indicator(floor, direction, True)
+                    await self._app.cron.cancel(
+                        self._close_door_job_name(cid))
+                    print(f'[hall_call] {direction}@L{floor} → car{cid} door open, keep LED + cancel cron')
+                    return
+                elif car.door_state == DoorState.CLOSING:
+                    # 门正在关 → 亮灯 + 取消关门 cron + 重新开门
+                    self._pickup_active[cid][(floor, direction)] = True
+                    await self._app.set_hall_indicator(floor, direction, True)
+                    await self._app.cron.cancel(
+                        self._close_door_job_name(cid))
+                    await self._app.action_queues[cid].put(
+                        Action(ActionKind.OPEN_DOOR))
+                    print(f'[hall_call] {direction}@L{floor} → car{cid} door closing, reopen')
+                    return
+            # 第一层防线：该 (floor, direction) 已被某部车服务 → 跳过
+            for cid in self._app.car_ids:
+                if self._pickup_active.get(cid, {}).get((floor, direction), False):
+                    return
             target_cid = self._app._dispatch_hall_call(floor, direction)
             if target_cid is None:
                 print(f'[hall_call] {direction}@L{floor} no available car')
+                # 诊断信息：列出每部车被过滤的原因,帮助现场排查
+                # (例:门开着 / 手动模式 / 未初始化 / 位置未知)
+                for cid in self._app.car_ids:
+                    car = self._app.cars[cid]
+                    if car.state != CarState.READY:
+                        print(f'         · car{cid}: state={car.state.value}')
+                    elif car.position is None:
+                        print(f'         · car{cid}: position=None')
+                    elif self._app.manual_mode.get(cid, False):
+                        print(f'         · car{cid}: 手动模式中')
+                    elif car.door_state != DoorState.CLOSED:
+                        print(f'         · car{cid}: 门={car.door_state.value}')
                 return
             # mark pickup, light indicator
             self._pickup_active[target_cid][(floor, direction)] = True
@@ -210,11 +249,18 @@ class PassengerManager:
                 await self._app.call_internal(floor, car_id=target_cid, origin='hall')
                 print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
         else:
-            # bit=0: find car serving this pickup → start close cron
+            # bit=0: 按钮松开 → 处理长按驻留场景
             for cid in self._app.car_ids:
                 if self._pickup_active.get(cid, {}).get((floor, direction), False):
                     car = self._app.cars[cid]
                     if car.door_state == DoorState.OPEN:
+                        # 熄灯 + 停闪烁（长按驻留期间灯一直亮，松手才灭）
+                        await self._app.set_hall_indicator(floor, direction, False)
+                        flash_key = f'{direction}_{floor}'
+                        task = self._flash_tasks[cid].pop(flash_key, None)
+                        if task is not None and not task.done():
+                            task.cancel()
+                        # 启动关门 cron
                         await self._start_close_door_cron(cid, floor, direction)
                     return
 
@@ -284,10 +330,14 @@ class PassengerManager:
             await self._on_move_done(car_id)
 
     async def _on_move_done(self, car_id: int) -> None:
-        """MOVE 到站 → 标记服务完成 + 队列还有剩余则开门接客
+        """MOVE 到站 → 标记服务完成 + 开门让乘客上下
 
         用 car.position 与乘客队列匹配，不依赖 car.target_floor
         （因为 _handle_algorithm_state_change 会先清 target_floor）。
+
+        Bug 修复:之前只当 pq 还有剩余时才开门,导致单次内召到站
+        （pq=[5] → serve 5 → pq 空 → 不开门）乘客被困。
+        现在只要当前层是被服务过的(在 pq 里),就开门让乘客下梯。
         """
         car = self._app.cars[car_id]
         pq = self._passenger_queue[car_id]
@@ -296,22 +346,58 @@ class PassengerManager:
         pos = car.position
         if pos is not None and pos in set(pq.items):
             pq.mark_served(pos)
-            if pq:
-                await self._app.action_queues[car_id].put(
-                    Action(ActionKind.OPEN_DOOR))
+            # 开门让乘客下梯:不管是单次还是多次内召,只要本层被服务过
+            await self._app.action_queues[car_id].put(
+                Action(ActionKind.OPEN_DOOR))
 
     async def _on_door_opened(self, car_id: int) -> None:
-        """door opened → clear indicators and button cache only"""
+        """door opened → 检查外召按钮状态 + 条件性清灯/启动关门 cron
+
+        长按驻留逻辑:
+          - 开门时检查对应外召按钮是否仍按住（读 IO cache）
+          - 仍按住：灯保持亮 + 不关门（等松手再处理）
+          - 已松开：灯熄灭 + 启动关门 cron (door_close_delay)
+        """
         app = self._app
+        held_pickups: list[tuple[int, str]] = []     # 按钮仍按住
+        released_pickups: list[tuple[int, str]] = []  # 按钮已松开
+
         for (floor, direction), active in list(
                 self._pickup_active[car_id].items()):
-            if active:
+            if not active:
+                continue
+            # 读 IO cache 检查按钮是否仍按住
+            signal_name = f'hall_call_{direction}_{floor}'
+            try:
+                i_addr = app.mapper.db_to_i(
+                    app.mapper.addr_input(signal_name, 0))
+                button_held = (app.io.get_input(i_addr) == 1)
+            except KeyError:
+                button_held = False
+
+            if button_held:
+                held_pickups.append((floor, direction))
+            else:
+                # 熄灯 + 停闪烁
                 await app.set_hall_indicator(floor, direction, False)
                 flash_key = f'{direction}_{floor}'
                 task = self._flash_tasks[car_id].pop(flash_key, None)
                 if task is not None and not task.done():
                     task.cancel()
+                released_pickups.append((floor, direction))
+
         self._button_cache[car_id] = set()
+
+        # 清除已释放的 pickup（允许再次按下时重新触发）
+        for (floor, direction) in released_pickups:
+            self._pickup_active[car_id].pop((floor, direction), None)
+
+        if released_pickups or not held_pickups:
+            # 有松开的 pickup（或没有任何 held）→ 启动关门 cron
+            await self._schedule_close_door_cron_job(
+                car_id, self._close_door_job_name(car_id),
+                hall_signals=released_pickups if released_pickups else None)
+        # held_pickups 非空时：灯保持亮，不启动 cron，等 on_hall_call bit=0 处理
 
     async def _on_door_closed(self, car_id: int) -> None:
         """门已关闭 → 清接客状态、合并队列 → 出发或熄灯"""

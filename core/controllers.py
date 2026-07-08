@@ -34,6 +34,9 @@ class MotorController:
         self.io_write = io_write if io_write is not None else io
         self.mapper = mapper
         self.car_id = car_id
+        # 低速阶段叠加刹车档位（0=不叠加，1-7=部分刹车）
+        # set_speed(high_speed=False) 时自动叠加；set_speed(high_speed=True) 时自动释放
+        self.slow_brake_level: int = 0
 
     async def start(self, high_speed: bool = True,
                     direction: str | None = None) -> None:
@@ -86,11 +89,37 @@ class MotorController:
         })
 
     async def set_speed(self, high_speed: bool) -> None:
-        await self.io_write.set_many({
-            self.mapper.addr_output('high_speed_contactor', self.car_id): 1 if high_speed else 0,
-            self.mapper.addr_output('low_speed_contactor', self.car_id): 0 if high_speed else 1,
-            self.mapper.addr_output('motor_start', self.car_id): 1,
-        })
+        """切换速度档位
+
+        切低速 (high_speed=False):
+            - 设置 low_speed_contactor=1, high_speed_contactor=0
+            - 若 slow_brake_level > 0，自动叠加刹车（降低逼近动量）
+        切高速 (high_speed=True):
+            - 设置 high_speed_contactor=1, low_speed_contactor=0
+            - 自动释放刹车（清除上一次的 slow_brake 残留）
+        """
+        if high_speed:
+            await self.io_write.set_many({
+                self.mapper.addr_output('high_speed_contactor', self.car_id): 1,
+                self.mapper.addr_output('low_speed_contactor', self.car_id): 0,
+                self.mapper.addr_output('motor_start', self.car_id): 1,
+                self.mapper.addr_output('brake_1', self.car_id): 0,
+                self.mapper.addr_output('brake_2', self.car_id): 0,
+                self.mapper.addr_output('brake_3', self.car_id): 0,
+            })
+        else:
+            # 低速：叠 slow_brake（若 >0）
+            b1 = 1 if (self.slow_brake_level & 0b001) else 0
+            b2 = 1 if (self.slow_brake_level & 0b010) else 0
+            b3 = 1 if (self.slow_brake_level & 0b100) else 0
+            await self.io_write.set_many({
+                self.mapper.addr_output('high_speed_contactor', self.car_id): 0,
+                self.mapper.addr_output('low_speed_contactor', self.car_id): 1,
+                self.mapper.addr_output('motor_start', self.car_id): 1,
+                self.mapper.addr_output('brake_1', self.car_id): b1,
+                self.mapper.addr_output('brake_2', self.car_id): b2,
+                self.mapper.addr_output('brake_3', self.car_id): b3,
+            })
 
     async def set_brakes(self, b1: int = 0, b2: int = 0, b3: int = 0) -> None:
         await self.io_write.set_many({
@@ -182,6 +211,16 @@ class DoorController:
     def cancel(self) -> None:
         """force-complete current door action (for emergency stop)"""
         self._remove_listeners()
+        self._done.set()
+
+    def cancel_for_reopen(self) -> None:
+        """中断关门，准备立即重开（不等物理完成）
+
+        与 cancel() 区别：标记结果为 'cancelled'，executor 据此
+        跳过 door_state=CLOSED 赋值，让后续 OPEN_DOOR 无缝接管。
+        """
+        self._remove_listeners()
+        self._result = 'cancelled'
         self._done.set()
 
     async def all_off(self) -> None:

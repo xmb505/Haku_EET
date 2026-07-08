@@ -554,6 +554,13 @@ class ActionExecutor:
             await self.motor.hold_stop()
             self._relevel_future = None
             self._level_correct_in_progress = False
+            # 注:此 sleep 违反"无 sleep/wait"哲学,但与 _arrive_and_brake 同理——
+            # PLC 物理时序的必备 dead time。若 hold_stop 后机械反弹产生 level
+            # 边沿事件(常见于机械惯性大/制动响应慢的车),该事件会立即触发下一轮
+            # 反冲,形成"释放-刹车-反弹-再释放"的无限循环。150ms 稳定窗口足够
+            # 机械稳定 + level 抖动衰减,允许的事件驱动反冲节流到 ≥ 1 次/150ms。
+            # 不允许改成 cron 或删除,除非实机复现反弹 bug 且有 PLC 反馈信号替换方案。
+            await asyncio.sleep(0.15)
 
     def set_station_seek(self, enabled: bool) -> None:
         """切换站点吸附总开关（不影响正在运行的车）
@@ -653,7 +660,10 @@ class ActionExecutor:
                 result = await self.door.wait_done()
                 if self._emergency_stop_flag:
                     return  # emergency stop cancelled the door action
-                if result == 'breach':
+                if result == 'cancelled':
+                    # 关门被重开请求打断 → 不改 door_state，让 OPEN_DOOR 接管
+                    pass
+                elif result == 'breach':
                     self.car.door_state = DoorState.OPEN
                     # breach reverses to open — report as OPEN_DOOR completion
                     self.current_action = Action(ActionKind.OPEN_DOOR)

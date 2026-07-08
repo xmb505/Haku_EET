@@ -149,6 +149,11 @@ class App:
                 action_queue=self.action_queues[cid],
             )
 
+        # 应用 slow_brake 配置（低速阶段叠加刹车档位）
+        _slow_brake = self.config['elevator'].get('slow_brake', 0)
+        for cid in self.car_ids:
+            self.executors[cid].motor.slow_brake_level = _slow_brake
+
         # 装配 per-car UiController(与 executors 平级,游戏 entity-component 模式)
         # UI 是电梯实体的属性,通过 app.ui[cid].set_xxx() 写,car.ui.xxx 读
         self.ui: dict[int, UiController] = {}
@@ -163,6 +168,8 @@ class App:
         # Hall indicator 是建筑级信号(car_id=0),不属于任何轿厢
         # 状态单独存在 App 上(不挂在 Car 上)
         self._hall_indicator_state: dict[tuple[int, str], bool] = {}
+        # 外召按钮边沿检测状态（防止 PLC 持续上报 bit=1 导致重复派车）
+        self._hall_call_last_state: dict[str, int] = {}
 
         # 同轿厢互斥锁(/door 同车不能并发)
         # 用 bool 标志即可:asyncio 是协作式调度,await done_event.wait()
@@ -289,6 +296,11 @@ class App:
                 continue
             if car.door_state != DoorState.CLOSED:
                 continue  # 门开着（接客/开门/关门中）不派新外召
+            # 第二层防线：该车已在服务此 (floor, direction) pickup → 跳过
+            if (self.pm is not None
+                    and self.pm._pickup_active.get(cid, {}).get(
+                        (floor, direction), False)):
+                continue
 
             pos = car.position
             moving_dir = car.direction
@@ -334,6 +346,12 @@ class App:
             try: floor = int(signal_name[len('hall_call_down_'):])
             except ValueError: return
         else: return
+        # 边沿检测：只在 0→1（按下）和 1→0（松开）时转发，中间持续不刷
+        key = signal_name
+        last = self._hall_call_last_state.get(key, 0)
+        if last == event.bit:
+            return  # 无变化，跳过
+        self._hall_call_last_state[key] = event.bit
         await self.pm.on_hall_call(floor, direction, event.bit)
 
     async def _on_cabin_button_event(self, event: IOEvent) -> None:
@@ -516,6 +534,24 @@ class App:
         await self._tick(cid)
         return True
 
+    def call_rejection_reason(self, floor: int, car_id: int) -> str | None:
+        """镜像 call_internal 的拒绝条件,返回具体原因;None 表示可接受
+
+        用于 REPL 给用户具体原因,避免 '门未关或其他原因' 这种模糊提示。
+        拒绝条件(与 call_internal 严格对齐,顺序一致):
+            1. 门未关
+            2. 楼层已在 pending_calls
+            3. 车已在该楼层且无 pending 任务
+        """
+        car = self.cars[car_id]
+        if car.door_state != DoorState.CLOSED:
+            return f'门未关 ({car.door_state.value})'
+        if floor in self.pending_calls[car_id]:
+            return f'L{floor} 已在召唤队列'
+        if car.position == floor and not self.pending_calls[car_id]:
+            return f'已在 L{floor}'
+        return None
+
     async def change_internal(self, floor: int, car_id: int) -> str:
         """中途更改目的地
 
@@ -644,6 +680,9 @@ class App:
         self.cars[cid].position = None
         self.cars[cid].target_floor = None
         self.cars[cid].fault = FaultFlags()
+        # 防御性重置门状态:防止上一次会话残留的 OPEN/OPENING/CLOSING 导致
+        # 下一次 init 后 dispatch 失败（门开着不派新外召）。
+        self.cars[cid].door_state = DoorState.CLOSED
         self.pending_calls[cid].clear()
         # 同步清 executor 的 init 残留（双重保险：_start_action 也清了）
         self.executors[cid]._init_reverse_mode = False
@@ -704,8 +743,31 @@ class App:
         station_seek_enabled = self.config['elevator'].get('station_seek', False)
         for cid in self.car_ids:
             self.executors[cid].set_station_seek(station_seek_enabled)
+        # slow_brake reload 同步
+        slow_brake = self.config['elevator'].get('slow_brake', 0)
+        for cid in self.car_ids:
+            self.executors[cid].motor.slow_brake_level = slow_brake
         print(f'[reload] config reloaded: init_dir={self.config["elevator"]["initialization_direction"]}, '
-              f'station_seek={station_seek_enabled}')
+              f'station_seek={station_seek_enabled}, slow_brake={slow_brake}')
+
+    def _save_elevator_config(self, key: str, value: Any) -> None:
+        """将 elevator.<key> 写回 config.yaml（保留注释和格式）
+
+        使用正则匹配 `key: <旧值>` 行并替换为 `key: <新值>`。
+        不依赖 yaml.safe_dump（会丢失注释）。
+        """
+        import re
+        text = self.config_path.read_text(encoding='utf-8')
+        # 匹配 elevator 段内的 key: value（缩进 2 空格）
+        pattern = rf'^(\s+{re.escape(key)}:\s*)(.+)$'
+        new_text, n = re.subn(pattern, rf'\g<1>{value}', text, count=1, flags=re.MULTILINE)
+        if n == 0:
+            # 如果 key 不存在，追加到 elevator 段末尾（不常见）
+            # 找 elevator: 段最后一个非注释行后追加
+            pass
+        self.config_path.write_text(new_text, encoding='utf-8')
+        # 同步更新内存中的 config
+        self.config['elevator'][key] = value
 
     async def set_station_seek(self, enabled: bool) -> dict[str, int]:
         """切换站点吸附开关（高层 API，console 用）
@@ -832,6 +894,11 @@ class App:
         for cid in car_ids:
             self.manual_mode[cid] = True
             car = self.cars[cid]
+            # 进入手动方向前先释放刹车 —— motor.start 不操作 brake_* 信号,
+            # 若残留 station_seek/反冲 hold_stop 的 (1,1,1) 会导致"边开电机边锁死"
+            # 手动模式下不需要保留任何"刹车保证"语义,每次都释放最安全。
+            if direction is not None:
+                await self.executors[cid].motor.release_brakes()
             if direction == Direction.UP:
                 if car.direction == Direction.UP and car.manual_speed == high_speed:
                     continue
@@ -864,6 +931,8 @@ class App:
         car = self.cars[cid]
         if car.direction == Direction.UP and car.manual_speed == high_speed:
             return
+        # 释放残留刹车 —— motor.start 不动 brake_*,必须先释放避免"边开电机边锁死"
+        await self.executors[cid].motor.release_brakes()
         car.direction = Direction.UP
         car.manual_speed = high_speed
         await self.executors[cid].motor.start(high_speed=high_speed, direction='up')
@@ -875,6 +944,8 @@ class App:
         car = self.cars[cid]
         if car.direction == Direction.DOWN and car.manual_speed == high_speed:
             return
+        # 释放残留刹车 —— motor.start 不动 brake_*,必须先释放避免"边开电机边锁死"
+        await self.executors[cid].motor.release_brakes()
         car.direction = Direction.DOWN
         car.manual_speed = high_speed
         await self.executors[cid].motor.start(high_speed=high_speed, direction='down')
@@ -1016,10 +1087,14 @@ class App:
             }
         if not force:
             if action == 'open' and not car_door_locked:
-                return {
-                    'status': 'rejected',
-                    'message': f'car {car_id} 门已开(car_door_lock=false),无需再开',
-                }
+                # 门正在关 → 允许重开
+                if car.door_state == DoorState.CLOSING:
+                    pass  # 放行，让 executor 处理重开
+                else:
+                    return {
+                        'status': 'rejected',
+                        'message': f'car {car_id} 门已开(car_door_lock=false),无需再开',
+                    }
             if action == 'close' and car_door_locked:
                 return {
                     'status': 'rejected',
@@ -1072,12 +1147,17 @@ class App:
                 'message': f'car {car_id} force 模式:已拉 {action} relay(不等待门锁)',
             }
 
-        # 3. 同轿厢互斥
+        # 3. 同轿厢互斥（门关中允许重开 → 立即打断关门 + 释放 busy）
         if self._door_busy[car_id]:
-            return {
-                'status': 'busy',
-                'message': f'car {car_id} 门动作进行中,请等待完成',
-            }
+            if action == 'open' and self.cars[car_id].door_state == DoorState.CLOSING:
+                # 立即中断关门（executor 的 wait_done 会收到 'cancelled'）
+                self.executors[car_id].door.cancel_for_reopen()
+                self._door_busy[car_id] = False
+            else:
+                return {
+                    'status': 'busy',
+                    'message': f'car {car_id} 门动作进行中,请等待完成',
+                }
         self._door_busy[car_id] = True
 
         # 4. 注册 listener (同步,在 dispatch 前,防止 race)

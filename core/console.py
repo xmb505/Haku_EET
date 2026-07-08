@@ -31,6 +31,7 @@ HELP_TEXT = """
   /debug show level_check        toggle 平层检测（每次 level 翻转打印所有车 ↑↓）
   /debug show station_seek       toggle 站点吸附（吸附状态 / 反冲中 / 平层信号）
   /debug show door_status        toggle 门动作完成监视(/door 完成时输出 [door] car N 完成)
+  /debug show ui_listener        toggle UI 事件监视（按钮按下/外召/过载/检修）
   /module <name> [true|false]        切换功能模块（默认关）
     模块: station_seek  站点吸附——到站后保持完美平层,偏离全速反冲
   /ui <car_id|all> <type> [true|false]   轿厢状态指示灯
@@ -91,6 +92,7 @@ class Console:
             'module': self.cmd_module,
             'reload': self.cmd_reload,
             'quit': self.cmd_quit,
+            'settings': self.cmd_settings,
             'ui': self.cmd_ui,
             'usermode': self.cmd_usermode,
         }
@@ -114,6 +116,9 @@ class Console:
         self.elevator_speed_enabled: bool = False
         self._elevator_speed_task: asyncio.Task | None = None
         self._last_speed_state: dict[int, str] = {}
+        self.ui_listener_enabled: bool = False
+        self._ui_listener_ref = None
+        self._ui_button_last_state: dict[str, int] = {}
 
     def _resolve_car_id(self, args: list[str]) -> int:
         """从参数里提取 car_id（如果有），否则用当前选中的"""
@@ -213,6 +218,7 @@ class Console:
                 '/debug': ['show'],
                 '/door': ['open', 'close'],
                 '/module': ['station_seek'],
+                '/settings': ['slow_brake'],
                 '/ui': ['max', 'warn', 'fan', 'light'],
                 '/buttonui': ['out', 'in'],
                 '/usermode': ['true', 'false'],
@@ -222,7 +228,7 @@ class Console:
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'change': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'fireman': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status', 'ui_listener'],
                 'station_seek': ['true', 'false'],
                 'max': ['true', 'false'],
                 'warn': ['true', 'false'],
@@ -231,6 +237,7 @@ class Console:
                 'out': ['up', 'down'],
                 'open': ['force'],
                 'close': ['force'],
+                'slow_brake': ['0', '1', '2', '3', '4', '5', '6', '7'],
             }
 
             # ===== 通用补全原语 =====
@@ -527,6 +534,21 @@ class Console:
                             ['true', 'false'], current_word)
                         return
 
+                # 8. /settings 路径：子命令 → 档位 0-7
+                if cmd == '/settings':
+                    if len(parts) < 2:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    yield from self._complete_sub_arg(current_word, parts[1])
+                    return
+
+                # 9. /usermode 路径：无子命令,直接补 true/false
+                if cmd == '/usermode':
+                    yield from self._yield_options(
+                        ['true', 'false'], current_word)
+                    return
+
             @staticmethod
             def _looks_like_car_id(raw: str) -> bool:
                 """判断 raw 是否像 car_id：纯数字 / all / 含 - / 含 , 且除 ,外都是数字"""
@@ -776,6 +798,13 @@ class Console:
         for cid in car_ids:
             exec_was_paused[cid] = self.app.executors[cid].paused
             self.app.executors[cid].paused = True
+            # 主动释放残留刹车：上一动作（站点吸附 _arrive_and_brake / 反冲
+            # _level_seek_check 的 hold_stop）可能把刹车锁在 (1,1,1)。
+            # 若不显式 release，后续 manual_up/manual_down 调用 motor.start
+            # 时刹车仍为 (1,1,1) → 电机转动但刹车锁死 = 车不动 = "刹车锁死"。
+            # 与 _start_move_up 的"release_brakes + start"语义对齐。
+            await self.app.executors[cid].motor.release_brakes()
+            self.app.executors[cid].manual_current_brake_state = 0
 
         def render_status() -> None:
             """单行状态渲染（用 \\r 回到行首覆盖，永不 print 干扰）"""
@@ -1085,19 +1114,31 @@ class Console:
             return
 
         parts: list[str] = []
-        rejected: list[str] = []
+        rejected: list[tuple[str, str]] = []  # (car→floor 标签, 具体原因)
         for cid, f in zip(car_ids, floors):
             if self.app.manual_mode.get(cid, False):
                 await self.app.manual_auto(car_id=cid)
+            # 预检:给出具体原因,避免"门未关或其他原因"这种模糊提示
+            reason = self.app.call_rejection_reason(f, cid)
+            if reason is not None:
+                rejected.append((f'car{cid}→L{f}', reason))
+                continue
             ok = await self.app.call_internal(f, car_id=cid)
             if ok:
                 parts.append(f'car{cid}→L{f}')
             else:
-                rejected.append(f'car{cid}')
+                # 防御性兜底:状态在预检和调用之间变了(异步时序)
+                rejected.append((f'car{cid}→L{f}', '状态变化,call 失败'))
         if parts:
             print(f'[batch call] {", ".join(parts)}')
         if rejected:
-            print(f'[batch call] 拒绝: {", ".join(rejected)}（门未关或其他原因）')
+            if len(rejected) == 1:
+                label, reason = rejected[0]
+                print(f'[batch call] 拒绝: {label}（{reason}）')
+            else:
+                print(f'[batch call] 拒绝:')
+                for label, reason in rejected:
+                    print(f'  - {label}: {reason}')
 
     async def _do_call(self, args: list[str]) -> None:
         if not args:
@@ -1117,11 +1158,17 @@ class Console:
         # 手动模式下自动切回 auto 再发内召
         if self.app.manual_mode.get(self.current_car_id, False):
             await self.app.manual_auto(car_id=self.current_car_id)
+        # 预检:给出具体原因,避免"内召被拒绝"这种模糊提示
+        reason = self.app.call_rejection_reason(floor, self.current_car_id)
+        if reason is not None:
+            print(f'car {self.current_car_id} 内召 L{floor} 被拒绝（{reason}）')
+            return
         ok = await self.app.call_internal(floor, car_id=self.current_car_id)
         if ok:
             print(f'car {self.current_car_id} 已内召 L{floor}')
         else:
-            print(f'car {self.current_car_id} 内召 L{floor} 被拒绝')
+            # 防御性兜底:状态在预检和调用之间变了(异步时序)
+            print(f'car {self.current_car_id} 内召 L{floor} 被拒绝（状态变化）')
 
     async def _do_change(self, args: list[str]) -> None:
         """/car N change <floor> — 中途改目的地"""
@@ -1523,6 +1570,35 @@ class Console:
         pm.set_queue_mode(mode)
         print(f'queue_mode 已切换为 {mode}')
 
+    async def cmd_settings(self, args: list[str]) -> None:
+        """设置与调试参数
+
+        用法:
+          /settings                        显示 slow_brake 当前值
+          /settings slow_brake            显示 slow_brake 当前值
+          /settings slow_brake <0-7>      设置低速阶段叠加刹车档位(所有轿厢)
+        """
+        if not args or args[0] == 'slow_brake':
+            if not args or len(args) < 2:
+                lv = self.app.executors[self.current_car_id].motor.slow_brake_level
+                print(f'slow_brake = {lv}')
+                return
+            try:
+                level = int(args[1])
+            except ValueError:
+                print('slow_brake 必须是 0-7 的整数')
+                return
+            if not (0 <= level <= 7):
+                print('slow_brake 必须是 0-7 的整数')
+                return
+            for cid in self.app.car_ids:
+                self.app.executors[cid].motor.slow_brake_level = level
+            # 落盘：写回 config.yaml 并同步内存 config
+            self.app._save_elevator_config('slow_brake', level)
+            print(f'[settings] slow_brake = {level}（所有轿厢，已落盘）')
+        else:
+            print(f'未知设置: {args[0]}')
+
     def _show_module_status(self) -> None:
         """打印所有模块当前状态"""
         enabled = self.app.station_seek_enabled()
@@ -1568,7 +1644,7 @@ class Console:
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':
-            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek>')
+            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek|ui_listener>')
             return
         if len(args) < 2:
             # 显示当前所有监视项状态
@@ -1588,6 +1664,8 @@ class Console:
             print(f'拉扯(站点吸附)监视:         {lh}')
             ds = '启用' if self.door_status_monitor_enabled else '禁用'
             print(f'door_status 监视:          {ds}')
+            ul = '启用' if self.ui_listener_enabled else '禁用'
+            print(f'ui_listener 监视:           {ul}')
             return
         topic = args[1]
         if topic == 'pass_floor':
@@ -1606,6 +1684,8 @@ class Console:
             self._toggle_level_seek_debug()
         elif topic == 'door_status':
             self._toggle_door_status_monitor()
+        elif topic == 'ui_listener':
+            self._toggle_ui_listener()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -1974,6 +2054,91 @@ class Console:
             self._door_status_listener_ref = door_status_listener
             self.app.io.add_listener(door_status_listener)
             print('[debug] door_status 监视已启用(/door 完成时输出)')
+
+    def _toggle_ui_listener(self) -> None:
+        """toggle UI 事件监视：监听按钮按下、外召、过载等 UI 相关输入信号
+
+        按钮类信号使用上升沿检测（0→1 才打印），避免 PLC 持续上报时刷屏。
+        状态类信号（overload / service_mode）打印双向变化。
+        """
+        if self.ui_listener_enabled:
+            self.ui_listener_enabled = False
+            if self._ui_listener_ref:
+                self.app.io.remove_listener(self._ui_listener_ref)
+                self._ui_listener_ref = None
+            self._ui_button_last_state.clear()
+            print('[debug] ui_listener 监视已禁用')
+        else:
+            self.ui_listener_enabled = True
+            self._ui_button_last_state.clear()
+
+            async def ui_listener(event) -> None:
+                if not self.ui_listener_enabled:
+                    return
+                sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
+                if not sig:
+                    return
+                car_id, signal_name = sig
+                # 按钮类信号：边沿检测（上升沿=按下，下降沿=松开，中间持续不刷）
+                is_button = (
+                    signal_name.startswith('cabin_button_')
+                    or signal_name.startswith('hall_call_')
+                    or signal_name in ('door_open_button', 'door_close_button')
+                )
+                if is_button:
+                    key = f'{car_id}:{signal_name}'
+                    last = self._ui_button_last_state.get(key, 0)
+                    self._ui_button_last_state[key] = event.bit
+                    if last == event.bit:
+                        return  # 无变化，跳过
+                    action = '按下' if event.bit == 1 else '松开'
+                else:
+                    action = ''  # 非按钮信号不走这里
+
+                # 轿内按钮
+                if signal_name.startswith('cabin_button_'):
+                    try:
+                        floor = int(signal_name[len('cabin_button_'):])
+                    except ValueError:
+                        return
+                    print(f'[UI] car {car_id} 轿内按钮 L{floor} {action}', file=sys.stderr)
+                    sys.stderr.flush()
+                # 外召按钮（car_id=0）
+                elif signal_name.startswith('hall_call_up_'):
+                    try:
+                        floor = int(signal_name[len('hall_call_up_'):])
+                    except ValueError:
+                        return
+                    print(f'[UI] 外召 L{floor}↑ {action}', file=sys.stderr)
+                    sys.stderr.flush()
+                elif signal_name.startswith('hall_call_down_'):
+                    try:
+                        floor = int(signal_name[len('hall_call_down_'):])
+                    except ValueError:
+                        return
+                    print(f'[UI] 外召 L{floor}↓ {action}', file=sys.stderr)
+                    sys.stderr.flush()
+                # 门按钮
+                elif signal_name == 'door_open_button':
+                    print(f'[UI] car {car_id} 开门按钮{action}', file=sys.stderr)
+                    sys.stderr.flush()
+                elif signal_name == 'door_close_button':
+                    print(f'[UI] car {car_id} 关门按钮{action}', file=sys.stderr)
+                    sys.stderr.flush()
+                # 过载（双向）
+                elif signal_name == 'overload':
+                    state = '超重' if event.bit == 1 else '恢复正常'
+                    print(f'[UI] car {car_id} {state}', file=sys.stderr)
+                    sys.stderr.flush()
+                # 检修模式（双向）
+                elif signal_name == 'service_mode':
+                    state = '进入检修' if event.bit == 1 else '退出检修'
+                    print(f'[UI] car {car_id} {state}', file=sys.stderr)
+                    sys.stderr.flush()
+
+            self._ui_listener_ref = ui_listener
+            self.app.io.add_listener(ui_listener)
+            print('[debug] ui_listener 监视已启用(按钮按下/外召/过载/检修)')
 
     async def cmd_reload(self, args: list[str]) -> None:
         await self.app.reload()
