@@ -961,11 +961,12 @@ class Console:
                         pass
 
         # 释放刹车 + 停电机 + 切回 auto（不自动 tick，避免 UNKNOWN 状态触发 INITIALIZE）
+        for cid in car_ids:
+            self.app.manual_mode[cid] = False
         if len(car_ids) == 1:
             cid = car_ids[0]
             await self.app.manual_brake(0, car_id=cid)
             await self.app.manual_stop(car_id=cid)
-            self.app.manual_mode[cid] = False
         else:
             await self.app.manual_brake_batch(0, car_ids)
             await self.app.manual_batch(None, False, car_ids)
