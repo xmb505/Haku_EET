@@ -1041,12 +1041,16 @@ class App:
         max_f = self.config['building']['max_floor']
         min_f = self.config['building']['min_floor']
         if direction == 'up' and not (min_f <= floor < max_f):
-            raise ValueError(f'上行指示灯仅 {min_f}-{max_f - 1} 层，收到 {floor}')
+            return  # 边界楼层静默跳过（如10楼没有上行）
         if direction == 'down' and not (min_f + 1 <= floor <= max_f):
-            raise ValueError(f'下行指示灯仅 {min_f + 1}-{max_f} 层，收到 {floor}')
-        self._hall_indicator_state[(floor, direction)] = on
+            return  # 边界楼层静默跳过（如1楼没有下行）
         sig = f'hall_indicator_{direction}_{floor}'
-        await self.io.set(self.mapper.addr_output(sig, 0), 1 if on else 0)
+        try:
+            addr = self.mapper.addr_output(sig, 0)
+        except KeyError:
+            return  # 信号未在 io_config 中配置，静默跳过
+        self._hall_indicator_state[(floor, direction)] = on
+        await self.io.set(addr, 1 if on else 0)
         # 通知外召灯 observer（事件驱动）
         for cb_o in self._hall_light_observers:
             try:

@@ -512,3 +512,65 @@ class TestPassengerManagerDoorButtons:
 
         # cron 应该被取消
         assert jn not in pm._app.cron._jobs
+
+
+class TestDoorCloseHallButtonProtection:
+    """外召按钮按住时关门保护测试"""
+
+    @pytest.mark.asyncio
+    async def test_door_close_button_ignored_when_hall_held(self, app: App):
+        """外召按钮按住时按关门按钮 → 不响应关门"""
+        _init_all_cars(app)
+        await app.set_usermode(True)
+        app.cars[1].position = 1
+        app.cars[1].door_state = DoorState.OPEN
+
+        pm = app.pm
+        # 设置外召 pickup 激活
+        pm._pickup_active[1][(1, 'up')] = True
+
+        # IO cache 中 hall_call_up_1 = 1（按钮按住）
+        i_addr = hall_call_i_addr(app, 'hall_call_up_1')
+        app.io.simulate_input(i_addr, 1)
+
+        # 清空 action queue
+        while not app.action_queues[1].empty():
+            app.action_queues[1].get_nowait()
+
+        # 按关门按钮
+        await pm.on_door_button(1, 'door_close_button')
+
+        # action_queue 中不应有 CLOSE_DOOR
+        assert app.action_queues[1].empty(), '外召按住时关门按钮不应发送 CLOSE_DOOR'
+
+    @pytest.mark.asyncio
+    async def test_door_close_cron_aborted_when_hall_held(self, app: App):
+        """关门 cron 触发时外召仍按住 → 不执行关门"""
+        _init_all_cars(app)
+        await app.set_usermode(True)
+        app.cars[1].position = 1
+        app.cars[1].door_state = DoorState.OPEN
+
+        pm = app.pm
+        # 设置外召 pickup 激活
+        pm._pickup_active[1][(1, 'up')] = True
+
+        # IO cache 中 hall_call_up_1 = 1（按钮按住）
+        i_addr = hall_call_i_addr(app, 'hall_call_up_1')
+        app.io.simulate_input(i_addr, 1)
+
+        # 清空 action queue
+        while not app.action_queues[1].empty():
+            app.action_queues[1].get_nowait()
+
+        # 调度关门 cron（delay=0 以便立即触发）
+        jn = pm._close_door_job_name(1)
+        await pm._schedule_close_door_cron_job(1, jn, floor=1, direction='up')
+
+        # 手动触发 cron 的 action
+        job = app.cron._jobs.get(jn)
+        assert job is not None, 'cron job 应存在'
+        await job.action()
+
+        # action_queue 中不应有 CLOSE_DOOR
+        assert app.action_queues[1].empty(), '外召按住时 cron 不应发送 CLOSE_DOOR'
