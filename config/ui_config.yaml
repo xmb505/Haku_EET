@@ -15,7 +15,11 @@ passenger:
 
   # 熄灯节能延时(秒): 关门后等待多久自动熄灯
   light_off_delay: 600
-
+  
+  # human_presence 确认无人延时(秒): 门关 + 无召唤后多久推到 -1
+  # （三态机: 1=有人 → 0=不确定 → 10min 无活动 → -1=确定无人）
+  human_presence_off_delay: 600
+  
   # 外召指示灯闪烁间隔(毫秒)
   #   车减速靠近目标层时，外召灯按此频率闪烁
   flash_interval_ms: 500

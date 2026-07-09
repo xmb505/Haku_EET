@@ -259,6 +259,7 @@ class ActionExecutor:
             reverse_dir = 'down' if was_up else 'up'
             await self.motor.release_brakes()  # 释放前一次停车时保持的全刹
             await self.motor.start(high_speed=False, direction=reverse_dir)
+            await self.motor.set_speed(high_speed=False)  # 立即应用 slow_brake
             await self.motor.set_direction_indicator(reverse_dir)
             self.car.position = self._init_base_floor  # 基站位（11 或 -1）
             self._init_reverse_mode = True
@@ -332,7 +333,7 @@ class ActionExecutor:
                     self._init_base_segment_done = True
                     # 到达目标 → 完成
                     if new_pos == self._init_target_floor:
-                        self._log(f'[exec] car{self.car_id} INIT 到达 L{new_pos}, 全刹→停车→保持(7)')
+                        self._log(f'[exec] car{self.car_id} INIT 到达 L{new_pos}, 全刹→停车→保持(6)')
                         self._init_reverse_mode = False
                         # 清 active 防残留影响下次 init
                         self._init_perfect_leveling_active = False
@@ -499,7 +500,7 @@ class ActionExecutor:
 
         # 2. 到达目标层 → 完全停车（复用统一刹车 _arrive_and_brake）
         if new_pos == target:
-            self._log(f'[exec] car{self.car_id} 到 L{new_pos}, 全刹→停→保持(7)')
+            self._log(f'[exec] car{self.car_id} 到 L{new_pos}, 全刹→停→保持(6)')
             self.decel_state = ''
             await self._arrive_and_brake()
             return
@@ -756,6 +757,7 @@ class ActionExecutor:
             # 用低速启动基站段，与运行时触限位反冲行为一致
             await self.motor.release_brakes()
             await self.motor.start(high_speed=False, direction='down')
+            await self.motor.set_speed(high_speed=False)  # 立即应用 slow_brake
             if await self._try_complete_init_if_at_target():
                 return
             self._log(f'[exec] 初始化: 已在顶站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
@@ -786,6 +788,7 @@ class ActionExecutor:
             # 修复：上电时已在底限位的情况下启动电机+低速反向往上
             await self.motor.release_brakes()
             await self.motor.start(high_speed=False, direction='up')
+            await self.motor.set_speed(high_speed=False)  # 立即应用 slow_brake
             if await self._try_complete_init_if_at_target():
                 return
             self._log(f'[exec] 初始化: 已在底站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')

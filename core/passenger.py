@@ -163,6 +163,13 @@ class PassengerManager:
     def _light_off_delay(self) -> float:
         return self._ui_config.get('passenger', {}).get('light_off_delay', 600.0)
 
+    def _human_presence_off_delay(self) -> float:
+        # 新配置项 human_presence_off_delay 优先（门关 + 无请求后多久 = -1）
+        # 未配置则复用老的 light_off_delay
+        cfg = self._ui_config.get('passenger', {})
+        return float(cfg.get('human_presence_off_delay',
+                             cfg.get('light_off_delay', 600.0)))
+
     def _flash_interval(self) -> float:
         ms = self._ui_config.get('passenger', {}).get('flash_interval_ms', 500)
         return max(0.05, ms / 1000.0)
@@ -202,6 +209,9 @@ class PassengerManager:
                 if car.door_state in (DoorState.OPEN, DoorState.OPENING):
                     # 门已开/正在开 → 只亮灯 + 取消关门 cron
                     self._pickup_active[cid][(floor, direction)] = True
+                    # 外召有人呼叫 → human_presence 至少 0
+                    self._app.cars[cid].human_presence = max(
+                        0, self._app.cars[cid].human_presence)
                     await self._app.set_hall_indicator(floor, direction, True)
                     await self._app.cron.cancel(
                         self._close_door_job_name(cid))
@@ -210,6 +220,9 @@ class PassengerManager:
                 elif car.door_state == DoorState.CLOSING:
                     # 门正在关 → 亮灯 + 取消关门 cron + 重新开门
                     self._pickup_active[cid][(floor, direction)] = True
+                    # 外召有人呼叫 → human_presence 至少 0
+                    self._app.cars[cid].human_presence = max(
+                        0, self._app.cars[cid].human_presence)
                     await self._app.set_hall_indicator(floor, direction, True)
                     await self._app.cron.cancel(
                         self._close_door_job_name(cid))
@@ -239,6 +252,9 @@ class PassengerManager:
                 return
             # mark pickup, light indicator
             self._pickup_active[target_cid][(floor, direction)] = True
+            # 外召有人呼叫 → 被派车的轿厢 human_presence 至少 0
+            self._app.cars[target_cid].human_presence = max(
+                0, self._app.cars[target_cid].human_presence)
             await self._app.set_hall_indicator(floor, direction, True)
             car = self._app.cars[target_cid]
             if car.position == floor:
@@ -249,19 +265,21 @@ class PassengerManager:
                 await self._app.call_internal(floor, car_id=target_cid, origin='hall')
                 print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
         else:
-            # bit=0: 按钮松开 → 处理长按驻留场景
+            # bit=0: 按钮松开 → 判断车是否已到站
             for cid in self._app.car_ids:
                 if self._pickup_active.get(cid, {}).get((floor, direction), False):
                     car = self._app.cars[cid]
-                    if car.door_state == DoorState.OPEN:
-                        # 熄灯 + 停闪烁（长按驻留期间灯一直亮，松手才灭）
+                    if car.position == floor:
+                        # 车已到站 → 熄灯 + 停闪烁 + 启动关门 cron
                         await self._app.set_hall_indicator(floor, direction, False)
                         flash_key = f'{direction}_{floor}'
                         task = self._flash_tasks[cid].pop(flash_key, None)
                         if task is not None and not task.done():
                             task.cancel()
-                        # 启动关门 cron
                         await self._start_close_door_cron(cid, floor, direction)
+                    else:
+                        # 车还没到 → 保持亮灯
+                        await self._app.set_hall_indicator(floor, direction, True)
                     return
 
     async def on_cabin_button(self, cid: int, floor: int) -> None:
@@ -269,7 +287,6 @@ class PassengerManager:
         car = self._app.cars[cid]
         if car.door_state in (DoorState.OPEN, DoorState.OPENING):
             self._button_cache[cid].add(floor)
-            await self._app.cron.cancel(self._close_door_job_name(cid))
         else:
             await self._app.call_internal(floor, car_id=cid)
 
@@ -351,14 +368,30 @@ class PassengerManager:
                 Action(ActionKind.OPEN_DOOR))
 
     async def _on_door_opened(self, car_id: int) -> None:
-        """door opened → 检查外召按钮状态 + 条件性清灯/启动关门 cron
+        """door opened → 检查外召按钮状态 + 条件性熄灯/启动关门 cron
 
-        长按驻留逻辑:
+        关门逻辑:
           - 开门时检查对应外召按钮是否仍按住（读 IO cache）
-          - 仍按住：灯保持亮 + 不关门（等松手再处理）
-          - 已松开：灯熄灭 + 启动关门 cron (door_close_delay)
+          - 仍按住：不熄灯 + 不启动关门 cron（等松手再处理）
+          - 已松开：熄灯 + 启动关门 cron
+          - 松手时另由 on_hall_call bit=0 handler 统一处理 LED
+
+        human_presence 转移:
+          - 有外召 pickup（接客开门）：-1 → 0（可能上客）
+          - 无 pickup（到站送客开门）：1 → 0（可能下客）
         """
         app = self._app
+        car = app.cars[car_id]
+        # human_presence 状态转移（开门时）
+        has_pickup = any(self._pickup_active[car_id].values())
+        if has_pickup:
+            # 接客开门：-1 → 0（有人可能上客）
+            car.human_presence = max(0, car.human_presence)
+        else:
+            # 到站送客开门：1 → 0（人可能下客离开）
+            if car.human_presence == 1:
+                car.human_presence = 0
+
         held_pickups: list[tuple[int, str]] = []     # 按钮仍按住
         released_pickups: list[tuple[int, str]] = []  # 按钮已松开
 
@@ -378,15 +411,16 @@ class PassengerManager:
             if button_held:
                 held_pickups.append((floor, direction))
             else:
-                # 熄灯 + 停闪烁
+                # 车到站、按钮已松 → 熄灯
                 await app.set_hall_indicator(floor, direction, False)
-                flash_key = f'{direction}_{floor}'
-                task = self._flash_tasks[car_id].pop(flash_key, None)
-                if task is not None and not task.done():
-                    task.cancel()
                 released_pickups.append((floor, direction))
 
         self._button_cache[car_id] = set()
+
+        # 到站开门 → 熄灭当前楼层的轿内按钮 LED
+        pos = car.position
+        if pos is not None:
+            await app.ui[car_id].set_cabin_button_led(pos, False)
 
         # 清除已释放的 pickup（允许再次按下时重新触发）
         for (floor, direction) in released_pickups:
@@ -397,7 +431,7 @@ class PassengerManager:
             await self._schedule_close_door_cron_job(
                 car_id, self._close_door_job_name(car_id),
                 hall_signals=released_pickups if released_pickups else None)
-        # held_pickups 非空时：灯保持亮，不启动 cron，等 on_hall_call bit=0 处理
+        # held_pickups 非空时：启动 cron，等 on_hall_call bit=0 处理
 
     async def _on_door_closed(self, car_id: int) -> None:
         """门已关闭 → 清接客状态、合并队列 → 出发或熄灯"""
@@ -483,20 +517,32 @@ class PassengerManager:
             event_rules=event_rules,
         ))
 
-    # ===== 熄灯节能 cron =====
+    # ===== 熄灯节能 + human_presence -1 确认 cron =====
+    #
+    # 双重角色：
+    #   1. human_presence 三态机的 -1 确认（4 点是门关后状态计时 → 转 -1）
+    #   2. 车灯节能（活人能取消，未人者占空间也关）
+    # 两个语义合并：一旦事件取消，仍按 0 走到 -1，同时保留灯亮着（human_presence 0 还是表示不确定，灯不强制关）
 
     async def _start_lights_off_cron(self, car_id: int) -> None:
+        """门已关 + 无 pending 请求 → 启动 10min cron
+
+        到期后：human_presence 0 → -1（确认无人），同时关灯节能。
+        任何开门/按钮/召唤触发均取消。
+        """
         jn = self._lights_off_job_name(car_id)
         await self._app.cron.cancel(jn)
-        delay = self._light_off_delay()
+        delay = self._human_presence_off_delay()
 
         async def _lights_off_action():
             car = self._app.cars[car_id]
-            car.human_presence = -1
+            if car.human_presence == 0:
+                car.human_presence = -1
             await self._app.ui[car_id].set_light(False)
 
         event_rules = [
             EventRule('door_open_button', car_id, 'cancel', 0),
+            EventRule('door_close_button', car_id, 'cancel', 0),
         ]
         await self._app.cron.schedule(CronJob(
             name=jn,

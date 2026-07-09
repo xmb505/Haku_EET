@@ -32,6 +32,9 @@ HELP_TEXT = """
   /debug show station_seek       toggle 站点吸附（吸附状态 / 反冲中 / 平层信号）
   /debug show door_status        toggle 门动作完成监视(/door 完成时输出 [door] car N 完成)
   /debug show ui_listener        toggle UI 事件监视（按钮按下/外召/过载/检修）
+  /debug show human_presence     toggle 人类预测状态变化监视（-1/0/1 三态转移）
+  /debug show door_event         toggle 门事件监视（door_open/close_done,relay,lock,curtain）
+  /debug show ui_light_listener   toggle UI 输出监视（轿内灯/外召灯/上下行指示灯）
   /module <name> [true|false]        切换功能模块（默认关）
     模块: station_seek  站点吸附——到站后保持完美平层,偏离全速反冲
   /ui <car_id|all> <type> [true|false]   轿厢状态指示灯
@@ -70,7 +73,7 @@ HELP_TEXT = """
   Shift+↑ ↓        上下行（高速）
   空格             刹车（按当前档位）
   0                释放所有刹车
-  1-7              设置刹车档位（7=全刹）
+  1-6              设置刹车档位（6=全刹）
   ESC / q / Ctrl-C 退出手动控制
 """
 
@@ -119,6 +122,12 @@ class Console:
         self.ui_listener_enabled: bool = False
         self._ui_listener_ref = None
         self._ui_button_last_state: dict[str, int] = {}
+        self.human_presence_monitor_enabled: bool = False
+        self._human_presence_monitor_ref = None
+        self._hp_last_state: dict[int, int] = {}
+        self.door_event_monitor_enabled: bool = False
+        self._door_event_monitor_ref = None
+        self.ui_light_listener_enabled: bool = False
 
     def _resolve_car_id(self, args: list[str]) -> int:
         """从参数里提取 car_id（如果有），否则用当前选中的"""
@@ -228,7 +237,7 @@ class Console:
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'change': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'fireman': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status', 'ui_listener'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status', 'ui_listener', 'human_presence', 'door_event', 'ui_light_listener'],
                 'station_seek': ['true', 'false'],
                 'max': ['true', 'false'],
                 'warn': ['true', 'false'],
@@ -237,7 +246,7 @@ class Console:
                 'out': ['up', 'down'],
                 'open': ['force'],
                 'close': ['force'],
-                'slow_brake': ['0', '1', '2', '3', '4', '5', '6', '7'],
+                'slow_brake': ['0', '1', '2', '3', '4', '5', '6'],
             }
 
             # ===== 通用补全原语 =====
@@ -778,7 +787,7 @@ class Console:
         print('  ↑ ↓ / ← →   = 上下行（低速）')
         print('  Shift+↑↓    = 上下行（高速）')
         print('  空格         = 立即停 + 刹车')
-        print('  数字键 1-7   = 设置刹车档位（0=释放, 7=全刹）')
+        print('  数字键 1-6   = 设置刹车档位（0=释放, 6=全刹）')
         print('  ESC / q      = 退出手动控制')
         print(f'  退出会恢复 executor 2 限位保护')
         print('=' * 50)
@@ -925,7 +934,7 @@ class Console:
                         break
                     elif raw == b'\x03':  # Ctrl-C
                         break
-                    elif raw in b'01234567':
+                    elif raw in b'0123456':
                         brake_level = raw[0] - ord('0')
                     else:
                         continue
@@ -1577,7 +1586,7 @@ class Console:
         用法:
           /settings                        显示 slow_brake 当前值
           /settings slow_brake            显示 slow_brake 当前值
-          /settings slow_brake <0-7>      设置低速阶段叠加刹车档位(所有轿厢)
+          /settings slow_brake <0-6>      设置低速阶段叠加刹车档位(所有轿厢)
         """
         if not args or args[0] == 'slow_brake':
             if not args or len(args) < 2:
@@ -1587,10 +1596,10 @@ class Console:
             try:
                 level = int(args[1])
             except ValueError:
-                print('slow_brake 必须是 0-7 的整数')
+                print('slow_brake 必须是 0-6 的整数')
                 return
-            if not (0 <= level <= 7):
-                print('slow_brake 必须是 0-7 的整数')
+            if not (0 <= level <= 6):
+                print('slow_brake 必须是 0-6 的整数')
                 return
             for cid in self.app.car_ids:
                 self.app.executors[cid].motor.slow_brake_level = level
@@ -1645,7 +1654,7 @@ class Console:
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':
-            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek|ui_listener>')
+            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek|ui_listener|human_presence|door_event|ui_light_listener>')
             return
         if len(args) < 2:
             # 显示当前所有监视项状态
@@ -1667,6 +1676,12 @@ class Console:
             print(f'door_status 监视:          {ds}')
             ul = '启用' if self.ui_listener_enabled else '禁用'
             print(f'ui_listener 监视:           {ul}')
+            hp = '启用' if self.human_presence_monitor_enabled else '禁用'
+            print(f'human_presence 监视:     {hp}')
+            de = '启用' if self.door_event_monitor_enabled else '禁用'
+            print(f'door_event 监视:          {de}')
+            ull = '启用' if self.ui_light_listener_enabled else '禁用'
+            print(f'ui_light_listener 监视:    {ull}')
             return
         topic = args[1]
         if topic == 'pass_floor':
@@ -1687,6 +1702,12 @@ class Console:
             self._toggle_door_status_monitor()
         elif topic == 'ui_listener':
             self._toggle_ui_listener()
+        elif topic == 'human_presence':
+            self._toggle_human_presence_monitor()
+        elif topic == 'door_event':
+            self._toggle_door_event_monitor()
+        elif topic == 'ui_light_listener':
+            self._toggle_ui_light_listener()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -2140,6 +2161,104 @@ class Console:
             self._ui_listener_ref = ui_listener
             self.app.io.add_listener(ui_listener)
             print('[debug] ui_listener 监视已启用(按钮按下/外召/过载/检修)')
+
+    def _toggle_human_presence_monitor(self) -> None:
+        """toggle human_presence 三态变化监视
+
+        每次 IO 事件后比较当前 human_presence 与上次快照，
+        有变化就打印 [HP] car N: old → new。「老老稳」不打印。
+        """
+        if self.human_presence_monitor_enabled:
+            self.human_presence_monitor_enabled = False
+            if self._human_presence_monitor_ref:
+                self.app.io.remove_listener(self._human_presence_monitor_ref)
+                self._human_presence_monitor_ref = None
+            self._hp_last_state.clear()
+            print('[debug] human_presence 监视已禁用')
+        else:
+            self.human_presence_monitor_enabled = True
+            self._hp_last_state.clear()
+
+            async def hp_listener(event) -> None:
+                if not self.human_presence_monitor_enabled:
+                    return
+                for cid in self.app.car_ids:
+                    car = self.app.cars[cid]
+                    hp = car.human_presence
+                    last = self._hp_last_state.get(cid, -999)
+                    if last != hp:
+                        self._hp_last_state[cid] = hp
+                        print(f'[HP] car{cid} human_presence: {last} → {hp}',
+                              file=sys.stderr)
+                        sys.stderr.flush()
+
+            self._human_presence_monitor_ref = hp_listener
+            self.app.io.add_listener(hp_listener)
+            print('[debug] human_presence 监视已启用')
+
+    def _toggle_door_event_monitor(self) -> None:
+        """toggle 门事件监视：打印 door_open/close_done, relay, lock, curtain"""
+        if self.door_event_monitor_enabled:
+            self.door_event_monitor_enabled = False
+            if self._door_event_monitor_ref:
+                self.app.io.remove_listener(self._door_event_monitor_ref)
+                self._door_event_monitor_ref = None
+            print('[debug] door_event 监视已禁用')
+        else:
+            self.door_event_monitor_enabled = True
+
+            _DOOR_SIGNALS = (
+                'door_open_done', 'door_close_done',
+                'door_open_button', 'door_close_button',
+                'car_door_lock', 'light_curtain',
+            )
+
+            async def door_event_listener(event) -> None:
+                if not self.door_event_monitor_enabled:
+                    return
+                sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
+                if not sig:
+                    return
+                car_id, name = sig
+                if name not in _DOOR_SIGNALS:
+                    return
+                print(f'[DOOR] car{car_id} {name} = {event.bit}',
+                      file=sys.stderr)
+                sys.stderr.flush()
+
+            self._door_event_monitor_ref = door_event_listener
+            self.app.io.add_listener(door_event_listener)
+            print('[debug] door_event 监视已启用(door_open/close_done,relay,lock,curtain)')
+
+    def _toggle_ui_light_listener(self) -> None:
+        """toggle UI 输出监视：事件驱动（observer 回调），不轮询"""
+        if self.ui_light_listener_enabled:
+            self.ui_light_listener_enabled = False
+            for cid in self.app.car_ids:
+                self.app.ui[cid].remove_observer(self._ui_light_observer)
+            self.app._hall_light_observers.remove(self._ui_light_hall_observer)
+            print('[debug] ui_light_listener 监视已禁用')
+        else:
+            self.ui_light_listener_enabled = True
+            for cid in self.app.car_ids:
+                self.app.ui[cid].add_observer(self._ui_light_observer)
+            self.app._hall_light_observers.append(self._ui_light_hall_observer)
+            print('[debug] ui_light_listener 监视已启用（事件驱动）')
+
+    async def _ui_light_observer(self, car_id: int, signal: str, value: object) -> None:
+        """UiController observer 回调 — 轿内灯/风扇/故障/满载"""
+        if not self.ui_light_listener_enabled:
+            return
+        print(f'[LIGHT] car{car_id} {signal} = {value}', file=sys.stderr)
+        sys.stderr.flush()
+
+    async def _ui_light_hall_observer(self, floor: int, direction: str, on: bool) -> None:
+        """外召灯 observer 回调"""
+        if not self.ui_light_listener_enabled:
+            return
+        label = '↑' if direction == 'up' else '↓'
+        print(f'[LIGHT] 外召 L{floor}{label} = {on}', file=sys.stderr)
+        sys.stderr.flush()
 
     async def cmd_reload(self, args: list[str]) -> None:
         await self.app.reload()

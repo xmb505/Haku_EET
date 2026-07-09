@@ -3,45 +3,13 @@ schema_version: 1
 locale: zh-CN
 branch: master
 nodes_managed: true
-exported_at: "2026-07-08T08:12:30Z"
+exported_at: "2026-07-09T04:05:41Z"
 modules:
     "":
-        dir_name: 电梯多轿厢控制系统（大脑-小脑-脑干三层架构）
-        title: 电梯多轿厢控制系统（大脑-小脑-脑干三层架构）
-        scope:
-            - core/__main__.py
-            - config/
-            - tools/
-            - 点位表.md
-            - HANDOVER.md
-            - SPEC.md
+        dir_name: 电梯控制系统核心（大脑_小脑_脑干）
+        title: 电梯控制系统核心（大脑/小脑/脑干）
+        scope: []
         source_files: []
-        children:
-            - brainstem
-            - cerebellum
+        children: []
         depends_on: []
         related_to: []
-    brainstem:
-        dir_name: IO 抽象层（脑干）：IOClient _ IOMapper _ DisplayEncoder
-        title: IO 抽象层（脑干）：IOClient / IOMapper / DisplayEncoder
-        scope:
-            - core/io_client.py
-            - core/io_mapper.py
-            - core/display.py
-        source_files: []
-        children: []
-        depends_on: []
-        related_to:
-            - path: cerebellum
-    cerebellum:
-        dir_name: 小脑（电梯运动协调层）
-        title: 小脑（电梯运动协调层）
-        scope:
-            - core/app.py
-            - core/executor.py
-            - core/controllers.py
-        source_files: []
-        children: []
-        depends_on: []
-        related_to:
-            - path: brainstem

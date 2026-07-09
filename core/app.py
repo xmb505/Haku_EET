@@ -168,6 +168,8 @@ class App:
         # Hall indicator 是建筑级信号(car_id=0),不属于任何轿厢
         # 状态单独存在 App 上(不挂在 Car 上)
         self._hall_indicator_state: dict[tuple[int, str], bool] = {}
+        # 外召灯 observer 列表（事件驱动，debug 监视器注册）
+        self._hall_light_observers: list = []
         # 外召按钮边沿检测状态（防止 PLC 持续上报 bit=1 导致重复派车）
         self._hall_call_last_state: dict[str, int] = {}
 
@@ -366,6 +368,7 @@ class App:
         try: floor = int(signal_name[len('cabin_button_'):])
         except ValueError: return
 
+        # 内召按下 = 确定有人 → 设为 1
         self.cars[cid].human_presence = 1
         await self.cron.cancel(self.pm._lights_off_job_name(cid))
         await self.ui[cid].set_cabin_button_led(floor, True)
@@ -511,6 +514,7 @@ class App:
     def _make_on_light_curtain(self, car_id: int):
         """light curtain callback — sets human_presence, notifies PM"""
         async def on_light_curtain():
+            # 光幕 = 确定有人穿过 → 设为 1
             self.cars[car_id].human_presence = 1
             if self.pm is not None:
                 await self.pm.on_light_curtain(car_id)
@@ -1043,6 +1047,12 @@ class App:
         self._hall_indicator_state[(floor, direction)] = on
         sig = f'hall_indicator_{direction}_{floor}'
         await self.io.set(self.mapper.addr_output(sig, 0), 1 if on else 0)
+        # 通知外召灯 observer（事件驱动）
+        for cb_o in self._hall_light_observers:
+            try:
+                await cb_o(floor, direction, on)
+            except Exception:
+                pass
 
     def hall_indicator_state(self, floor: int, direction: str) -> bool:
         """读当前外召按钮指示灯状态(供 /buttonui toggle 用)"""

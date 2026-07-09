@@ -29,7 +29,7 @@ elevator:
   # 低速阶段叠加刹车档位（0=不叠加，1-7=部分刹车）
   # 切低速接触器时自动叠加，切高速时自动释放
   # /settings slow_brake <N> 可运行时修改并落盘
-  slow_brake: 2
+  slow_brake: 3
   # 门动作完成超时(秒):/door open/close 派发后,等 door_open_done/close_done 信号
   # 超过此时间视为 PLC 异常,cron 兜底自动释放 _door_busy + 打印警告。
   door_complete_timeout: 8

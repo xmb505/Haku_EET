@@ -11,7 +11,7 @@ PLC 刹车接法（代码假设,验证现场硬件后确认）:
 
     整套代码以下面这个语义为准:
       set_brakes(0, 0, 0) = 释放刹车(让电机能驱动)
-      set_brakes(1, 1, 1) = 全刹(7 档 max)
+      set_brakes(1, 1, 1) = 全刹(6 档 max)
     如果现场 PLC 接法相反,需要反转 set_brakes 里的 0/1 映射。
 """
 
@@ -108,10 +108,20 @@ class MotorController:
                 self.mapper.addr_output('brake_3', self.car_id): 0,
             })
         else:
-            # 低速：叠 slow_brake（若 >0）
-            b1 = 1 if (self.slow_brake_level & 0b001) else 0
-            b2 = 1 if (self.slow_brake_level & 0b010) else 0
-            b3 = 1 if (self.slow_brake_level & 0b100) else 0
+            # 低速：根据 slow_brake_level 叠加刹车（0-6 级）
+            # 0=无, 1=brake_1, 2=brake_2, 3=brake_3,
+            # 4=brake_1+3, 5=brake_2+3, 6=全刹
+            _BRAKE_TABLE = [
+                (0, 0, 0),  # 0
+                (1, 0, 0),  # 1
+                (0, 1, 0),  # 2
+                (0, 0, 1),  # 3
+                (1, 0, 1),  # 4
+                (0, 1, 1),  # 5
+                (1, 1, 1),  # 6
+            ]
+            lv = max(0, min(self.slow_brake_level, 6))
+            b1, b2, b3 = _BRAKE_TABLE[lv]
             await self.io_write.set_many({
                 self.mapper.addr_output('high_speed_contactor', self.car_id): 0,
                 self.mapper.addr_output('low_speed_contactor', self.car_id): 1,
@@ -129,9 +139,17 @@ class MotorController:
         })
 
     async def set_brake_level(self, level: int) -> None:
-        b1 = 1 if (level & 0b001) else 0
-        b2 = 1 if (level & 0b010) else 0
-        b3 = 1 if (level & 0b100) else 0
+        """设置刹车级数（0-6 级查表）
+
+        0=无, 1=brake_1, 2=brake_2, 3=brake_3,
+        4=brake_1+3, 5=brake_2+3, 6=全刹
+        """
+        _BRAKE_TABLE = [
+            (0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1),
+            (1, 0, 1), (0, 1, 1), (1, 1, 1),
+        ]
+        lv = max(0, min(level, 6))
+        b1, b2, b3 = _BRAKE_TABLE[lv]
         await self.set_brakes(b1, b2, b3)
 
     async def all_off(self) -> None:

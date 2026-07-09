@@ -12,6 +12,8 @@ ui.py —— 电梯 UI 指示灯控制器
     - 不自动绑定事件:cabin_button_X 按下不自动亮 LED,
       上层逻辑自行决定(为未来闪灯/复杂效果预留解耦)
     - 单一 IO 写路径:每方法一次 set_many(后续可改成批量 flush,目前够用)
+    - 事件驱动:每次 set_xxx 后通知注册的 observer,供 debug 监视器消费
+      (不依赖轮询,对齐项目事件驱动哲学)
 
 上层调用示例:
     app.ui[1].set_fault(True)             # 1 号梯亮故障灯
@@ -21,12 +23,14 @@ ui.py —— 电梯 UI 指示灯控制器
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Awaitable, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .io_client import IOClient
     from .io_mapper import IOMapper
     from .player import Car
+
+UiObserver = Callable[[int, str, object], Awaitable[None]]
 
 
 class UiController:
@@ -49,6 +53,25 @@ class UiController:
         self.mapper = mapper
         self.car_id = car_id
         self.car = car
+        self._observers: list[UiObserver] = []
+
+    def add_observer(self, cb: UiObserver) -> None:
+        """注册 UI 写观测器（事件驱动：每次 set_xxx 后调用 cb(car_id, signal_name, value)）"""
+        self._observers.append(cb)
+
+    def remove_observer(self, cb: UiObserver) -> None:
+        """移除观测器"""
+        try:
+            self._observers.remove(cb)
+        except ValueError:
+            pass
+
+    async def _notify_observers(self, signal: str, value: object) -> None:
+        for cb in self._observers:
+            try:
+                await cb(self.car_id, signal, value)
+            except Exception:
+                pass
 
     def _addr(self, signal: str) -> str | None:
         """查信号地址，缺信号时打印警告返回 None"""
@@ -66,6 +89,7 @@ class UiController:
         addr = self._addr('full_load_indicator')
         if addr is not None:
             await self.io_write.set(addr, 1 if on else 0)
+        await self._notify_observers('full_load', on)
 
     async def set_fault(self, on: bool) -> None:
         """故障指示灯"""
@@ -73,6 +97,7 @@ class UiController:
         addr = self._addr('fault_indicator')
         if addr is not None:
             await self.io_write.set(addr, 1 if on else 0)
+        await self._notify_observers('fault', on)
 
     async def set_light(self, on: bool) -> None:
         """照明(电梯内灯)"""
@@ -80,6 +105,7 @@ class UiController:
         addr = self._addr('light_indicator')
         if addr is not None:
             await self.io_write.set(addr, 1 if on else 0)
+        await self._notify_observers('light', on)
 
     async def set_fan(self, on: bool) -> None:
         """风扇"""
@@ -87,6 +113,7 @@ class UiController:
         addr = self._addr('fan_indicator')
         if addr is not None:
             await self.io_write.set(addr, 1 if on else 0)
+        await self._notify_observers('fan', on)
 
     # ===== 轿内按钮指示灯 =====
 
@@ -101,6 +128,7 @@ class UiController:
         addr = self._addr(f'cabin_button_led_{floor}')
         if addr is not None:
             await self.io_write.set(addr, 1 if on else 0)
+        await self._notify_observers(f'cabin_led_{floor}', on)
 
     # ===== 批量同步 =====
 

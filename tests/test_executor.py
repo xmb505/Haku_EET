@@ -407,10 +407,10 @@ async def test_motor_stop_does_not_touch_brakes(setup):
     期望:接触器清零 + motor_start=0,但 brake_1/2/3 保持非 0
     """
     car, io, mapper, display, executor = setup
-    # 模拟手动模式设了刹车档位 5 (=101,b1=1, b2=0, b3=1)
-    await executor.motor.set_brake_level(5)
+    # 模拟手动模式设了刹车档位 6 (全刹: b1=1, b2=1, b3=1)
+    await executor.motor.set_brake_level(6)
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_2', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
     assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     # 模拟手动停电机(空格或退出手动)
@@ -424,7 +424,7 @@ async def test_motor_stop_does_not_touch_brakes(setup):
 
     # 刹车状态保持（不被 stop 吃掉）
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_2', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
     assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     # 显式 release_brakes 才会清
@@ -444,7 +444,7 @@ async def test_release_brakes_called_on_move_start(setup):
     car.target_floor = 5
 
     # 先人为设个非零刹车状态（模拟手动模式残留）
-    await executor.motor.set_brake_level(3)
+    await executor.motor.set_brake_level(6)
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
     assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
 
@@ -1686,10 +1686,10 @@ async def test_motor_stop_does_not_touch_brakes(setup):
     期望:接触器清零 + motor_start=0,但 brake_1/2/3 保持非 0
     """
     car, io, mapper, display, executor = setup
-    # 模拟手动模式设了刹车档位 5 (=101,b1=1, b2=0, b3=1)
-    await executor.motor.set_brake_level(5)
+    # 模拟手动模式设了刹车档位 6 (全刹: b1=1, b2=1, b3=1)
+    await executor.motor.set_brake_level(6)
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_2', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
     assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     # 模拟手动停电机(空格或退出手动)
@@ -1703,7 +1703,7 @@ async def test_motor_stop_does_not_touch_brakes(setup):
 
     # 刹车状态保持（不被 stop 吃掉）
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
-    assert io.get_output(mapper.addr_output('brake_2', 1)) == 0
+    assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
     assert io.get_output(mapper.addr_output('brake_3', 1)) == 1
 
     # 显式 release_brakes 才会清
@@ -1723,7 +1723,7 @@ async def test_release_brakes_called_on_move_start(setup):
     car.target_floor = 5
 
     # 先人为设个非零刹车状态（模拟手动模式残留）
-    await executor.motor.set_brake_level(3)
+    await executor.motor.set_brake_level(6)
     assert io.get_output(mapper.addr_output('brake_1', 1)) == 1
     assert io.get_output(mapper.addr_output('brake_2', 1)) == 1
 
