@@ -13,6 +13,7 @@ from typing import Awaitable, Callable
 
 from .app import App
 from .io_client import IOEvent
+from .player import CarState, Direction
 
 
 HELP_TEXT = """
@@ -42,8 +43,10 @@ HELP_TEXT = """
   /help                          显示这个帮助
   /reload                        重载全部 config
   /quit                          退出
-  /usermode [true|false]          用户模式——开启前需所有轿厢已初始化
+  /usermode [true|false|partial <true|false>]
+                                  用户模式——开启前需所有轿厢已初始化
                                   开启后 ready 信号置 1，可正常接客
+                                  partial:只对已就绪车启用,跳过未就绪车（用于单步测试）
 
 示例:
   /car 1 init                    1 号梯初始化（完整流程：全速→触 1 限位→减速→完美平层）
@@ -230,7 +233,7 @@ class Console:
                 '/settings': ['slow_brake'],
                 '/ui': ['max', 'warn', 'fan', 'light'],
                 '/buttonui': ['out', 'in'],
-                '/usermode': ['true', 'false'],
+                '/usermode': ['true', 'false', 'partial'],
             }
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
@@ -247,6 +250,7 @@ class Console:
                 'open': ['force'],
                 'close': ['force'],
                 'slow_brake': ['0', '1', '2', '3', '4', '5', '6'],
+                'partial': ['true', 'false'],
             }
 
             # ===== 通用补全原语 =====
@@ -552,10 +556,16 @@ class Console:
                     yield from self._complete_sub_arg(current_word, parts[1])
                     return
 
-                # 9. /usermode 路径：无子命令,直接补 true/false
+                # 9. /usermode 路径：true|false|partial → [true|false] (仅 partial)
                 if cmd == '/usermode':
-                    yield from self._yield_options(
-                        ['true', 'false'], current_word)
+                    if len(parts) < 2:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    # 选了 partial → 补 true/false;其他子命令不再补
+                    if parts[1] == 'partial':
+                        yield from self._complete_sub_arg(
+                            current_word, 'partial')
                     return
 
             @staticmethod
@@ -1621,9 +1631,11 @@ class Console:
     async def cmd_usermode(self, args: list[str]) -> None:
         """切换用户模式
 
-        /usermode          → 显示当前状态
-        /usermode true     → 开启（需所有轿厢已初始化）
-        /usermode false    → 关闭
+        /usermode              → 显示当前状态
+        /usermode true         → 开启（需所有轿厢已初始化）
+        /usermode false        → 关闭
+        /usermode partial true → 单车测试:只对已就绪车启用
+        /usermode partial false→ 关闭
         """
         if not args:
             enabled = self.app.usermode_enabled
@@ -1631,7 +1643,35 @@ class Console:
             return
 
         arg = args[0].lower()
-        if arg == 'true':
+        if arg == 'partial':
+            if len(args) < 2:
+                print('用法: /usermode partial <true|false>')
+                return
+            sub = args[1].lower()
+            if sub == 'true':
+                if self.app.pm is None:
+                    print('[usermode] 错误:大脑模块（passenger.py）未加载,无法启用用户模式')
+                    return
+                # 只对已就绪车调用 set_usermode
+                ready = [cid for cid in self.app.car_ids
+                         if self.app.cars[cid].state == CarState.READY
+                         and self.app.cars[cid].position is not None]
+                if not ready:
+                    print('[usermode] partial 失败:无任何已就绪轿厢,需先 /car N init')
+                    return
+                result = await self.app.set_usermode(True, cars=ready)
+                enabled_cars = result.get('enabled_cars', [])
+                blocked = result.get('blocked', [])
+                print(f'[usermode] partial 模式:car {enabled_cars} 已启用（ready=1）')
+                if blocked:
+                    skipped = [c for c in self.app.car_ids if c not in ready]
+                    print(f'  跳过未就绪车: {skipped}')
+            elif sub == 'false':
+                await self.app.set_usermode(False)
+                print('[usermode] 用户模式已关闭（ready=0）')
+            else:
+                print(f'[usermode] partial 未知参数: {args[1]}（要 true 或 false）')
+        elif arg == 'true':
             if self.app.pm is None:
                 print('[usermode] 错误：大脑模块（passenger.py）未加载，无法启用用户模式')
                 return
@@ -1650,7 +1690,7 @@ class Console:
             await self.app.set_usermode(False)
             print('[usermode] 用户模式已关闭（ready=0）')
         else:
-            print(f'未知参数: {args[0]}（要 true 或 false）')
+            print(f'未知参数: {args[0]}（要 true|false|partial）')
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':

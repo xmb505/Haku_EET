@@ -357,7 +357,7 @@ class App:
         await self.pm.on_hall_call(floor, direction, event.bit)
 
     async def _on_cabin_button_event(self, event: IOEvent) -> None:
-        if not self._usermode or event.bit != 1 or self.pm is None:
+        if not self._usermode or self.pm is None:
             return
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
         if sig is None or sig[0] not in self.car_ids:
@@ -368,20 +368,28 @@ class App:
         try: floor = int(signal_name[len('cabin_button_'):])
         except ValueError: return
 
-        # 内召按下 = 确定有人 → 设为 1
-        self.cars[cid].human_presence = 1
-        await self.cron.cancel(self.pm._lights_off_job_name(cid))
-        await self.ui[cid].set_cabin_button_led(floor, True)
-        await self.pm.on_cabin_button(cid, floor)
+        if event.bit == 1:
+            # 内召按下 = 确定有人 → 设为 1
+            self.cars[cid].human_presence = 1
+            await self.cron.cancel(self.pm._lights_off_job_name(cid))
+            await self.ui[cid].set_cabin_button_led(floor, True)
+            await self.pm.on_cabin_button(cid, floor)
+        else:
+            # 内召松开：若按钮楼层 == 当前楼层 → 灭灯
+            # （不在当前楼层的灯由 on_door_opened 到站时统一灭）
+            car = self.cars[cid]
+            if car.position == floor:
+                await self.ui[cid].set_cabin_button_led(floor, False)
 
     async def _on_door_button_event(self, event: IOEvent) -> None:
-        if not self._usermode or event.bit != 1 or self.pm is None:
+        if not self._usermode or self.pm is None:
             return
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
         if sig is None or sig[0] not in self.car_ids:
             return
         cid, signal_name = sig
-        await self.pm.on_door_button(cid, signal_name)
+        # bit=1=按下, bit=0=松开都需转发到大脑(尤其开门松开后要启关门 cron)
+        await self.pm.on_door_button(cid, signal_name, event.bit)
 
     # _on_light_curtain_event deleted — DoorController manages light curtain internally
     # with on_light_curtain callback → human_presence + PM notification
@@ -408,6 +416,51 @@ class App:
             if self.debug:
                 print(f'[tick]   → {action}')
             await self.action_queues[cid].put(action)
+            # 车开始移动 → 检查是否需要让其他空闲车回 L1
+            if action.kind in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN):
+                await self._auto_park_check(cid)
+
+    async def _auto_park_check(self, moving_car_id: int) -> None:
+        """当一部车开始移动时，检查是否需要让其他空闲车回 L1 待命
+
+        规则：
+        - 仅在 usermode 启用时生效
+        - 如果移走的车原本在 L1 → 检查是否有其他空闲车已在 L1
+        - 如果没有空闲车在 L1 → 派最近的一部空闲车去 L1
+        """
+        if not self._usermode:
+            return
+
+        building = self.config.get('building', {})
+        main_floor = building.get('min_floor', 1)  # 主楼层，默认 L1
+
+        # 检查是否已有空闲车在主楼层
+        has_idle_at_main = False
+        candidates = []
+
+        for cid in self.car_ids:
+            if cid == moving_car_id:
+                continue
+            car = self.cars[cid]
+            if (car.state == CarState.READY
+                    and car.direction == Direction.IDLE
+                    and car.door_state == DoorState.CLOSED
+                    and car.position is not None
+                    and not self.manual_mode.get(cid, False)):
+                if car.position == main_floor:
+                    has_idle_at_main = True
+                    break
+                else:
+                    candidates.append((abs(car.position - main_floor), cid))
+
+        if has_idle_at_main or not candidates:
+            return  # 已有车在 L1 待命，或无空闲车
+
+        # 选最近的车派去 L1
+        candidates.sort()
+        _, target_cid = candidates[0]
+        print(f'[auto_park] car{moving_car_id} 离开 → car{target_cid} 自动回 L{main_floor}')
+        await self.call_internal(main_floor, car_id=target_cid, origin='auto_park')
 
     def _make_on_action_done(self, car_id: int):
         async def _on_action_done(last_action: Action) -> None:
@@ -466,6 +519,9 @@ class App:
                     await self.action_queues[car_id].put(
                         Action(ActionKind.OPEN_DOOR))
                     return True
+            elif target is not None:
+                # pos != target: MOVE 被中断或过冲，仍清理 target_floor 防止残留
+                self.cars[car_id].target_floor = None
             return False
 
         if kind == ActionKind.INITIALIZE:
@@ -853,29 +909,47 @@ class App:
     def usermode_enabled(self) -> bool:
         return self._usermode
 
-    async def set_usermode(self, enabled: bool) -> dict:
+    async def set_usermode(self, enabled: bool,
+                            cars: list[int] | None = None) -> dict:
         """切换用户模式
 
         启用时：验证所有轿厢已初始化（state=READY + position 非空）
                → 设置 ready 信号为 1，PLC 认为电梯准备就绪
         禁用时：设置 ready 信号为 0
 
+        Args:
+            enabled: True=启用, False=关闭
+            cars: 限定检查的轿厢范围;None=全部车(默认,严格模式,任一未就绪即拒绝)
+
         Returns:
-            {'enabled': bool, 'blocked': list[int]}
-            blocked 列出未就绪的轿厢 ID（空列表 = 全部就绪）
+            {'enabled': bool,
+             'blocked': list[int],         # 未就绪车 id 列表
+             'enabled_cars': list[int]}    # 本次启用成功的车 id(仅启用时)
         """
-        result: dict[str, object] = {'enabled': enabled, 'blocked': []}
+        result: dict[str, object] = {
+            'enabled': enabled,
+            'blocked': [],
+            'enabled_cars': [],
+        }
+        target_cars = cars if cars is not None else self.car_ids
 
         if enabled:
             blocked: list[int] = []
-            for cid in self.car_ids:
+            ready: list[int] = []
+            for cid in target_cars:
                 car = self.cars[cid]
                 if car.state != CarState.READY or car.position is None:
                     blocked.append(cid)
-            if blocked:
-                result['blocked'] = blocked
-                return result  # 拒绝启用，不设 ready
-
+                else:
+                    ready.append(cid)
+            result['blocked'] = blocked
+            result['enabled_cars'] = ready
+            # 严格模式 (cars=None): 任一车未就绪即整体拒绝
+            # partial 模式 (cars=[...]): console 已预过滤为已就绪车,blocked 必为空
+            if cars is None and blocked:
+                return result  # 严格模式拒绝,不设 ready
+            if not ready:
+                return result  # 没有任何就绪车,拒绝
             self._usermode = True
             try:
                 ready_addr = self.mapper.addr_output('ready', 0)

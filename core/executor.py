@@ -351,7 +351,7 @@ class ActionExecutor:
                     return
 
             # 3b. 正常 MOVE_UP/MOVE_DOWN 的减速曲线
-            if event.bit == 1:
+            if event.bit == 1 and self.current_action is not None:
                 if name == 'level_up' and self.current_action.kind == ActionKind.MOVE_UP:
                     await self._on_level_reached(direction=Direction.UP)
                 elif name == 'level_down' and self.current_action.kind == ActionKind.MOVE_DOWN:

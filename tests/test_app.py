@@ -940,3 +940,173 @@ async def test_hall_call_pending_origin_tracked(app: App):
 
     # 记录 origin
     assert app.pending_call_origin[1].get(3) == 'hall'
+
+
+# ===== /usermode partial 单车测试支持 =====
+
+@pytest.mark.asyncio
+async def test_usermode_partial_skips_unready(app: App):
+    """partial 模式：仅 car 1 初始化时，只启用 car 1"""
+    # car 1 初始化
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    # car 2-6 保持 UNKNOWN
+
+    ready = [cid for cid in app.car_ids
+             if app.cars[cid].state == CarState.READY
+             and app.cars[cid].position is not None]
+    result = await app.set_usermode(True, cars=ready)
+
+    assert app.usermode_enabled is True
+    assert result['enabled'] is True
+    assert 1 in result['enabled_cars']
+    assert result['blocked'] == []  # partial 模式只检查传入的 ready 列表
+
+
+@pytest.mark.asyncio
+async def test_usermode_partial_all_unready_rejected(app: App):
+    """partial 模式：全部车未就绪时，enabled_cars 空，整体拒绝"""
+    # 所有车保持 UNKNOWN
+    result = await app.set_usermode(True, cars=[])
+    assert result['enabled_cars'] == []
+    assert app.usermode_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_usermode_strict_still_requires_all(app: App):
+    """严格模式（cars=None）保持原行为：任一车未就绪即拒绝"""
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    # car 2-6 UNKNOWN
+
+    result = await app.set_usermode(True)  # cars=None → 检查全部
+    assert app.usermode_enabled is False
+    assert 2 in result['blocked']
+    assert 1 in result['enabled_cars']  # 严格模式仍记录已就绪车(便于 console 展示)
+
+
+@pytest.mark.asyncio
+async def test_usermode_partial_console_subcommand(app_and_console, capsys):
+    """/usermode partial true 命令路径：跳过未就绪车，启用已就绪车"""
+    a, c = app_and_console
+    # car 1 初始化
+    a.cars[1].state = CarState.READY
+    a.cars[1].position = 1
+    # car 2-6 UNKNOWN
+
+    await c.cmd_usermode(['partial', 'true'])
+    out = capsys.readouterr().out
+    assert 'partial 模式' in out
+    assert '1' in out  # 启用了 car 1
+    assert a.usermode_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_usermode_partial_no_ready_cars_rejected(app_and_console, capsys):
+    """/usermode partial true：无任何已就绪车时拒绝"""
+    a, c = app_and_console
+    # 所有车 UNKNOWN
+
+    await c.cmd_usermode(['partial', 'true'])
+    out = capsys.readouterr().out
+    assert 'partial 失败' in out
+    assert a.usermode_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_usermode_partial_false_closes_mode(app_and_console, capsys):
+    """/usermode partial false → 关闭用户模式"""
+    a, c = app_and_console
+    a._usermode = True  # 预设启用
+
+    await c.cmd_usermode(['partial', 'false'])
+    out = capsys.readouterr().out
+    assert '已关闭' in out
+    assert a.usermode_enabled is False
+
+
+# ===== auto_park 自动回 L1 测试 =====
+
+
+@pytest.mark.asyncio
+async def test_auto_park_dispatches_idle_car_to_L1(app: App):
+    """当车1从L1出发去其他楼层，车2（空闲、不在L1、最近）被自动派往L1"""
+    # 设置车1在L1（即将离开）
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    app.cars[1].direction = Direction.IDLE
+    app.cars[1].door_state = DoorState.CLOSED
+    # 设置车2在L3（空闲，距L1距离2）
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 3
+    app.cars[2].direction = Direction.IDLE
+    app.cars[2].door_state = DoorState.CLOSED
+    # 设置车3在L5（空闲，距L1距离4，比车2远）
+    app.cars[3].state = CarState.READY
+    app.cars[3].position = 5
+    app.cars[3].direction = Direction.IDLE
+    app.cars[3].door_state = DoorState.CLOSED
+
+    # 启用 usermode（所有车必须 READY + position 非空）
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = app.cars[cid].position or 1
+    await app.set_usermode(True)
+
+    # 恢复测试场景状态（车4-6 移出 L1，避免干扰 auto_park 检测）
+    app.cars[1].position = 1
+    app.cars[2].position = 3
+    app.cars[3].position = 5
+    for cid in (4, 5, 6):
+        app.cars[cid].position = cid + 3  # 放在 L7/L8/L9
+
+    # 车1被叫去5楼（从L1离开）
+    await app.call_internal(5, car_id=1)
+
+    # 车2（最近空闲车）应被自动派往L1
+    assert 1 in app.pending_calls[2], \
+        f'期望 car2 pending_calls 含 L1，实际 {app.pending_calls[2]}'
+    assert app.pending_call_origin[2].get(1) == 'auto_park'
+    # car3（更远）不应被派
+    assert 1 not in app.pending_calls[3], \
+        f'car3 不应被派往 L1，实际 pending={app.pending_calls[3]}'
+
+
+@pytest.mark.asyncio
+async def test_auto_park_skips_when_idle_at_L1(app: App):
+    """当车1离开L1，但车3已在L1空闲时，不再派其他车去L1"""
+    # 设置车1在L1（即将离开）
+    app.cars[1].state = CarState.READY
+    app.cars[1].position = 1
+    app.cars[1].direction = Direction.IDLE
+    app.cars[1].door_state = DoorState.CLOSED
+    # 设置车2在L3（空闲）
+    app.cars[2].state = CarState.READY
+    app.cars[2].position = 3
+    app.cars[2].direction = Direction.IDLE
+    app.cars[2].door_state = DoorState.CLOSED
+    # 设置车3已在L1空闲
+    app.cars[3].state = CarState.READY
+    app.cars[3].position = 1
+    app.cars[3].direction = Direction.IDLE
+    app.cars[3].door_state = DoorState.CLOSED
+
+    # 启用 usermode（所有车必须 READY + position 非空）
+    for cid in app.car_ids:
+        app.cars[cid].state = CarState.READY
+        app.cars[cid].position = app.cars[cid].position or 1
+    await app.set_usermode(True)
+
+    # 恢复测试场景状态（车4-6 移出 L1，避免干扰 auto_park 检测）
+    app.cars[1].position = 1
+    app.cars[2].position = 3
+    app.cars[3].position = 1
+    for cid in (4, 5, 6):
+        app.cars[cid].position = cid + 3  # 放在 L7/L8/L9
+
+    # 车1被叫去5楼
+    await app.call_internal(5, car_id=1)
+
+    # 车2不应被派往L1（因为车3已在L1空闲）
+    assert 1 not in app.pending_calls[2], \
+        f'L1 已有空闲车3，car2 不应被派往 L1，实际 pending={app.pending_calls[2]}'

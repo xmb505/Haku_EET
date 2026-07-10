@@ -574,3 +574,88 @@ class TestDoorCloseHallButtonProtection:
 
         # action_queue 中不应有 CLOSE_DOOR
         assert app.action_queues[1].empty(), '外召按住时 cron 不应发送 CLOSE_DOOR'
+
+
+class TestDoorOpenButtonRelease:
+    """开门按钮松开 → 启关门 cron"""
+
+    @pytest.mark.asyncio
+    async def test_door_open_button_release_schedules_close_cron(self, app: App):
+        """门开着时松开开门按钮 → 启关门 cron"""
+        _init_all_cars(app)
+        await app.set_usermode(True)
+        app.cars[1].position = 3
+        app.cars[1].door_state = DoorState.OPEN
+
+        pm = app.pm
+        jn = pm._close_door_job_name(1)
+        # 确保起始无 cron
+        await pm._app.cron.cancel(jn)
+        assert jn not in pm._app.cron._jobs
+
+        # 模拟开门按钮松开 (bit=0)
+        db = app.mapper.addr_input('door_open_button', 1)
+        i_addr = app.mapper.db_to_i(db)
+        app.io.simulate_input(i_addr, 0)
+        await asyncio.sleep(0.1)
+
+        # cron 应被启动
+        assert jn in pm._app.cron._jobs, '开门松开后应启关门 cron'
+
+
+class TestDoorCloseOpenButtonProtection:
+    """开门按钮按住时关门保护测试"""
+
+    @pytest.mark.asyncio
+    async def test_door_close_button_ignored_when_open_held(self, app: App):
+        """开门按钮按住时按关门按钮 → 不响应关门"""
+        _init_all_cars(app)
+        await app.set_usermode(True)
+        app.cars[1].position = 1
+        app.cars[1].door_state = DoorState.OPEN
+
+        # 模拟开门按钮按住
+        db = app.mapper.addr_input('door_open_button', 1)
+        i_addr = app.mapper.db_to_i(db)
+        app.io.simulate_input(i_addr, 1)
+
+        # 清空 action queue
+        while not app.action_queues[1].empty():
+            app.action_queues[1].get_nowait()
+
+        # 按关门按钮
+        await app.pm.on_door_button(1, 'door_close_button', bit=1)
+
+        # action_queue 中不应有 CLOSE_DOOR
+        assert app.action_queues[1].empty(), \
+            '开门按钮按住时关门按钮不应发送 CLOSE_DOOR'
+
+    @pytest.mark.asyncio
+    async def test_door_close_button_works_when_open_released(self, app: App):
+        """开门按钮松开后按关门按钮 → 正常关门"""
+        _init_all_cars(app)
+        await app.set_usermode(True)
+        app.cars[1].position = 1
+        app.cars[1].door_state = DoorState.OPEN
+
+        # 模拟开门按钮按下后松开
+        db = app.mapper.addr_input('door_open_button', 1)
+        i_addr = app.mapper.db_to_i(db)
+        app.io.simulate_input(i_addr, 1)
+        await asyncio.sleep(0.05)
+        app.io.simulate_input(i_addr, 0)
+        await asyncio.sleep(0.05)
+
+        # 清空 action queue
+        while not app.action_queues[1].empty():
+            app.action_queues[1].get_nowait()
+
+        # 按关门按钮
+        await app.pm.on_door_button(1, 'door_close_button', bit=1)
+
+        # action_queue 中应有 CLOSE_DOOR
+        actions = []
+        while not app.action_queues[1].empty():
+            actions.append(app.action_queues[1].get_nowait())
+        assert any(a.kind == ActionKind.CLOSE_DOOR for a in actions), \
+            '开门按钮松开后关门按钮应发送 CLOSE_DOOR'

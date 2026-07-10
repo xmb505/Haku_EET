@@ -290,32 +290,72 @@ class PassengerManager:
                     return
 
     async def on_cabin_button(self, cid: int, floor: int) -> None:
-        """cabin button: door open/opening/closing → cache; door closed → call_internal"""
+        """cabin button: door open/opening → cache; closing → interrupt + cache; closed → call_internal"""
         car = self._app.cars[cid]
-        if car.door_state in (DoorState.OPEN, DoorState.OPENING, DoorState.CLOSING):
+        if car.door_state == DoorState.CLOSING:
+            # 门正在关 → 中断关门 + 缓存（与外召 reopen 同机制）
+            self._app.executors[cid].door.cancel_for_reopen()
+            self._button_cache[cid].add(floor)
+            await self._app.action_queues[cid].put(Action(ActionKind.OPEN_DOOR))
+            print(f'[cabin_button] car{cid} L{floor}: door closing, reopen + cache')
+        elif car.door_state in (DoorState.OPEN, DoorState.OPENING):
             self._button_cache[cid].add(floor)
         else:
             await self._app.call_internal(floor, car_id=cid)
 
-    async def on_door_button(self, cid: int, signal: str) -> None:
-        """door button: open/close relay directly"""
+    async def on_door_button(self, cid: int, signal: str,
+                              bit: int = 1) -> None:
+        """door button: open/close with hold/release semantics
+
+        bit=1(按下)/bit=0(松开) 都需处理:
+          - door_open_button 松开 → 启关门 cron
+          - door_close_button 按下 → 额外检查开门按钮是否按住
+        """
         car = self._app.cars[cid]
         if signal == 'door_open_button':
-            await self._app.cron.cancel(self._close_door_job_name(cid))
-            if car.door_state in (DoorState.CLOSED, DoorState.CLOSING):
-                await self._app.action_queues[cid].put(
-                    Action(ActionKind.OPEN_DOOR))
-        elif signal == 'door_close_button':
-            await self._app.cron.cancel(self._close_door_job_name(cid))
-            if car.door_state in (DoorState.OPEN, DoorState.OPENING):
-                # ★ 检查当前楼层是否有外召按钮仍按住
-                hall_held = self._is_any_hall_button_held(cid)
-                print(f'[door_button] car{cid} close: door={car.door_state.value}, hall_held={hall_held}, cache={sorted(self._button_cache[cid])}')
-                if not hall_held:
+            if bit == 1:
+                # 按下: 取消关门 cron + 门关着则下发开门
+                await self._app.cron.cancel(self._close_door_job_name(cid))
+                if car.door_state in (DoorState.CLOSED, DoorState.CLOSING):
                     await self._app.action_queues[cid].put(
-                        Action(ActionKind.CLOSE_DOOR))
-                else:
-                    print(f'[door_button] car{cid} close ignored: hall button still held at L{car.position}')
+                        Action(ActionKind.OPEN_DOOR))
+            else:
+                # 松开: 门开着/正在开 → 启关门 cron
+                if car.door_state in (DoorState.OPEN, DoorState.OPENING):
+                    await self._schedule_close_door_cron_job(
+                        cid, self._close_door_job_name(cid))
+        elif signal == 'door_close_button':
+            if bit == 1:
+                # 按下: 取消关门 cron + 检查外召/开门按钮后决定是否关门
+                await self._app.cron.cancel(self._close_door_job_name(cid))
+                if car.door_state in (DoorState.OPEN, DoorState.OPENING):
+                    # ★ 同时检查外召按钮 + 开门按钮,任何一个按住就不关
+                    hall_held = self._is_any_hall_button_held(cid)
+                    open_held = self._is_open_button_held(cid)
+                    print(f'[door_button] car{cid} close: door={car.door_state.value}, '
+                          f'hall_held={hall_held}, open_held={open_held}, '
+                          f'cache={sorted(self._button_cache[cid])}')
+                    if not hall_held and not open_held:
+                        await self._app.action_queues[cid].put(
+                            Action(ActionKind.CLOSE_DOOR))
+                    else:
+                        held = []
+                        if hall_held:
+                            held.append('hall')
+                        if open_held:
+                            held.append('open')
+                        print(f'[door_button] car{cid} close ignored: '
+                              f'{"+".join(held)} button still held')
+            # bit=0 松开: 关门动作已发出,no-op
+
+    def _is_open_button_held(self, car_id: int) -> bool:
+        """检查开门按钮是否被按住(读 IO cache)"""
+        try:
+            i_addr = self._app.mapper.db_to_i(
+                self._app.mapper.addr_input('door_open_button', car_id))
+            return self._app.io.get_input(i_addr) == 1
+        except KeyError:
+            return False
 
     def _is_any_hall_button_held(self, car_id: int) -> bool:
         """检查当前楼层是否有外召按钮仍被按住（读 IO cache）
@@ -399,6 +439,7 @@ class PassengerManager:
             pos = car.position
             if pos is not None and pos in set(pq.items):
                 pq.mark_served(pos)
+                print(f'[move_done] car{car_id} served L{pos}, remaining pq={pq.items}')
                 # 开门让乘客下梯:不管是单次还是多次内召,只要本层被服务过
                 await self._app.action_queues[car_id].put(
                     Action(ActionKind.OPEN_DOOR))
@@ -499,10 +540,18 @@ class PassengerManager:
         self._button_cache[car_id].clear()
 
         if pq:
+            pos = car.position
+            # 跳过当前楼层：已经在本站服务过，无须再 dispatch
+            if pos is not None and pq.next_target() == pos:
+                pq.mark_served(pos)
+
             first = pq.next_target()
-            print(f'[door_closed] car{car_id} dispatching → L{first}')
             if first is not None:
+                print(f'[door_closed] car{car_id} dispatching → L{first}')
                 await self._app.call_internal(first, car_id=car_id)
+            else:
+                print(f'[door_closed] car{car_id} empty, lights off cron')
+                await self._start_lights_off_cron(car_id)
         else:
             print(f'[door_closed] car{car_id} empty, lights off cron')
             await self._start_lights_off_cron(car_id)
