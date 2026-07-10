@@ -514,6 +514,7 @@ class App:
                 ]
                 origin = self.pending_call_origin[car_id].pop(target, 'internal')
                 self.cars[car_id].target_floor = None
+                self.cars[car_id].last_dispatch_direction = Direction.IDLE  # 到站后清除方向
                 # 外召到站 → 开门(内召不碰门)
                 if origin == 'hall':
                     await self.action_queues[car_id].put(

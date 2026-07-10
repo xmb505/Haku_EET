@@ -297,15 +297,10 @@ class PassengerManager:
                     return
 
     async def on_cabin_button(self, cid: int, floor: int) -> None:
-        """cabin button: door open/opening → cache; closing → interrupt + cache; closed → call_internal"""
+        """cabin button: door open/opening/closing → cache; door closed → call_internal"""
         car = self._app.cars[cid]
-        if car.door_state == DoorState.CLOSING:
-            # 门正在关 → 中断关门 + 缓存（与外召 reopen 同机制）
-            self._app.executors[cid].door.cancel_for_reopen()
-            self._button_cache[cid].add(floor)
-            await self._app.action_queues[cid].put(Action(ActionKind.OPEN_DOOR))
-            print(f'[cabin_button] car{cid} L{floor}: door closing, reopen + cache')
-        elif car.door_state in (DoorState.OPEN, DoorState.OPENING):
+        if car.door_state in (DoorState.OPEN, DoorState.OPENING, DoorState.CLOSING):
+            # 门未关好时只缓存，不中断关门（内召不需要重开门）
             self._button_cache[cid].add(floor)
         else:
             await self._app.call_internal(floor, car_id=cid)
@@ -544,10 +539,23 @@ class PassengerManager:
 
         # 合并已有队列余项 + 本次开门期间的新内召缓存
         all_requests = set(pq.items) | self._button_cache[car_id]
-        # 发车时计算方向：如果车已停靠（IDLE），用上次外召派车方向排序
+        # 发车时计算方向：
+        #   1. 车正在移动 → 用 car.direction
+        #   2. 车已停靠 + 有外召派车方向 → 用 last_dispatch_direction
+        #   3. 车已停靠 + 无外召方向 → 根据目的地位置自动推断
         effective_dir = car.direction
-        if effective_dir == Direction.IDLE and car.last_dispatch_direction != Direction.IDLE:
-            effective_dir = car.last_dispatch_direction
+        if effective_dir == Direction.IDLE:
+            if car.last_dispatch_direction != Direction.IDLE:
+                effective_dir = car.last_dispatch_direction
+            elif all_requests and car.position is not None:
+                # 无外召时根据目的地自动推断方向
+                above = any(f > car.position for f in all_requests)
+                below = any(f < car.position for f in all_requests)
+                if above and not below:
+                    effective_dir = Direction.UP
+                elif below and not above:
+                    effective_dir = Direction.DOWN
+                # 混合方向保持 IDLE → compile 走 sorted(cache) 兆底
         print(f'[door_closed] car{car_id} cache={sorted(self._button_cache[car_id])}, pq={pq.items}, merged={sorted(all_requests)}, dir={effective_dir.value}')
         pq.compile(
             cache=all_requests,
