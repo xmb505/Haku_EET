@@ -73,20 +73,31 @@ class PassengerQueue:
                 valid = [f for f in cache if pos > f >= target]
                 valid.sort(reverse=True)
                 self._items = valid
+            elif car_direction == Direction.DOWN:
+                # 无目标但方向向下 → 按距离降序（最近的先服务）
+                self._items = sorted(cache, reverse=True)
+            elif car_direction == Direction.UP:
+                # 无目标但方向向上 → 按距离升序
+                self._items = sorted(cache)
             else:
                 self._items = sorted(cache)
         else:
-            floors = sorted(cache)
             if car_direction == Direction.UP and target is not None:
+                floors = sorted(cache)
                 forward = [f for f in floors if pos < f <= target]
                 backward = [f for f in floors if f <= pos or f > target]
                 self._items = forward + backward
             elif car_direction == Direction.DOWN and target is not None:
+                floors = sorted(cache)
                 forward = [f for f in floors if pos > f >= target]
                 backward = [f for f in floors if f >= pos or f < target]
                 self._items = list(reversed(forward)) + list(reversed(backward))
+            elif car_direction == Direction.DOWN:
+                self._items = sorted(cache, reverse=True)
+            elif car_direction == Direction.UP:
+                self._items = sorted(cache)
             else:
-                self._items = floors
+                self._items = sorted(cache)
 
     @property
     def items(self) -> list[int]:
