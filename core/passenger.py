@@ -211,6 +211,8 @@ class PassengerManager:
                 if car.door_state in (DoorState.OPEN, DoorState.OPENING):
                     # 门已开/正在开 → 只亮灯 + 取消关门 cron
                     self._pickup_active[cid][(floor, direction)] = True
+                    self._app.cars[cid].last_dispatch_direction = (
+                        Direction.UP if direction == 'up' else Direction.DOWN)
                     # 外召有人呼叫 → human_presence 至少 0
                     self._app.cars[cid].human_presence = max(
                         0, self._app.cars[cid].human_presence)
@@ -222,6 +224,8 @@ class PassengerManager:
                 elif car.door_state == DoorState.CLOSING:
                     # 门正在关 → 亮灯 + 取消关门 cron + 中断关门 + 重新开门
                     self._pickup_active[cid][(floor, direction)] = True
+                    self._app.cars[cid].last_dispatch_direction = (
+                        Direction.UP if direction == 'up' else Direction.DOWN)
                     self._app.cars[cid].human_presence = max(
                         0, self._app.cars[cid].human_presence)
                     await self._app.set_hall_indicator(floor, direction, True)
@@ -592,6 +596,8 @@ class PassengerManager:
             if target_cid is not None:
                 dispatched.append((floor, direction))
                 self._pickup_active[target_cid][(floor, direction)] = True
+                self._app.cars[target_cid].last_dispatch_direction = (
+                    Direction.UP if direction == 'up' else Direction.DOWN)
                 self._app.cars[target_cid].human_presence = max(
                     0, self._app.cars[target_cid].human_presence)
                 await self._app.set_hall_indicator(floor, direction, True)
