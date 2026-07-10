@@ -259,6 +259,9 @@ class PassengerManager:
                 return
             # mark pickup, light indicator
             self._pickup_active[target_cid][(floor, direction)] = True
+            # 记录派车方向（用于 compile 排序）
+            self._app.cars[target_cid].last_dispatch_direction = (
+                Direction.UP if direction == 'up' else Direction.DOWN)
             # 外召有人呼叫 → 被派车的轿厢 human_presence 至少 0
             self._app.cars[target_cid].human_presence = max(
                 0, self._app.cars[target_cid].human_presence)
@@ -334,7 +337,8 @@ class PassengerManager:
             if bit == 1:
                 # 按下: 取消关门 cron + 检查外召/开门按钮后决定是否关门
                 await self._app.cron.cancel(self._close_door_job_name(cid))
-                if car.door_state in (DoorState.OPEN, DoorState.OPENING):
+                if car.door_state == DoorState.OPEN:
+                    # ★ 只在门完全打开后才响应关门，开门中(OPENING)不响应
                     # ★ 同时检查外召按钮 + 开门按钮,任何一个按住就不关
                     hall_held = self._is_any_hall_button_held(cid)
                     open_held = self._is_open_button_held(cid)
@@ -536,11 +540,15 @@ class PassengerManager:
 
         # 合并已有队列余项 + 本次开门期间的新内召缓存
         all_requests = set(pq.items) | self._button_cache[car_id]
-        print(f'[door_closed] car{car_id} cache={sorted(self._button_cache[car_id])}, pq={pq.items}, merged={sorted(all_requests)}')
+        # 发车时计算方向：如果车已停靠（IDLE），用上次外召派车方向排序
+        effective_dir = car.direction
+        if effective_dir == Direction.IDLE and car.last_dispatch_direction != Direction.IDLE:
+            effective_dir = car.last_dispatch_direction
+        print(f'[door_closed] car{car_id} cache={sorted(self._button_cache[car_id])}, pq={pq.items}, merged={sorted(all_requests)}, dir={effective_dir.value}')
         pq.compile(
             cache=all_requests,
             car_position=car.position,
-            car_direction=car.direction,
+            car_direction=effective_dir,
             current_target=car.target_floor,
         )
         self._button_cache[car_id].clear()
