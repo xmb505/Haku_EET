@@ -318,13 +318,9 @@ class PassengerManager:
 
     async def on_door_button(self, cid: int, signal: str,
                               bit: int = 1) -> None:
-        """door button: open/close with hold/release semantics
-
-        bit=1(按下)/bit=0(松开) 都需处理:
-          - door_open_button 松开 → 启关门 cron
-          - door_close_button 按下 → 额外检查开门按钮是否按住
-        """
+        """door button: open/close with hold/release semantics"""
         car = self._app.cars[cid]
+        print(f'[door_button] car{cid} {signal} bit={bit} door={car.door_state.value}')
         if signal == 'door_open_button':
             if bit == 1:
                 # 按下: 取消关门 cron
@@ -529,6 +525,7 @@ class PassengerManager:
 
         if not held_pickups:
             # 没有按住的 pickup → 启动关门 cron
+            print(f'[door_opened] car{car_id} scheduling close cron (released={released_pickups})')
             await self._schedule_close_door_cron_job(
                 car_id, self._close_door_job_name(car_id),
                 hall_signals=released_pickups if released_pickups else None)
