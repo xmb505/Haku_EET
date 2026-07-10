@@ -314,9 +314,15 @@ class PassengerManager:
         car = self._app.cars[cid]
         if signal == 'door_open_button':
             if bit == 1:
-                # 按下: 取消关门 cron + 门关着则下发开门
+                # 按下: 取消关门 cron
                 await self._app.cron.cancel(self._close_door_job_name(cid))
-                if car.door_state in (DoorState.CLOSED, DoorState.CLOSING):
+                if car.door_state == DoorState.CLOSING:
+                    # ★ 门正在关 → 中断关门 + 重开（与外召/内召 reopen 同机制）
+                    self._app.executors[cid].door.cancel_for_reopen()
+                    await self._app.action_queues[cid].put(
+                        Action(ActionKind.OPEN_DOOR))
+                    print(f'[door_button] car{cid} open: door closing, cancel_for_reopen + reopen')
+                elif car.door_state == DoorState.CLOSED:
                     await self._app.action_queues[cid].put(
                         Action(ActionKind.OPEN_DOOR))
             else:
