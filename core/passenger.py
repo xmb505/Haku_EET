@@ -651,7 +651,7 @@ class PassengerManager:
         delay = self._door_close_delay()
         event_rules = [
             EventRule('door_open_button', car_id, 'cancel', 0),
-            EventRule('door_close_button', car_id, 'cancel', 0),
+            # door_close_button 不取消 cron：手动关门后 cron 触发时会自然退出
         ]
         # 外召按下 → 自毁关门 cron（长按保持开门）
         if hall_signals:
@@ -718,7 +718,7 @@ class PassengerManager:
 
         event_rules = [
             EventRule('door_open_button', car_id, 'cancel', 0),
-            EventRule('door_close_button', car_id, 'cancel', 0),
+            # door_close_button 不取消 cron：手动关门后 cron 触发时会自然退出
         ]
         await self._app.cron.schedule(CronJob(
             name=jn,

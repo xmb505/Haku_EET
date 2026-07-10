@@ -388,6 +388,9 @@ class App:
         if sig is None or sig[0] not in self.car_ids:
             return
         cid, signal_name = sig
+        # ★ 只转发开门/关门按钮信号，忽略其他所有信号
+        if signal_name not in ('door_open_button', 'door_close_button'):
+            return
         # bit=1=按下, bit=0=松开都需转发到大脑(尤其开门松开后要启关门 cron)
         await self.pm.on_door_button(cid, signal_name, event.bit)
 
