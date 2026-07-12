@@ -646,6 +646,10 @@ class PassengerManager:
         )
         self._button_cache[car_id].clear()
 
+        # 扫路模式：反转队列，从最远站开始（L7→L10→回程 L9）
+        if sweep_mode and pq:
+            pq._items.reverse()
+
         if pq:
             pos = car.position
             # 跳过当前楼层：已经在本站服务过，无须再 dispatch
