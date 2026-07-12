@@ -527,15 +527,6 @@ class PassengerManager:
             door_open_at_floor = app.is_floor_door_open(car_id, floor)
             if not door_open_at_floor:
                 continue
-            # 方向匹配：仅当电梯来向与呼梯方向一致时才处理
-            arrived_from = car.direction
-            if arrived_from == Direction.IDLE:
-                arrived_from = car.last_dispatch_direction
-            if arrived_from != Direction.IDLE:
-                if direction == 'up' and arrived_from == Direction.DOWN:
-                    continue  # 电梯从上面下来的，不灭上行灯
-                if direction == 'down' and arrived_from == Direction.UP:
-                    continue  # 电梯从下面上去的，不灭下行灯
             # 读 IO cache 检查按钮是否仍按住
             button_held = app.is_hall_button_held(floor, direction)
 
@@ -617,23 +608,32 @@ class PassengerManager:
                 elif below and not above:
                     effective_dir = Direction.DOWN
 
-        # 如果仍是 IDLE（无内召无历史方向），从 pending 外呼推断方向
+        # 如果仍是 IDLE（无内召无历史方向），从 pending 外呼位置推断方向
+        sweep_mode = False
         if effective_dir == Direction.IDLE and self._pending_hall_calls and car.position is not None:
-            up_count = sum(1 for _, d in self._pending_hall_calls if d == 'up')
-            down_count = sum(1 for _, d in self._pending_hall_calls if d == 'down')
-            if up_count >= down_count:
-                effective_dir = Direction.UP
+            above = sum(1 for f, _ in self._pending_hall_calls if f > car.position)
+            below = sum(1 for f, _ in self._pending_hall_calls if f < car.position)
+            if above > below:
+                effective_dir = Direction.UP   # 全在上方 → 向上 sweep
+                sweep_mode = True
+            elif below > above:
+                effective_dir = Direction.DOWN  # 全在下方 → 向下 sweep
+                sweep_mode = True
             else:
-                effective_dir = Direction.DOWN
+                up_count = sum(1 for _, d in self._pending_hall_calls if d == 'up')
+                down_count = sum(1 for _, d in self._pending_hall_calls if d == 'down')
+                effective_dir = Direction.UP if up_count >= down_count else Direction.DOWN
 
-        # 将顺路 pending 外召也编入路线（必须同向 + 在前方，防止 L7→L9 错搭 L6↓）
+        # 将顺路 pending 外召也编入路线
         if effective_dir != Direction.IDLE:
             for (floor, direction) in list(self._pending_hall_calls):
-                if direction == 'up' and effective_dir == Direction.UP and floor > pos:
-                    all_requests.add(floor)
-                    self._pending_hall_calls.discard((floor, direction))
-                    self._pickup_active[car_id][(floor, direction)] = True
-                elif direction == 'down' and effective_dir == Direction.DOWN and floor < pos:
+                if sweep_mode:
+                    # 扫路模式：用位置判断（L8 去 L10↓ + L9↓ → up sweep 全包）
+                    add = (floor > pos if effective_dir == Direction.UP else floor < pos)
+                else:
+                    add = (direction == 'up' and effective_dir == Direction.UP and floor > pos) or \
+                          (direction == 'down' and effective_dir == Direction.DOWN and floor < pos)
+                if add:
                     all_requests.add(floor)
                     self._pending_hall_calls.discard((floor, direction))
                     self._pickup_active[car_id][(floor, direction)] = True
