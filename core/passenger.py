@@ -714,6 +714,7 @@ class PassengerManager:
                 else:
                     await self._app.call_internal(floor, car_id=target_cid, origin='hall')
                     print(f'[hall_call] pending {direction}@L{floor} → car{target_cid}')
+                break  # 只派一个，避免同一 tick 连推多个 MOVE
 
         for item in dispatched:
             self._pending_hall_calls.discard(item)
