@@ -625,17 +625,24 @@ class PassengerManager:
 
         # 将顺路 pending 外召也编入路线
         if effective_dir != Direction.IDLE:
-            for (floor, direction) in list(self._pending_hall_calls):
-                if sweep_mode:
-                    # 扫路模式：用位置判断（L8 去 L10↓ + L9↓ → up sweep 全包）
-                    add = (floor > pos if effective_dir == Direction.UP else floor < pos)
-                else:
-                    add = (direction == 'up' and effective_dir == Direction.UP and floor > pos) or \
-                          (direction == 'down' and effective_dir == Direction.DOWN and floor < pos)
-                if add:
+            if sweep_mode:
+                # 扫路模式：只编入最远站，中间站保留等回程
+                candidates = [(f, d) for f, d in self._pending_hall_calls
+                              if (f > pos if effective_dir == Direction.UP else f < pos)]
+                if candidates:
+                    key = max(candidates) if effective_dir == Direction.UP else min(candidates)
+                    floor, direction = key
                     all_requests.add(floor)
                     self._pending_hall_calls.discard((floor, direction))
                     self._pickup_active[car_id][(floor, direction)] = True
+            else:
+                for (floor, direction) in list(self._pending_hall_calls):
+                    add = (direction == 'up' and effective_dir == Direction.UP and floor > pos) or \
+                          (direction == 'down' and effective_dir == Direction.DOWN and floor < pos)
+                    if add:
+                        all_requests.add(floor)
+                        self._pending_hall_calls.discard((floor, direction))
+                        self._pickup_active[car_id][(floor, direction)] = True
         print(f'[door_closed] car{car_id} cache={sorted(self._button_cache[car_id])}, pq={pq.items}, merged={sorted(all_requests)}, dir={effective_dir.value}')
         pq.compile(
             cache=all_requests,
@@ -644,10 +651,6 @@ class PassengerManager:
             current_target=car.target_floor,
         )
         self._button_cache[car_id].clear()
-
-        # 扫路模式：反转队列，从最远站开始（L7→L10→回程 L9）
-        if sweep_mode and pq:
-            pq._items.reverse()
 
         if pq:
             pos = car.position
