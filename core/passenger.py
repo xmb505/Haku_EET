@@ -620,9 +620,8 @@ class PassengerManager:
                 effective_dir = Direction.DOWN  # 全在下方 → 向下 sweep
                 sweep_mode = True
             else:
-                up_count = sum(1 for _, d in self._pending_hall_calls if d == 'up')
-                down_count = sum(1 for _, d in self._pending_hall_calls if d == 'down')
-                effective_dir = Direction.UP if up_count >= down_count else Direction.DOWN
+                # 上方下方等量 → 不推断方向，留给 _try_dispatch_pending_hall_calls
+                pass
 
         # 将顺路 pending 外召也编入路线
         if effective_dir != Direction.IDLE:
