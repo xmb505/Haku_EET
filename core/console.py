@@ -131,6 +131,8 @@ class Console:
         self.door_event_monitor_enabled: bool = False
         self._door_event_monitor_ref = None
         self.ui_light_listener_enabled: bool = False
+        self.ai_need_1_monitor_enabled: bool = False
+        self._ai_need_1_monitor_ref = None
 
     def _resolve_car_id(self, args: list[str]) -> int:
         """从参数里提取 car_id（如果有），否则用当前选中的"""
@@ -240,7 +242,7 @@ class Console:
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'change': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'fireman': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status', 'ui_listener', 'human_presence', 'door_event', 'ui_light_listener'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status', 'ui_listener', 'human_presence', 'door_event', 'ui_light_listener', 'ai_need_1'],
                 'station_seek': ['true', 'false'],
                 'max': ['true', 'false'],
                 'warn': ['true', 'false'],
@@ -1694,7 +1696,7 @@ class Console:
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':
-            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek|ui_listener|human_presence|door_event|ui_light_listener>')
+            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek|ui_listener|human_presence|door_event|ui_light_listener|ai_need_1>')
             return
         if len(args) < 2:
             # 显示当前所有监视项状态
@@ -1722,6 +1724,8 @@ class Console:
             print(f'door_event 监视:          {de}')
             ull = '启用' if self.ui_light_listener_enabled else '禁用'
             print(f'ui_light_listener 监视:    {ull}')
+            ain1 = '启用' if self.ai_need_1_monitor_enabled else '禁用'
+            print(f'ai_need_1 诊断监视:       {ain1}')
             return
         topic = args[1]
         if topic == 'pass_floor':
@@ -1748,6 +1752,8 @@ class Console:
             self._toggle_door_event_monitor()
         elif topic == 'ui_light_listener':
             self._toggle_ui_light_listener()
+        elif topic == 'ai_need_1':
+            self._toggle_ai_need_1_monitor()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -2284,6 +2290,58 @@ class Console:
                 self.app.ui[cid].add_observer(self._ui_light_observer)
             self.app._hall_light_observers.append(self._ui_light_hall_observer)
             print('[debug] ui_light_listener 监视已启用（事件驱动）')
+
+    def _toggle_ai_need_1_monitor(self) -> None:
+        """toggle ai_need_1 诊断监视：每次 door_close_done=1 时打印轿厢状态快照"""
+        if self.ai_need_1_monitor_enabled:
+            self.ai_need_1_monitor_enabled = False
+            if self._ai_need_1_monitor_ref:
+                self.app.io.remove_listener(self._ai_need_1_monitor_ref)
+                self._ai_need_1_monitor_ref = None
+            print('[debug] ai_need_1 诊断监视已禁用')
+        else:
+            self.ai_need_1_monitor_enabled = True
+
+            async def _ai_need_listener(event) -> None:
+                if not self.ai_need_1_monitor_enabled:
+                    return
+                sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
+                if not sig:
+                    return
+                car_id, name = sig
+                if name != 'door_close_done' or event.bit != 1:
+                    return
+                self._print_ai_need_1_snapshot(car_id)
+
+            self._ai_need_1_monitor_ref = _ai_need_listener
+            self.app.io.add_listener(_ai_need_listener)
+            print('[debug] ai_need_1 诊断监视已启用(每次 door_close_done=1 打印快照)')
+
+    def _print_ai_need_1_snapshot(self, car_id: int) -> None:
+        """打印指定轿厢的完整内部状态快照"""
+        car = self.app.cars[car_id]
+        exe = self.app.executors[car_id]
+        pm = self.app.pm
+        print(f'--- ai_need_1 car{car_id} 快照 ---')
+        print(f'  state:              {car.state.value}')
+        print(f'  position:           {car.position}')
+        print(f'  direction:          {car.direction.value}')
+        print(f'  door_state:         {car.door_state.value}')
+        print(f'  target_floor:       {car.target_floor}')
+        print(f'  last_dispatch_dir:  {car.last_dispatch_direction.value}')
+        print(f'  human_presence:     {car.human_presence}')
+        cur = exe.current_action
+        print(f'  current_action:     {cur.kind.value if cur else None}')
+        print(f'  pending_calls:      {self.app.pending_calls.get(car_id, [])}')
+        print(f'  pending_origin:     {dict(self.app.pending_call_origin.get(car_id, {}))}')
+        if pm is not None:
+            snap = pm.status_snapshot(car_id)
+            print(f'  queue_mode:         {snap["queue_mode"]}')
+            print(f'  button_cache:       {snap["button_cache"]}')
+            print(f'  passenger_queue:    {snap["passenger_queue"]}')
+            print(f'  pickup_active:      {snap["pickup_active"]}')
+            print(f'  _pending_hall_calls: {sorted(pm._pending_hall_calls)}')
+        print('----------------------------------')
 
     async def _ui_light_observer(self, car_id: int, signal: str, value: object) -> None:
         """UiController observer 回调 — 轿内灯/风扇/故障/满载"""

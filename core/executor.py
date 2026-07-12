@@ -794,22 +794,36 @@ class ActionExecutor:
             self._log(f'[exec] 初始化: 已在底站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
 
     async def _start_move_up(self) -> None:
-        """上行启动：释放刹车 + 点亮上行灯 + 高速 + 上 + 电机（之后靠 _on_level_reached 减速）"""
+        """上行启动：释放刹车 + 点亮上行灯 + 电机（之后靠 _on_level_reached 减速）"""
+        if self.car.door_state != DoorState.CLOSED:
+            return  # 门未关好，拒绝启动电机（防止门开着时行车导致计数器崩溃）
         self.decel_state = 'high_speed'
         self._last_level_up = 0
         await self.motor.release_brakes()
         await self.motor.set_direction_indicator('up')
-        await self.motor.start(high_speed=True, direction='up')
+        # 短距离（1层）直接用低速，防止高速启动后刹不住过冲
+        target = self.car.target_floor
+        pos = self.car.position
+        use_high = not (pos is not None and target is not None
+                        and abs(target - pos) <= 1)
+        await self.motor.start(high_speed=use_high, direction='up')
         self.car.direction = Direction.UP
         self.waiting_sensor = None  # 不等特定传感器，靠 level_up 边沿推进
 
     async def _start_move_down(self) -> None:
-        """下行启动：释放刹车 + 点亮下行灯 + 高速 + 下 + 电机"""
+        """下行启动：释放刹车 + 点亮下行灯 + 电机"""
+        if self.car.door_state != DoorState.CLOSED:
+            return  # 门未关好，拒绝启动电机（防止门开着时行车导致计数器崩溃）
         self.decel_state = 'high_speed'
         self._last_level_down = 0
         await self.motor.release_brakes()
         await self.motor.set_direction_indicator('down')
-        await self.motor.start(high_speed=True, direction='down')
+        # 短距离（1层）直接用低速，防止高速启动后刹不住过冲
+        target = self.car.target_floor
+        pos = self.car.position
+        use_high = not (pos is not None and target is not None
+                        and abs(target - pos) <= 1)
+        await self.motor.start(high_speed=use_high, direction='down')
         self.car.direction = Direction.DOWN
         self.waiting_sensor = None
 

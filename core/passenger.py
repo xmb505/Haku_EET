@@ -287,8 +287,22 @@ class PassengerManager:
                     Action(ActionKind.OPEN_DOOR))
                 print(f'[hall_call] {direction}@L{floor} → car{target_cid} at floor, opening')
             else:
-                await self._app.call_internal(floor, car_id=target_cid, origin='hall')
-                print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
+                # 车不在当前层，尝试顺路改道（change_internal）
+                car = self._app.cars[target_cid]
+                old_target = car.target_floor
+                changed = await self._app.change_internal(floor, car_id=target_cid)
+                if changed == 'accepted':
+                    # 顺路改道到外呼楼层，原目标保留
+                    # ★ 必须设外召来源标记，否则到站后 _handle_algorithm_state_change
+                    # 看到 origin='internal' 不会开门
+                    self._app.pending_call_origin[target_cid][floor] = 'hall'
+                    if old_target is not None and old_target != floor:
+                        self._app.pending_calls[target_cid].append(old_target)
+                    print(f'[hall_call] {direction}@L{floor} → car{target_cid} (顺路改道)')
+                else:
+                    # 距离不够或不顺路，加入 pending_calls 等返回
+                    await self._app.call_internal(floor, car_id=target_cid, origin='hall')
+                    print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
         else:
             # bit=0: 按钮松开 → 判断车是否已到站
             for cid in self._app.car_ids:
@@ -308,12 +322,32 @@ class PassengerManager:
                     return
 
     async def on_cabin_button(self, cid: int, floor: int) -> None:
-        """cabin button: door open/opening/closing → cache; door closed → call_internal"""
+        """cabin button: door open/opening/closing → cache; door closed → try change_internal first, fallback to call_internal"""
         car = self._app.cars[cid]
         if car.door_state in (DoorState.OPEN, DoorState.OPENING, DoorState.CLOSING):
             # 门未关好时只缓存，不中断关门（内召不需要重开门）
             self._button_cache[cid].add(floor)
         else:
+            # 门已关：先尝试缩短当前行程（中途加站），失败再作为新请求入队
+            old_target = car.target_floor
+            result = await self._app.change_internal(floor, car_id=cid)
+            if result == 'accepted':
+                # change_internal 已设 target_floor=floor 并清空 pending_calls
+                # 但原目标楼层（如 L10）需要保留，不能丢弃
+                pq = self._passenger_queue[cid]
+                remaining = [floor]
+                if old_target is not None and old_target != floor:
+                    self._app.pending_calls[cid].append(old_target)
+                    remaining.append(old_target)
+                pq.clear()
+                pq._items = remaining
+                return
+            elif result == 'rejected':
+                # 刹不住车或方向不符，非法内呼，不在中途熄灭 LED
+                # 等终点站到站后统一清所有轿内灯
+                print(f'[cabin_button] car{cid} L{floor} rejected (too close/wrong dir)')
+                return
+            # result == 'not_running' → 车没在移动，作为普通内呼
             await self._app.call_internal(floor, car_id=cid)
 
     async def on_door_button(self, cid: int, signal: str,
@@ -343,6 +377,11 @@ class PassengerManager:
             if bit == 1:
                 # 按下: 取消关门 cron + 检查外召/开门按钮后决定是否关门
                 await self._app.cron.cancel(self._close_door_job_name(cid))
+                # ★ 电梯移动中不允许关门（防止 CLOSE_DOOR 抢占正在执行的 MOVE，
+                # 导致 current_action 被覆盖、计数器崩溃）
+                if car.direction != Direction.IDLE:
+                    print(f'[door_button] car{cid} close ignored: car moving {car.direction.value}')
+                    return
                 if car.door_state == DoorState.OPEN:
                     # ★ 只在门完全打开后才响应关门，开门中(OPENING)不响应
                     # ★ 同时检查外召按钮 + 开门按钮,任何一个按住就不关
@@ -519,6 +558,20 @@ class PassengerManager:
         if pos is not None:
             await app.ui[car_id].set_cabin_button_led(pos, False)
 
+        # 如果这是本次行程终点（乘客队列已空），统一熄灭所有残留轿内灯
+        # 中途非法内呼（如刹不住车）产生的 LED 在此清理
+        pq = self._passenger_queue[car_id]
+        if not pq:
+            building = self._app.config.get('building', {})
+            min_f = building.get('min_floor', 1)
+            max_f = building.get('max_floor', 10)
+            # 跳过本次开门期间新按的按钮（保留给下一趟）
+            skip = self._button_cache.get(car_id, set())
+            for f in range(min_f, max_f + 1):
+                if f not in skip:
+                    await app.ui[car_id].set_cabin_button_led(f, False)
+            print(f'[door_opened] car{car_id} terminal stop, cleared all cabin LEDs (skip={sorted(skip)})')
+
         # 清除已释放的 pickup（允许再次按下时重新触发）
         for (floor, direction) in released_pickups:
             self._pickup_active[car_id].pop((floor, direction), None)
@@ -582,10 +635,20 @@ class PassengerManager:
             first = pq.next_target()
             if first is not None:
                 print(f'[door_closed] car{car_id} dispatching → L{first}')
-                await self._app.call_internal(first, car_id=car_id)
-            else:
-                print(f'[door_closed] car{car_id} empty, lights off cron')
-                await self._start_lights_off_cron(car_id)
+                added = await self._app.call_internal(first, car_id=car_id)
+                if not added:
+                    # call_internal 拒绝（如 floor 已在 pending_calls）
+                    # 需要手动 tick 让算法继续处理剩余任务
+                    if self._app.executors[car_id].current_action is None:
+                        await self._app._tick(car_id)
+                return
+
+        # 走到这里说明 pq 已空（或全部已 serve），但 pending_calls 可能还有剩余任务
+        #（如中途 cabin button 加站后原目标已到，新站还在 pending_calls 里）
+        pending = self._app.pending_calls.get(car_id, [])
+        if pending and self._app.executors[car_id].current_action is None:
+            print(f'[door_closed] car{car_id} pending_calls={pending}, fallback tick')
+            await self._app._tick(car_id)
         else:
             print(f'[door_closed] car{car_id} empty, lights off cron')
             await self._start_lights_off_cron(car_id)
