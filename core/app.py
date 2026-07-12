@@ -303,6 +303,12 @@ class App:
                     and self.pm._pickup_active.get(cid, {}).get(
                         (floor, direction), False)):
                 continue
+            # 第三层防线：该车已在服务同层反方向的 pickup → 跳过
+            # 避免一部车同时接上下行两个方向的同楼层呼梯
+            if (self.pm is not None):
+                opposite = 'down' if direction == 'up' else 'up'
+                if self.pm._pickup_active.get(cid, {}).get((floor, opposite), False):
+                    continue
 
             pos = car.position
             moving_dir = car.direction
