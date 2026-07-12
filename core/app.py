@@ -328,6 +328,42 @@ class App:
         candidates.sort()
         return candidates[0][2]
 
+    def is_floor_door_open(self, car_id: int, floor: int) -> bool:
+        """检查楼层门锁是否已开（floor_door_lock_{floor} == 0）"""
+        try:
+            i_addr = self.mapper.db_to_i(
+                self.mapper.addr_input(f'floor_door_lock_{floor}', car_id))
+            return self.io.get_input(i_addr) == 0
+        except KeyError:
+            return False
+
+    def is_hall_button_held(self, floor: int, direction: str) -> bool:
+        """检查外召按钮是否物理按住（hall_call_{direction}_{floor} == 1）"""
+        try:
+            i_addr = self.mapper.db_to_i(
+                self.mapper.addr_input(f'hall_call_{direction}_{floor}', 0))
+            return self.io.get_input(i_addr) == 1
+        except KeyError:
+            return False
+
+    def is_door_open_button_held(self, car_id: int) -> bool:
+        """检查开门按钮是否物理按住（door_open_button == 1）"""
+        try:
+            i_addr = self.mapper.db_to_i(
+                self.mapper.addr_input('door_open_button', car_id))
+            return self.io.get_input(i_addr) == 1
+        except KeyError:
+            return False
+
+    def is_light_curtain_active(self, car_id: int) -> bool:
+        """检查光幕是否触发（light_curtain == 1）"""
+        try:
+            i_addr = self.mapper.db_to_i(
+                self.mapper.addr_input('light_curtain', car_id))
+            return self.io.get_input(i_addr) == 1
+        except KeyError:
+            return False
+
     # ===== IO 事件监听器（小脑 — 纯解析+转发到大脑） =====
 
     async def _on_hall_call_event(self, event: IOEvent) -> None:
@@ -592,7 +628,8 @@ class App:
         if self.cars[cid].position == floor and not self.pending_calls[cid]:
             return False
         self.pending_calls[cid].append(floor)
-        self.pending_call_origin[cid][floor] = origin
+        # 不覆盖已设的 origin（如 _on_door_closed 预填了 'hall'）
+        self.pending_call_origin[cid].setdefault(floor, origin)
         if self.cars[cid].target_floor is None:
             self.cars[cid].target_floor = floor
         await self._tick(cid)

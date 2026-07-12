@@ -405,12 +405,7 @@ class PassengerManager:
 
     def _is_open_button_held(self, car_id: int) -> bool:
         """检查开门按钮是否被按住(读 IO cache)"""
-        try:
-            i_addr = self._app.mapper.db_to_i(
-                self._app.mapper.addr_input('door_open_button', car_id))
-            return self._app.io.get_input(i_addr) == 1
-        except KeyError:
-            return False
+        return self._app.is_door_open_button_held(car_id)
 
     def _is_any_hall_button_held(self, car_id: int) -> bool:
         """检查当前楼层是否有外召按钮仍被按住（读 IO cache）
@@ -425,15 +420,8 @@ class PassengerManager:
         for (floor, direction), active in self._pickup_active[car_id].items():
             if not active or floor != pos:
                 continue
-            # 读 IO cache 检查按钮是否仍按住
-            signal_name = f'hall_call_{direction}_{pos}'
-            try:
-                i_addr = self._app.mapper.db_to_i(
-                    self._app.mapper.addr_input(signal_name, 0))
-                if self._app.io.get_input(i_addr) == 1:
-                    return True
-            except KeyError:
-                pass
+            if self._app.is_hall_button_held(pos, direction):
+                return True
         return False
 
     # ===== 小脑回调方法 =====
@@ -498,8 +486,9 @@ class PassengerManager:
                 # 开门让乘客下梯:不管是单次还是多次内召,只要本层被服务过
                 await self._app.action_queues[car_id].put(
                     Action(ActionKind.OPEN_DOOR))
-        # 尝试处理待派外召
-        await self._try_dispatch_pending_hall_calls(car_id)
+        # 尝试处理待派外召（不在这里：到站途中来的外召等下站 _on_door_closed 再派）
+        # _try_dispatch_pending_hall_calls 会污染 car.last_dispatch_direction，导致
+        # _on_door_opened 方向检查误判 + _on_door_closed effective_dir 偏航 → 路线丢失
 
     async def _on_door_opened(self, car_id: int) -> None:
         """door opened → 检查外召按钮状态 + 条件性熄灯/启动关门 cron
@@ -533,14 +522,22 @@ class PassengerManager:
                 self._pickup_active[car_id].items()):
             if not active:
                 continue
+            # 只处理当前开门楼层的 pickup（读物理 floor_door_lock 信号，不读 car.position）
+            # 外召 LED 应和本层门事件绑定，不应在别的楼层开门时被熄灭
+            door_open_at_floor = app.is_floor_door_open(car_id, floor)
+            if not door_open_at_floor:
+                continue
+            # 方向匹配：仅当电梯来向与呼梯方向一致时才处理
+            arrived_from = car.direction
+            if arrived_from == Direction.IDLE:
+                arrived_from = car.last_dispatch_direction
+            if arrived_from != Direction.IDLE:
+                if direction == 'up' and arrived_from == Direction.DOWN:
+                    continue  # 电梯从上面下来的，不灭上行灯
+                if direction == 'down' and arrived_from == Direction.UP:
+                    continue  # 电梯从下面上去的，不灭下行灯
             # 读 IO cache 检查按钮是否仍按住
-            signal_name = f'hall_call_{direction}_{floor}'
-            try:
-                i_addr = app.mapper.db_to_i(
-                    app.mapper.addr_input(signal_name, 0))
-                button_held = (app.io.get_input(i_addr) == 1)
-            except KeyError:
-                button_held = False
+            button_held = app.is_hall_button_held(floor, direction)
 
             if button_held:
                 held_pickups.append((floor, direction))
@@ -594,29 +591,52 @@ class PassengerManager:
         # 取消守卫：关门被中断（door_state 未被 executor 设为 CLOSED）
         if car.door_state != DoorState.CLOSED:
             return
-        self._pickup_active[car_id].clear()
+        # 只清除本楼层已服务的 pickup，未来站点的 pickup 保留
+        pos = car.position
+        if pos is not None:
+            for key in list(self._pickup_active[car_id]):
+                if key[0] == pos:
+                    del self._pickup_active[car_id][key]
 
         pq = self._passenger_queue[car_id]
 
         # 合并已有队列余项 + 本次开门期间的新内召缓存
         all_requests = set(pq.items) | self._button_cache[car_id]
-        # 发车时计算方向：
-        #   1. 车正在移动 → 用 car.direction
-        #   2. 车已停靠 + 有外召派车方向 → 用 last_dispatch_direction
-        #   3. 车已停靠 + 无外召方向 → 根据目的地位置自动推断
+        pos = car.position
+
+        # 先计算车的行驶方向（不依赖 pending hall calls，避免反方向混入）
         effective_dir = car.direction
         if effective_dir == Direction.IDLE:
             if car.last_dispatch_direction != Direction.IDLE:
                 effective_dir = car.last_dispatch_direction
             elif all_requests and car.position is not None:
-                # 无外召时根据目的地自动推断方向
                 above = any(f > car.position for f in all_requests)
                 below = any(f < car.position for f in all_requests)
                 if above and not below:
                     effective_dir = Direction.UP
                 elif below and not above:
                     effective_dir = Direction.DOWN
-                # 混合方向保持 IDLE → compile 走 sorted(cache) 兆底
+
+        # 如果仍是 IDLE（无内召无历史方向），从 pending 外呼推断方向
+        if effective_dir == Direction.IDLE and self._pending_hall_calls and car.position is not None:
+            up_count = sum(1 for _, d in self._pending_hall_calls if d == 'up')
+            down_count = sum(1 for _, d in self._pending_hall_calls if d == 'down')
+            if up_count >= down_count:
+                effective_dir = Direction.UP
+            else:
+                effective_dir = Direction.DOWN
+
+        # 将顺路 pending 外召也编入路线（必须同向 + 在前方，防止 L7→L9 错搭 L6↓）
+        if effective_dir != Direction.IDLE:
+            for (floor, direction) in list(self._pending_hall_calls):
+                if direction == 'up' and effective_dir == Direction.UP and floor > pos:
+                    all_requests.add(floor)
+                    self._pending_hall_calls.discard((floor, direction))
+                    self._pickup_active[car_id][(floor, direction)] = True
+                elif direction == 'down' and effective_dir == Direction.DOWN and floor < pos:
+                    all_requests.add(floor)
+                    self._pending_hall_calls.discard((floor, direction))
+                    self._pickup_active[car_id][(floor, direction)] = True
         print(f'[door_closed] car{car_id} cache={sorted(self._button_cache[car_id])}, pq={pq.items}, merged={sorted(all_requests)}, dir={effective_dir.value}')
         pq.compile(
             cache=all_requests,
@@ -734,17 +754,12 @@ class PassengerManager:
                 print(f'[cron] car{car_id} close aborted: hall button still held')
                 return  # 不调度关门，等 on_hall_call bit=0 handler 重新调度 cron
             # check light curtain before closing: if still blocked, reschedule
-            try:
-                lc_addr = self._app.mapper.db_to_i(
-                    self._app.mapper.addr_input('light_curtain', car_id))
-                if self._app.io.get_input(lc_addr) == 1:
-                    await self._app.cron.cancel(job_name)
-                    await self._schedule_close_door_cron_job(
-                        car_id, job_name, floor, direction,
-                        hall_signals=hall_signals)
-                    return
-            except KeyError:
-                pass
+            if self._app.is_light_curtain_active(car_id):
+                await self._app.cron.cancel(job_name)
+                await self._schedule_close_door_cron_job(
+                    car_id, job_name, floor, direction,
+                    hall_signals=hall_signals)
+                return
             await self._app.action_queues[car_id].put(
                     Action(ActionKind.CLOSE_DOOR))
 
