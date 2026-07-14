@@ -31,14 +31,13 @@ async def app():
 
 
 def i_event(mapper, signal: str, bit: int, car_id: int = 1) -> IOEvent:
-    db = mapper.addr_input(signal, car_id)
-    return IOEvent(i_addr=mapper.db_to_i(db), bit=bit)
+    i_addr = mapper.addr_input(signal, car_id)
+    return IOEvent(i_addr=i_addr, bit=bit)
 
 
 def hall_call_i_addr(app, signal: str) -> str:
     """hall_call 信号是 car_id=0 的全局信号，转成 I 地址"""
-    db = app.mapper.addr_input(signal, 0)
-    return app.mapper.db_to_i(db)
+    return app.mapper.addr_input(signal, 0)
 
 
 @pytest.mark.asyncio
@@ -176,7 +175,7 @@ async def test_simulate_input_via_app(app: App):
     """通过 /sim input 路径调用（间接通过 io.simulate_input）"""
     # simulate_input 是同步方法，不能 await
     app.io.simulate_input(
-        app.mapper.db_to_i(app.mapper.addr_input('overload', 1)),
+        app.mapper.addr_input('overload', 1),
         1,
     )
     await asyncio.sleep(0.02)
@@ -916,8 +915,7 @@ async def test_cabin_button_sets_human_presence(app: App):
     assert app.cars[1].human_presence == -1  # 默认无人
 
     # 模拟 cabin_button_5 按下
-    i_addr = app.mapper.db_to_i(
-        app.mapper.addr_input('cabin_button_5', 1))
+    i_addr = app.mapper.addr_input('cabin_button_5', 1)
     app.io.simulate_input(i_addr, 1)
     await asyncio.sleep(0.05)
 

@@ -212,9 +212,7 @@ class VirtualPLC:
 
     def _pulse_level(self, signal: str) -> None:
         """触发 level 信号脉冲（1 → 200ms → 0）"""
-        i_addr = self.mapper.db_to_i(
-            self.mapper.addr_input(signal, self.car_id)
-        )
+        i_addr = self.mapper.addr_input(signal, self.car_id)
         # 先 fire 1
         self.io.simulate_input(i_addr, 1)
         # 取消旧 pulse
@@ -232,9 +230,7 @@ class VirtualPLC:
 
     def _fire_limit(self, signal: str) -> None:
         """触发限位信号（持续 1，200ms 后自动复位）"""
-        i_addr = self.mapper.db_to_i(
-            self.mapper.addr_input(signal, self.car_id)
-        )
+        i_addr = self.mapper.addr_input(signal, self.car_id)
         self.io.simulate_input(i_addr, 1)
         # 200ms 后自动复位
         async def reset_later():
@@ -302,14 +298,10 @@ class VirtualPLC:
                 if pos is None or not isinstance(pos, int):
                     return
                 # car_door_lock 一定存在
-                car_lock_addr = self.mapper.db_to_i(
-                    self.mapper.addr_input('car_door_lock', self.car_id)
-                )
+                car_lock_addr = self.mapper.addr_input('car_door_lock', self.car_id)
                 # floor_door_lock_{pos} 可能不存在（pos 越界）
                 try:
-                    floor_lock_addr = self.mapper.db_to_i(
-                        self.mapper.addr_input(f'floor_door_lock_{pos}', self.car_id)
-                    )
+                    floor_lock_addr = self.mapper.addr_input(f'floor_door_lock_{pos}', self.car_id)
                 except KeyError:
                     floor_lock_addr = None
                 self.io.simulate_input(car_lock_addr, target_bit)
@@ -327,9 +319,7 @@ class VirtualPLC:
         signal: 'door_open_done' 或 'door_close_done'
         delay:  延时秒数
         """
-        i_addr = self.mapper.db_to_i(
-            self.mapper.addr_input(signal, self.car_id)
-        )
+        i_addr = self.mapper.addr_input(signal, self.car_id)
         # 取消旧任务
         old = self._door_done_tasks.pop(signal, None)
         if old and not old.done():

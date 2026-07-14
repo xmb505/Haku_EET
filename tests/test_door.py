@@ -45,13 +45,9 @@ async def ready_app(app: App):
     app.cars[car_id].position = 1
     app.cars[car_id].direction = Direction.IDLE
     app.cars[car_id].door_state = DoorState.CLOSED
-    car_lock_i = app.mapper.db_to_i(
-        app.mapper.addr_input('car_door_lock', car_id)
-    )
+    car_lock_i = app.mapper.addr_input('car_door_lock', car_id)
     app.io.observe_input(car_lock_i, 1)
-    floor_lock_i = app.mapper.db_to_i(
-        app.mapper.addr_input('floor_door_lock_1', car_id)
-    )
+    floor_lock_i = app.mapper.addr_input('floor_door_lock_1', car_id)
     app.io.observe_input(floor_lock_i, 1)
     yield app
 
@@ -92,9 +88,7 @@ class TestRejectedPrechecks:
 
     @pytest.mark.asyncio
     async def test_door_already_open_rejected(self, ready_app: App):
-        car_lock_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('car_door_lock', 1)
-        )
+        car_lock_i = ready_app.mapper.addr_input('car_door_lock', 1)
         ready_app.io.observe_input(car_lock_i, 0)
         result = await ready_app.control_door(1, 'open', force=False)
         assert result['status'] == 'rejected'
@@ -149,9 +143,7 @@ class TestNonBlocking:
         # 等待后台完成
         await _wait_for_busy_release(ready_app, 1)
         # 触发完成信号让后台结束(否则要等真实 PLC)
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
         ready_app.io.simulate_input(door_open_done_i, 1)
         # 再等一下
         await _wait_for_busy_release(ready_app, 1, timeout=0.2)
@@ -159,9 +151,7 @@ class TestNonBlocking:
     @pytest.mark.asyncio
     async def test_door_does_not_block_event_loop(self, ready_app: App):
         """control_door 立即返回,event loop 可处理其他 task"""
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
 
         # 启动 control_door(后台跟踪)
         result = await ready_app.control_door(1, 'open', force=False)
@@ -182,12 +172,8 @@ class TestWrongFloorDetection:
     @pytest.mark.asyncio
     async def test_open_wrong_floor_prints_warning(self, ready_app: App, capsys):
         """开门过程中:错误楼层 L3 门锁 false → 后台 task 打印 ⚠️"""
-        floor_lock_3_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('floor_door_lock_3', 1)
-        )
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        floor_lock_3_i = ready_app.mapper.addr_input('floor_door_lock_3', 1)
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
 
         result = await ready_app.control_door(1, 'open', force=False)
         assert result['status'] == 'dispatched'
@@ -208,12 +194,8 @@ class TestWrongFloorDetection:
     @pytest.mark.asyncio
     async def test_open_correct_floor_no_warning(self, ready_app: App, capsys):
         """正常开门:仅对应楼层 L1 门锁 false → 后台 task 不打印 ⚠️"""
-        floor_lock_1_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('floor_door_lock_1', 1)
-        )
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        floor_lock_1_i = ready_app.mapper.addr_input('floor_door_lock_1', 1)
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
 
         result = await ready_app.control_door(1, 'open', force=False)
         assert result['status'] == 'dispatched'
@@ -237,9 +219,7 @@ class TestDoorStatusMonitor:
     async def test_default_off_no_print_on_completion(self, ready_app: App, capsys):
         """默认不开启 door_status → 完成时不打印 [door]"""
         c = Console(ready_app)
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
 
         await ready_app.control_door(1, 'open', force=False)
         await asyncio.sleep(0.02)
@@ -257,9 +237,7 @@ class TestDoorStatusMonitor:
         c._toggle_door_status_monitor()  # 开启
         capsys.readouterr()  # 清空 enable 的输出
 
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
 
         await ready_app.control_door(1, 'open', force=False)
         await asyncio.sleep(0.02)
@@ -278,9 +256,7 @@ class TestDoorStatusMonitor:
         c._toggle_door_status_monitor()  # off
         capsys.readouterr()  # 清空 toggle 的输出
 
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
 
         await ready_app.control_door(1, 'open', force=False)
         await asyncio.sleep(0.02)
@@ -298,12 +274,8 @@ class TestDoorStatusMonitor:
         # 不开启 monitor
         capsys.readouterr()  # 清空
 
-        floor_lock_3_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('floor_door_lock_3', 1)
-        )
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        floor_lock_3_i = ready_app.mapper.addr_input('floor_door_lock_3', 1)
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
 
         await ready_app.control_door(1, 'open', force=False)
         await asyncio.sleep(0.02)
@@ -333,9 +305,7 @@ class TestMutex:
         result1 = await task1
         assert result1['status'] == 'dispatched'
         # 等后台释放
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
         ready_app.io.simulate_input(door_open_done_i, 1)
         await _wait_for_busy_release(ready_app, 1)
         await task1 if not task1.done() else None
@@ -346,9 +316,7 @@ class TestMutex:
         ready_app.cars[2].state = CarState.READY
         ready_app.cars[2].position = 1
         ready_app.cars[2].direction = Direction.IDLE
-        car_lock_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('car_door_lock', 2)
-        )
+        car_lock_i = ready_app.mapper.addr_input('car_door_lock', 2)
         ready_app.io.observe_input(car_lock_i, 1)
 
         r1, r2 = await asyncio.gather(
@@ -358,12 +326,8 @@ class TestMutex:
         assert r1['status'] == 'dispatched'
         assert r2['status'] == 'dispatched'
         # 清理
-        door_open_done_i_1 = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
-        door_open_done_i_2 = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 2)
-        )
+        door_open_done_i_1 = ready_app.mapper.addr_input('door_open_done', 1)
+        door_open_done_i_2 = ready_app.mapper.addr_input('door_open_done', 2)
         ready_app.io.simulate_input(door_open_done_i_1, 1)
         ready_app.io.simulate_input(door_open_done_i_2, 1)
         await _wait_for_busy_release(ready_app, 1)
@@ -406,9 +370,7 @@ class TestConsoleCmdDoor:
         assert '已派发' in out
         assert '后台跟踪' in out
         # 清理
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
         ready_app.io.simulate_input(door_open_done_i, 1)
         await _wait_for_busy_release(ready_app, 1)
 
@@ -428,12 +390,8 @@ class TestIntegration:
         app.cars[car_id].state = CarState.READY
         app.cars[car_id].position = 1
         app.cars[car_id].direction = Direction.IDLE
-        car_lock_i = app.mapper.db_to_i(
-            app.mapper.addr_input('car_door_lock', car_id)
-        )
-        floor_lock_1_i = app.mapper.db_to_i(
-            app.mapper.addr_input('floor_door_lock_1', car_id)
-        )
+        car_lock_i = app.mapper.addr_input('car_door_lock', car_id)
+        floor_lock_1_i = app.mapper.addr_input('floor_door_lock_1', car_id)
         app.io.observe_input(car_lock_i, 1)
         app.io.observe_input(floor_lock_1_i, 1)
 
@@ -441,9 +399,7 @@ class TestIntegration:
         r2 = await app.control_door(car_id, 'open', force=False)
         assert r2['status'] == 'dispatched'
         # 触发完成
-        door_open_done_i = app.mapper.db_to_i(
-            app.mapper.addr_input('door_open_done', car_id)
-        )
+        door_open_done_i = app.mapper.addr_input('door_open_done', car_id)
         app.io.simulate_input(door_open_done_i, 1)
         await _wait_for_busy_release(app, car_id)
         # 模拟门开了
@@ -457,9 +413,7 @@ class TestIntegration:
         # 5. /door close → dispatched
         r4 = await app.control_door(car_id, 'close', force=False)
         assert r4['status'] == 'dispatched'
-        door_close_done_i = app.mapper.db_to_i(
-            app.mapper.addr_input('door_close_done', car_id)
-        )
+        door_close_done_i = app.mapper.addr_input('door_close_done', car_id)
         app.io.simulate_input(door_close_done_i, 1)
         await _wait_for_busy_release(app, car_id)
         app.io.observe_input(car_lock_i, 1)
@@ -476,9 +430,7 @@ class TestCompletionSignalRefactor:
     @pytest.mark.asyncio
     async def test_car_door_lock_change_does_not_complete(self, ready_app: App):
         """car_door_lock 变化不再触发后台完成(_door_busy 仍为 True)"""
-        car_lock_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('car_door_lock', 1)
-        )
+        car_lock_i = ready_app.mapper.addr_input('car_door_lock', 1)
 
         # control_door 立即返回 dispatched
         result = await ready_app.control_door(1, 'open', force=False)
@@ -493,9 +445,7 @@ class TestCompletionSignalRefactor:
         assert ready_app._door_busy[1] is True, \
             "car_door_lock 变化不应触发完成,只 door_open_done 才能"
         # 清理:触发 door_open_done 完成
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
         ready_app.io.simulate_input(door_open_done_i, 1)
         await _wait_for_busy_release(ready_app, 1)
 
@@ -552,9 +502,7 @@ class TestCronTimeoutFallback:
         assert job_name in ready_app.cron._jobs
 
         # 立即触发 done 信号(远在 timeout 之前)
-        door_open_done_i = ready_app.mapper.db_to_i(
-            ready_app.mapper.addr_input('door_open_done', 1)
-        )
+        door_open_done_i = ready_app.mapper.addr_input('door_open_done', 1)
         ready_app.io.simulate_input(door_open_done_i, 1)
         await _wait_for_busy_release(ready_app, 1)
 

@@ -37,9 +37,7 @@ def setup():
 
 
 def i_to_event(mapper: IOMapper, signal: str, bit: int, car_id: int = 1) -> IOEvent:
-    db = mapper.addr_input(signal, car_id)
-    i_addr = mapper.db_to_i(db)
-    return IOEvent(i_addr=i_addr, bit=bit)
+    return IOEvent(i_addr=mapper.addr_input(signal, car_id), bit=bit)
 
 
 async def fire_perfect_level_pulse(executor: ActionExecutor, mapper: IOMapper,
@@ -49,8 +47,8 @@ async def fire_perfect_level_pulse(executor: ActionExecutor, mapper: IOMapper,
     真实硬件行为：电梯经过一层平层区，level_up 和 level_down 同时=1 持续几百毫秒，
     然后同时回 0。executor 的上升沿触发 step，下降沿 reset 以接受下一个上升沿。
     """
-    addr_up = mapper.db_to_i(mapper.addr_input('level_up', car_id))
-    addr_down = mapper.db_to_i(mapper.addr_input('level_down', car_id))
+    addr_up = mapper.addr_input('level_up', car_id)
+    addr_down = mapper.addr_input('level_down', car_id)
     # 上升沿：两个同时=1
     await executor.on_io_event(IOEvent(i_addr=addr_up, bit=1))
     await executor.on_io_event(IOEvent(i_addr=addr_down, bit=1))
@@ -266,8 +264,8 @@ async def test_open_door_completes_on_door_open_done(setup):
     assert car.door_state == DoorState.OPENING
 
     # DoorController manages its own door_open_done listener via IOClient dispatch
-    db = mapper.addr_input('door_open_done', 1)
-    i_addr = mapper.db_to_i(db)
+    i_addr = mapper.addr_input('door_open_done', 1)
+    
     io.simulate_input(i_addr, 1)
     await asyncio.sleep(0.02)
 
@@ -597,9 +595,7 @@ def setup():
 
 
 def i_to_event(mapper: IOMapper, signal: str, bit: int, car_id: int = 1) -> IOEvent:
-    db = mapper.addr_input(signal, car_id)
-    i_addr = mapper.db_to_i(db)
-    return IOEvent(i_addr=i_addr, bit=bit)
+    return IOEvent(i_addr=mapper.addr_input(signal, car_id), bit=bit)
 
 
 async def fire_perfect_level_pulse(executor: ActionExecutor, mapper: IOMapper,
@@ -609,8 +605,8 @@ async def fire_perfect_level_pulse(executor: ActionExecutor, mapper: IOMapper,
     真实硬件行为：电梯经过一层平层区，level_up 和 level_down 同时=1 持续几百毫秒，
     然后同时回 0。executor 的上升沿触发 step，下降沿 reset 以接受下一个上升沿。
     """
-    addr_up = mapper.db_to_i(mapper.addr_input('level_up', car_id))
-    addr_down = mapper.db_to_i(mapper.addr_input('level_down', car_id))
+    addr_up = mapper.addr_input('level_up', car_id)
+    addr_down = mapper.addr_input('level_down', car_id)
     # 上升沿：两个同时=1
     await executor.on_io_event(IOEvent(i_addr=addr_up, bit=1))
     await executor.on_io_event(IOEvent(i_addr=addr_down, bit=1))
@@ -1097,8 +1093,8 @@ async def test_open_door_completes_on_door_open_done(setup):
     assert car.door_state == DoorState.OPENING
 
     # DoorController manages its own door_open_done listener via IOClient dispatch
-    db = mapper.addr_input('door_open_done', 1)
-    i_addr = mapper.db_to_i(db)
+    i_addr = mapper.addr_input('door_open_done', 1)
+    
     io.simulate_input(i_addr, 1)
     await asyncio.sleep(0.02)
 

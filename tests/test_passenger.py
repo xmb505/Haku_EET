@@ -33,14 +33,12 @@ async def app():
 
 def i_event(mapper, signal: str, bit: int, car_id: int = 1) -> IOEvent:
     """构建一个 IO 事件"""
-    db = mapper.addr_input(signal, car_id)
-    return IOEvent(i_addr=mapper.db_to_i(db), bit=bit)
+    return IOEvent(i_addr=mapper.addr_input(signal, car_id), bit=bit)
 
 
 def hall_call_i_addr(app, signal: str) -> str:
     """hall_call 信号是 car_id=0 的全局信号，转成 I 地址"""
-    db = app.mapper.addr_input(signal, 0)
-    return app.mapper.db_to_i(db)
+    return app.mapper.addr_input(signal, 0)
 
 
 # ======================================================================
@@ -281,8 +279,7 @@ class TestPassengerManagerCabinButton:
         pm = app.pm
 
         # 模拟 cabin_button_7
-        db = app.mapper.addr_input('cabin_button_7', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('cabin_button_7', 1)
         app.io.simulate_input(i_addr, 1)
         await asyncio.sleep(0.05)
 
@@ -300,8 +297,7 @@ class TestPassengerManagerCabinButton:
         pm = app.pm
 
         # 模拟 cabin_button_7
-        db = app.mapper.addr_input('cabin_button_7', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('cabin_button_7', 1)
         app.io.simulate_input(i_addr, 1)
         await asyncio.sleep(0.1)
 
@@ -318,8 +314,7 @@ class TestPassengerManagerCabinButton:
 
         pm = app.pm
 
-        db = app.mapper.addr_input('cabin_button_7', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('cabin_button_7', 1)
         app.io.simulate_input(i_addr, 1)
         await asyncio.sleep(0.05)
 
@@ -466,8 +461,7 @@ class TestPassengerManagerDoorButtons:
         app.cars[1].door_state = DoorState.CLOSED
 
         # 模拟 door_open_button
-        db = app.mapper.addr_input('door_open_button', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('door_open_button', 1)
         app.io.simulate_input(i_addr, 1)
         await asyncio.sleep(0.1)
 
@@ -482,8 +476,7 @@ class TestPassengerManagerDoorButtons:
         app.cars[1].door_state = DoorState.OPEN
 
         # 模拟 door_close_button
-        db = app.mapper.addr_input('door_close_button', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('door_close_button', 1)
         app.io.simulate_input(i_addr, 1)
         await asyncio.sleep(0.1)
 
@@ -505,8 +498,7 @@ class TestPassengerManagerDoorButtons:
         assert jn in pm._app.cron._jobs
 
         # 按开门按钮
-        db = app.mapper.addr_input('door_open_button', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('door_open_button', 1)
         app.io.simulate_input(i_addr, 1)
         await asyncio.sleep(0.05)
 
@@ -594,8 +586,7 @@ class TestDoorOpenButtonRelease:
         assert jn not in pm._app.cron._jobs
 
         # 模拟开门按钮松开 (bit=0)
-        db = app.mapper.addr_input('door_open_button', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('door_open_button', 1)
         app.io.simulate_input(i_addr, 0)
         await asyncio.sleep(0.1)
 
@@ -615,8 +606,7 @@ class TestDoorCloseOpenButtonProtection:
         app.cars[1].door_state = DoorState.OPEN
 
         # 模拟开门按钮按住
-        db = app.mapper.addr_input('door_open_button', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('door_open_button', 1)
         app.io.simulate_input(i_addr, 1)
 
         # 清空 action queue
@@ -639,8 +629,7 @@ class TestDoorCloseOpenButtonProtection:
         app.cars[1].door_state = DoorState.OPEN
 
         # 模拟开门按钮按下后松开
-        db = app.mapper.addr_input('door_open_button', 1)
-        i_addr = app.mapper.db_to_i(db)
+        i_addr = app.mapper.addr_input('door_open_button', 1)
         app.io.simulate_input(i_addr, 1)
         await asyncio.sleep(0.05)
         app.io.simulate_input(i_addr, 0)

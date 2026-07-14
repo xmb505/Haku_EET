@@ -131,10 +131,8 @@ class ActionExecutor:
 
         # 预解析 level 信号 IO 地址（避免 on_io_event 热路径多次查表）
         try:
-            self._level_up_i = self.mapper.db_to_i(
-                self.mapper.addr_input('level_up', self.car_id))
-            self._level_down_i = self.mapper.db_to_i(
-                self.mapper.addr_input('level_down', self.car_id))
+            self._level_up_i = self.mapper.addr_input('level_up', self.car_id)
+            self._level_down_i = self.mapper.addr_input('level_down', self.car_id)
         except KeyError:
             self._level_up_i = None
             self._level_down_i = None
@@ -235,7 +233,7 @@ class ActionExecutor:
         #  1 限位处理之前主动查 cache，已确保撞 2 限位时必急停）
         for limit_sig in ('top_limit_2', 'bottom_limit_2'):
             try:
-                addr = self.mapper.db_to_i(self.mapper.addr_input(limit_sig, self.car_id))
+                addr = self.mapper.addr_input(limit_sig, self.car_id)
                 if self.io.get_input(addr) == 1:
                     await self._emergency_stop(reason=f'{limit_sig}_touched')
                     return
@@ -268,8 +266,8 @@ class ActionExecutor:
             # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
             # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
             # 后再计下个上升沿,确保从 L1 才开始计数。
-            _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
-            _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
+            _up = self.mapper.addr_input("level_up", self.car_id)
+            _dn = self.mapper.addr_input("level_down", self.car_id)
             self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
             self.waiting_sensor = None
             # 如果 base == target，直接完成（电梯已在目标层）
@@ -299,12 +297,8 @@ class ActionExecutor:
             #   下降沿 (1,1 → 0,0) → reset active
             #   其他状态不变
             if self._init_reverse_mode:
-                addr_up = self.mapper.db_to_i(
-                    self.mapper.addr_input('level_up', self.car_id)
-                )
-                addr_down = self.mapper.db_to_i(
-                    self.mapper.addr_input('level_down', self.car_id)
-                )
+                addr_up = self.mapper.addr_input('level_up', self.car_id)
+                addr_down = self.mapper.addr_input('level_down', self.car_id)
                 up_now = self.io.get_input(addr_up)
                 down_now = self.io.get_input(addr_down)
                 # 每条 level event 都打日志（真模式调试时看时序用）
@@ -359,10 +353,8 @@ class ActionExecutor:
             # 3c. 停车反冲中:只在两个平层信号同时=1时通知等待协程,不在任何 level=1 就停
             if name in ('level_up', 'level_down') and event.bit == 1 and self._relevel_future is not None:
                 try:
-                    up = self.io.get_input(self.mapper.db_to_i(
-                        self.mapper.addr_input('level_up', self.car_id)))
-                    dn = self.io.get_input(self.mapper.db_to_i(
-                        self.mapper.addr_input('level_down', self.car_id)))
+                    up = self.io.get_input(self.mapper.addr_input('level_up', self.car_id))
+                    dn = self.io.get_input(self.mapper.addr_input('level_down', self.car_id))
                     if up == 1 and dn == 1:
                         self._relevel_future.set_result(True)
                 except KeyError:
@@ -530,8 +522,8 @@ class ActionExecutor:
             self._level_seek_skip_next = False
             return
 
-        up = self.mapper.db_to_i(self.mapper.addr_input('level_up', self.car_id))
-        dn = self.mapper.db_to_i(self.mapper.addr_input('level_down', self.car_id))
+        up = self.mapper.addr_input('level_up', self.car_id)
+        dn = self.mapper.addr_input('level_down', self.car_id)
         up_now = self.io.get_input(up)
         dn_now = self.io.get_input(dn)
         if up_now == 1 and dn_now == 1:
@@ -729,7 +721,7 @@ class ActionExecutor:
         """
         direction = self.init_direction
         if direction == 'up':
-            top_addr = self.mapper.db_to_i(self.mapper.addr_input('top_limit_1', self.car_id))
+            top_addr = self.mapper.addr_input('top_limit_1', self.car_id)
             at_limit = self.io.get_input(top_addr) == 1
             if not at_limit:
                 await self.motor.release_brakes()
@@ -747,8 +739,8 @@ class ActionExecutor:
             # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
             # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
             # 后再计下个上升沿,确保从 L1 才开始计数。
-            _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
-            _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
+            _up = self.mapper.addr_input("level_up", self.car_id)
+            _dn = self.mapper.addr_input("level_down", self.car_id)
             self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
             self.waiting_sensor = None
             self.car.direction = Direction.UP
@@ -762,7 +754,7 @@ class ActionExecutor:
                 return
             self._log(f'[exec] 初始化: 已在顶站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
         else:  # down
-            bot_addr = self.mapper.db_to_i(self.mapper.addr_input('bottom_limit_1', self.car_id))
+            bot_addr = self.mapper.addr_input('bottom_limit_1', self.car_id)
             at_limit = self.io.get_input(bot_addr) == 1
             if not at_limit:
                 await self.motor.release_brakes()
@@ -779,8 +771,8 @@ class ActionExecutor:
             # 可能还在 cache 中残留(1,1),导致反向计数误以为已在第一层,
             # 过早从 0 计到 1=target 停在 base 层。标记 active=True 等下降沿
             # 后再计下个上升沿,确保从 L1 才开始计数。
-            _up = self.mapper.db_to_i(self.mapper.addr_input("level_up", self.car_id))
-            _dn = self.mapper.db_to_i(self.mapper.addr_input("level_down", self.car_id))
+            _up = self.mapper.addr_input("level_up", self.car_id)
+            _dn = self.mapper.addr_input("level_down", self.car_id)
             self._init_perfect_leveling_active = (self.io.get_input(_up) == 1 and self.io.get_input(_dn) == 1)
             self.waiting_sensor = None
             self.car.direction = Direction.DOWN

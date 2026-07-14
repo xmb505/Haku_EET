@@ -971,10 +971,8 @@ class Console:
             for cid in car_ids:
                 if self.app.cars[cid].state == CarState.FAULT:
                     try:
-                        bl2 = self.app.mapper.db_to_i(
-                            self.app.mapper.addr_input('bottom_limit_2', cid))
-                        tl2 = self.app.mapper.db_to_i(
-                            self.app.mapper.addr_input('top_limit_2', cid))
+                        bl2 = self.app.mapper.addr_input('bottom_limit_2', cid)
+                        tl2 = self.app.mapper.addr_input('top_limit_2', cid)
                         if self.app.io.get_input(bl2) == 0 and self.app.io.get_input(tl2) == 0:
                             self.app.cars[cid].state = CarState.READY
                             print(f'[manual] car{cid} FAULT 自动恢复（2 限位已释放）')
@@ -1770,12 +1768,8 @@ class Console:
         self.pass_floor_monitor_enabled = True
         for cid in self.app.car_ids:
             try:
-                up_addr = self.app.mapper.db_to_i(
-                    self.app.mapper.addr_input('level_up', cid)
-                )
-                down_addr = self.app.mapper.db_to_i(
-                    self.app.mapper.addr_input('level_down', cid)
-                )
+                up_addr = self.app.mapper.addr_input('level_up', cid)
+                down_addr = self.app.mapper.addr_input('level_down', cid)
             except KeyError:
                 continue
             perfect = (self.app.io.get_input(up_addr) == 1
@@ -1815,12 +1809,8 @@ class Console:
         # 初始化每部车的当前状态(避免启用前累积的旧状态被误报为"翻转")
         for cid in self.app.car_ids:
             try:
-                up_addr = self.app.mapper.db_to_i(
-                    self.app.mapper.addr_input('level_up', cid)
-                )
-                down_addr = self.app.mapper.db_to_i(
-                    self.app.mapper.addr_input('level_down', cid)
-                )
+                up_addr = self.app.mapper.addr_input('level_up', cid)
+                down_addr = self.app.mapper.addr_input('level_down', cid)
             except KeyError:
                 continue
             self._level_check_last_state[cid] = (
@@ -1852,12 +1842,8 @@ class Console:
         states: dict[int, tuple[int, int]] = {}
         for cid in self.app.car_ids:
             try:
-                up_addr = self.app.mapper.db_to_i(
-                    self.app.mapper.addr_input('level_up', cid)
-                )
-                down_addr = self.app.mapper.db_to_i(
-                    self.app.mapper.addr_input('level_down', cid)
-                )
+                up_addr = self.app.mapper.addr_input('level_up', cid)
+                down_addr = self.app.mapper.addr_input('level_down', cid)
             except KeyError:
                 continue
             states[cid] = (
@@ -1931,8 +1917,8 @@ class Console:
             corr = '⚡' if exe._level_correct_in_progress else ' '
             # 当前平层
             try:
-                ua = self.app.mapper.db_to_i(self.app.mapper.addr_input('level_up', cid))
-                da = self.app.mapper.db_to_i(self.app.mapper.addr_input('level_down', cid))
+                ua = self.app.mapper.self.app.mapper.addr_input('level_up', cid)
+                da = self.app.mapper.self.app.mapper.addr_input('level_down', cid)
                 lu = self.app.io.get_input(ua)
                 ld = self.app.io.get_input(da)
             except KeyError:
@@ -1947,12 +1933,8 @@ class Console:
         """IO listener：扫描所有车的 level_up & level_down，detect 完美平层上升沿"""
         for cid in self.app.car_ids:
             try:
-                up_addr = self.app.mapper.db_to_i(
-                    self.app.mapper.addr_input('level_up', cid)
-                )
-                down_addr = self.app.mapper.db_to_i(
-                    self.app.mapper.addr_input('level_down', cid)
-                )
+                up_addr = self.app.mapper.addr_input('level_up', cid)
+                down_addr = self.app.mapper.addr_input('level_down', cid)
             except KeyError:
                 continue
             up_now = self.app.io.get_input(up_addr)

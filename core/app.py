@@ -337,8 +337,7 @@ class App:
     def is_floor_door_open(self, car_id: int, floor: int) -> bool:
         """检查楼层门锁是否已开（floor_door_lock_{floor} == 0）"""
         try:
-            i_addr = self.mapper.db_to_i(
-                self.mapper.addr_input(f'floor_door_lock_{floor}', car_id))
+            i_addr = self.mapper.addr_input(f'floor_door_lock_{floor}', car_id)
             return self.io.get_input(i_addr) == 0
         except KeyError:
             return False
@@ -346,8 +345,7 @@ class App:
     def is_hall_button_held(self, floor: int, direction: str) -> bool:
         """检查外召按钮是否物理按住（hall_call_{direction}_{floor} == 1）"""
         try:
-            i_addr = self.mapper.db_to_i(
-                self.mapper.addr_input(f'hall_call_{direction}_{floor}', 0))
+            i_addr = self.mapper.addr_input(f'hall_call_{direction}_{floor}', 0)
             return self.io.get_input(i_addr) == 1
         except KeyError:
             return False
@@ -355,8 +353,7 @@ class App:
     def is_door_open_button_held(self, car_id: int) -> bool:
         """检查开门按钮是否物理按住（door_open_button == 1）"""
         try:
-            i_addr = self.mapper.db_to_i(
-                self.mapper.addr_input('door_open_button', car_id))
+            i_addr = self.mapper.addr_input('door_open_button', car_id)
             return self.io.get_input(i_addr) == 1
         except KeyError:
             return False
@@ -364,8 +361,7 @@ class App:
     def is_light_curtain_active(self, car_id: int) -> bool:
         """检查光幕是否触发（light_curtain == 1）"""
         try:
-            i_addr = self.mapper.db_to_i(
-                self.mapper.addr_input('light_curtain', car_id))
+            i_addr = self.mapper.addr_input('light_curtain', car_id)
             return self.io.get_input(i_addr) == 1
         except KeyError:
             return False
@@ -910,12 +906,8 @@ class App:
 
             # 空闲车:读 level 传感器判断是否需要 auto-seek
             try:
-                up_addr = self.mapper.db_to_i(
-                    self.mapper.addr_input('level_up', cid)
-                )
-                dn_addr = self.mapper.db_to_i(
-                    self.mapper.addr_input('level_down', cid)
-                )
+                up_addr = self.mapper.addr_input('level_up', cid)
+                dn_addr = self.mapper.addr_input('level_down', cid)
             except KeyError:
                 # 没有 level 信号（异常配置）→ 仅激活 hold,让下次 IO 事件触发检查
                 exe._level_seek_active = True
@@ -1200,9 +1192,7 @@ class App:
         mapper = self.mapper
 
         try:
-            car_lock_i = mapper.db_to_i(
-                mapper.addr_input('car_door_lock', car_id)
-            )
+            car_lock_i = mapper.addr_input('car_door_lock', car_id)
         except KeyError:
             return {
                 'status': 'rejected',
@@ -1299,17 +1289,13 @@ class App:
         floor_lock_i: dict[int, str] = {}
         for f in range(1, 11):
             try:
-                floor_lock_i[f] = mapper.db_to_i(
-                    mapper.addr_input(f'floor_door_lock_{f}', car_id)
-                )
+                floor_lock_i[f] = mapper.addr_input(f'floor_door_lock_{f}', car_id)
             except KeyError:
                 pass
 
         door_done_signal = 'door_open_done' if action == 'open' else 'door_close_done'
         try:
-            door_done_i = mapper.db_to_i(
-                mapper.addr_input(door_done_signal, car_id)
-            )
+            door_done_i = mapper.addr_input(door_done_signal, car_id)
         except KeyError:
             self._door_busy[car_id] = False
             return {
