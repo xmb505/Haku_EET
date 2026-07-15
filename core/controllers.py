@@ -209,6 +209,8 @@ class DoorController:
             self.mapper.addr_output('door_open_relay', self.car_id): 1,
             self.mapper.addr_output('door_close_relay', self.car_id): 0,
         })
+        # ★ 立即 flush，确保开门命令先到达 PLC 再注册 listener
+        await self.io_write.flush_now()
 
     async def close(self) -> None:
         """initiate door close; caller awaits wait_done() for result"""
@@ -220,6 +222,8 @@ class DoorController:
             self.mapper.addr_output('door_open_relay', self.car_id): 0,
             self.mapper.addr_output('door_close_relay', self.car_id): 1,
         })
+        # ★ 立即 flush，确保关门命令先到达 PLC，防止 breach 覆盖缓冲区
+        await self.io_write.flush_now()
 
     async def wait_done(self) -> str:
         """await door action completion; returns 'done' | 'breach' | 'wrong_floor'"""

@@ -27,6 +27,7 @@ class DisplayEncoder:
         self.segments: list[str] = []
         self.glyphs: dict[str, list[str]] = {}
         self.floor_display: dict[int, str] = {}
+        self.leading_zero_for_single_digit: bool = False
         self.reload()
 
     def reload(self) -> None:
@@ -37,6 +38,8 @@ class DisplayEncoder:
         self.segments = list(cfg['segments'])
         self.glyphs = {k: list(v) for k, v in cfg['glyphs'].items()}
         self.floor_display = {int(k): str(v) for k, v in cfg['floor_display'].items()}
+        self.leading_zero_for_single_digit = bool(
+            cfg.get('leading_zero_for_single_digit', False))
 
         # 校验：所有 glyph 引用的笔画都必须在 segments 里
         all_segs: Set[str] = set(self.segments)
@@ -64,12 +67,23 @@ class DisplayEncoder:
         if number in self.floor_display:
             glyph = self.floor_display[number]
             if glyph.isdigit() and len(glyph) == 1:
-                await self._write_segments(self.number_to_segments(number), car_id)
+                # 标准数字（1-9）：leading_zero 决定是否用 zfill 路径（"01"）或仅个位（"1"）
+                if self.leading_zero_for_single_digit:
+                    segs = self.number_to_segments(number)
+                else:
+                    segs = self.get_segments_for_glyph(glyph)
+                await self._write_segments(segs, car_id)
             else:
                 # 自定义字符（A、F 等）→ 用 get_segments_for_floor 处理
                 await self._write_segments(self.get_segments_for_floor(number), car_id)
         else:
-            await self._write_segments(self.number_to_segments(number), car_id)
+            # 兜底：未配置的楼层直接走 number_to_segments
+            # 单数字 (0-9) 受 leading_zero 控制；≥10 永远是两位数路径
+            if 0 <= number <= 9 and not self.leading_zero_for_single_digit:
+                segs = self.get_segments_for_glyph(glyph)
+            else:
+                segs = self.number_to_segments(number)
+            await self._write_segments(segs, car_id)
 
     async def show_glyph(self, glyph_name: str, car_id: int) -> None:
         """显示一个命名字符（up/down/fault/blank 等），十位补 0"""

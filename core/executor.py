@@ -320,8 +320,11 @@ class ActionExecutor:
                     self._log(f'[exec] car{self.car_id} 平层 L{pos} → L{new_pos} (目标 L{self._init_target_floor})')
                     self.car.position = new_pos
                     # 实时更新 7 段显示
-                    await self.display.show_number(new_pos, self.car_id)
-                    self.car.display = new_pos
+                    try:
+                        await self.display.show_number(new_pos, self.car_id)
+                        self.car.display = new_pos
+                    except Exception:
+                        pass
                     # 标记基站段完成（首个完美平层上升沿 = 临界点）
                     # _apply_init_decel 会根据这个标记切换基-客分段逻辑
                     self._init_base_segment_done = True
@@ -484,8 +487,11 @@ class ActionExecutor:
         remaining = target - new_pos  # 还差几层（正数=还需上行，负数=还需下行）
 
         # 实时更新 7 段显示：每经过一层就刷新(中间层也显示)
-        await self.display.show_number(new_pos, self.car_id)
-        self.car.display = new_pos
+        try:
+            await self.display.show_number(new_pos, self.car_id)
+            self.car.display = new_pos
+        except Exception:
+            pass
 
         if self.debug:
             print(f'[exec] level reached: pos={new_pos} target={target} remaining={remaining} decel_state={self.decel_state}')

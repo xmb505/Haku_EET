@@ -10,6 +10,8 @@ io_client.py —— 异步 IO2HTTP 客户端
 支持 simulate=True 模式，跳过真实网络（无硬件调试用）。
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import sys
@@ -155,6 +157,11 @@ class IOClient:
             self._output_cache[addr] = bit
             if not self.simulate:
                 self._write_buffer[addr] = bit
+
+    async def flush_now(self) -> None:
+        """强制立即 flush 写缓冲区（不等下个 tick）"""
+        if not self.simulate and self._write_buffer:
+            await self._flush_now()
 
     # ===== 写合并定时 flush =====
 
