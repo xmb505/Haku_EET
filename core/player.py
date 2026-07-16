@@ -89,6 +89,7 @@ class Car:
     weight_state: int = 0                   # 0=正常 / 1=临界 / 2=超重
     max_weight: int = 0                     # 配置的最大载重（kg）
     weight_threshold_kg: int = 0            # 临界阈值（kg，已计算 = max_weight * threshold）
+    adc_full_scale_kg: int = 0              # ADC 模拟量满量程（kg），0=直读 kg（无需换算）
 
     def is_ready(self) -> bool:
         return self.state == CarState.READY and not self.fault.service_mode

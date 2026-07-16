@@ -1837,12 +1837,13 @@ class Console:
         print('[competition] === 比赛自动流程开始 ===')
 
         car_ids = self.app.car_ids
-        init_dir = self.app.config['elevator']['initialization_direction']
-        print(f'[competition] 初始化 {len(car_ids)} 部轿厢: {car_ids}，方向={init_dir}')
+        print(f'[competition] 初始化 {len(car_ids)} 部轿厢: {car_ids}')
 
-        # 1. 初始化所有轿厢（异步入队，不阻塞）
+        # 1. 初始化所有轿厢（异步入队，不阻塞），每部车独立配置
         for cid in car_ids:
-            await self.app.reset(direction=init_dir, target_floor=1, car_id=cid)
+            init_dir, init_target = self.app._get_car_init_config(cid)
+            print(f'[competition]  car{cid}: direction={init_dir}, target={init_target}')
+            await self.app.reset(direction=init_dir, target_floor=init_target, car_id=cid)
 
         # 2. 等待所有轿厢初始化完成（state=READY + position 非空）
         print('[competition] 等待初始化完成...')

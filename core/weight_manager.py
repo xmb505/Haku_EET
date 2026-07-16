@@ -171,14 +171,27 @@ class WeightManager:
     # ===== 内部 read_word 封装 =====
 
     async def _read_weight(self, car_id: int) -> int | None:
-        """读 word（封装 mapper.addr_word_input + io.read_word + vplc）
+        """读 word → ADC 原始值 → 换算为 kg
 
+        PLC 输出的是 Siemens 标准模拟量原始值（0-27648），需根据
+        adc_full_scale_kg 换算为实际 kg：
+            weight_kg = raw_word * adc_full_scale_kg / 27648
+
+        当 adc_full_scale_kg=0 时，认为 weight 已直接是 kg（兼容旧版）。
         返回 None = 当前 profile 无 weight_word 配置 / read 失败
         """
         try:
             db_num, byte = self._app.mapper.addr_word_input('weight', car_id)
         except KeyError:
             return None  # 当前 profile 无 weight_word，silent skip
+        car = self._app.cars[car_id]
         if self._app.io.simulate:
-            return self._app.virtual_plcs[car_id].read_word(db_num, byte)
-        return await self._app.io.read_word(db_num, byte)
+            raw = self._app.virtual_plcs[car_id].read_word(db_num, byte)
+        else:
+            raw = await self._app.io.read_word(db_num, byte)
+        if raw is None:
+            return None
+        if car.adc_full_scale_kg > 0:
+            # Siemens ADC 满量程 27648 → kg
+            return round(raw * car.adc_full_scale_kg / 27648)
+        return raw  # 直读 kg，无需换算

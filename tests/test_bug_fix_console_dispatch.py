@@ -36,6 +36,13 @@ async def _setup_cars_at_l1(app):
         app.cars[cid].state = CarState.READY
     # 等所有 init action 处理完(包括残余的 INITIALIZE action)
     await asyncio.sleep(2.5)
+    # 设置平层信号为 1（MOVE 完美平层 + OPEN_DOOR 平层校验需要）
+    for cid in app.car_ids:
+        try:
+            app.io.observe_input(app.mapper.addr_input('level_up', cid), 1)
+            app.io.observe_input(app.mapper.addr_input('level_down', cid), 1)
+        except KeyError:
+            pass
 
 
 @pytest.mark.asyncio

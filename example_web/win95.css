@@ -1,0 +1,1036 @@
+/* ============================================================
+   Win95 复古风格主题 - EET 电梯控制系统 HMI
+   ============================================================ */
+
+/* ===== 像素字体加载: Fusion Pixel 12px (proportional, near-monospaced) ===== */
+@font-face {
+    font-family: 'Fusion Pixel';
+    src: url('fusion-pixel-12px-proportional-latin.ttf') format('truetype');
+    unicode-range: U+0020-007E, U+00A0-00FF, U+0100-017F, U+0180-024F,
+                   U+2000-206F, U+2070-209F, U+20A0-20CF, U+2100-214F,
+                   U+2190-21FF, U+2200-22FF, U+2300-23FF, U+2500-257F,
+                   U+2580-259F, U+25A0-25FF, U+2600-26FF, U+2700-27BF;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Fusion Pixel';
+    src: url('fusion-pixel-12px-proportional-zh_hans.ttf') format('truetype');
+    unicode-range: U+3000-303F, U+4E00-9FFF, U+FF00-FFEF,
+                   U+2014, U+2018-2019, U+201C-201D, U+2026, U+00B7;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Fusion Pixel';
+    src: url('fusion-pixel-12px-proportional-zh_hant.ttf') format('truetype');
+    unicode-range: U+3400-4DBF, U+20000-2A6DF, U+F900-FAFF, U+2F800-2FA1F;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Fusion Pixel';
+    src: url('fusion-pixel-12px-proportional-ja.ttf') format('truetype');
+    unicode-range: U+3040-309F, U+30A0-30FF, U+31F0-31FF;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Fusion Pixel';
+    src: url('fusion-pixel-12px-proportional-ko.ttf') format('truetype');
+    unicode-range: U+1100-11FF, U+3130-318F, U+A960-A97F,
+                   U+AC00-D7AF, U+D7B0-D7FF;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: 'W95FA';
+    src: local('MS Sans Serif'), local('Microsoft Sans Serif');
+}
+
+:root {
+    --win-gray: #c0c0c0;
+    --win-dark: #808080;
+    --win-darker: #404040;
+    --win-darkest: #0a0a0a;
+    --win-light: #ffffff;
+    --win-title: #000080;
+    --win-title-end: #1084d0;
+    --win-bg: #008080;
+    --win-green: #008000;
+    --win-red: #800000;
+    --win-yellow: #808000;
+    --win-blue: #000080;
+    --win-sunken: #ffffff;
+    --win-shadow: #808080;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html, body {
+    height: 100%;
+    overflow: hidden;
+}
+
+body {
+    font-family: 'Fusion Pixel', 'Microsoft Sans Serif', 'MS Sans Serif', 'W95FA', 'Tahoma', sans-serif;
+    font-size: 12px;
+    background: var(--win-bg);
+    color: #000;
+    user-select: none;
+    cursor: default;
+    -webkit-font-smoothing: none;
+    -moz-osx-font-smoothing: grayscale;
+    font-smooth: never;
+    image-rendering: pixelated;
+}
+
+/* ==================== Win95 窗口 ==================== */
+.window {
+    background: var(--win-gray);
+    border: 2px solid;
+    border-color: var(--win-light) var(--win-darkest) var(--win-darkest) var(--win-light);
+    box-shadow: 1px 1px 0 var(--win-dark);
+    display: flex;
+    flex-direction: column;
+    position: absolute;
+}
+
+.window.desktop {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    border: none;
+    box-shadow: none;
+    background: var(--win-bg);
+    display: flex;
+    flex-direction: column;
+}
+
+/* ==================== 标题栏 ==================== */
+.title-bar {
+    background: linear-gradient(90deg, var(--win-title), var(--win-title-end));
+    color: white;
+    padding: 2px 3px;
+    display: flex;
+    align-items: center;
+    height: 22px;
+    flex-shrink: 0;
+    letter-spacing: 0.3px;
+}
+
+.title-bar-icon {
+    width: 14px;
+    height: 14px;
+    margin-right: 4px;
+    font-size: 10px;
+    line-height: 14px;
+    text-align: center;
+    background: var(--win-gray);
+    color: #000;
+    border: 1px solid;
+    border-color: var(--win-light) #000 #000 var(--win-light);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.title-bar-text {
+    flex: 1;
+    font-weight: bold;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.title-bar-controls {
+    display: flex;
+    gap: 2px;
+    margin-left: 12px;
+    flex-shrink: 0;
+    align-items: center;
+}
+
+.title-btn {
+    min-width: 18px;
+    height: 16px;
+    padding: 0 4px;
+    background: var(--win-gray);
+    border: 1px solid;
+    border-color: var(--win-light) var(--win-dark) var(--win-dark) var(--win-light);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    cursor: pointer;
+    line-height: 1;
+    color: #000;
+    font-family: inherit;
+}
+
+.title-btn:active {
+    border-color: var(--win-dark) var(--win-light) var(--win-light) var(--win-dark);
+}
+
+.title-btn.close {
+    font-weight: bold;
+    font-size: 10px;
+}
+
+/* ==================== 菜单栏 ==================== */
+.menu-bar {
+    background: var(--win-gray);
+    border-bottom: 1px solid var(--win-shadow);
+    padding: 2px 0;
+    display: flex;
+    gap: 0;
+    flex-shrink: 0;
+}
+
+.menu-item {
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.menu-item:hover, .menu-item.active {
+    background: var(--win-title);
+    color: white;
+}
+
+/* ==================== 窗口内容区 ==================== */
+.window-body {
+    flex: 1;
+    padding: 8px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    background: var(--win-gray);
+}
+
+.window-body.desktop-body {
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ==================== 状态栏 ==================== */
+.status-bar {
+    background: var(--win-gray);
+    border-top: 1px solid var(--win-shadow);
+    padding: 2px 4px;
+    display: flex;
+    font-size: 11px;
+    flex-shrink: 0;
+    gap: 2px;
+}
+
+.status-bar-item {
+    border: 1px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    padding: 1px 6px;
+    white-space: nowrap;
+}
+
+.status-bar-item.grip {
+    border: none;
+    background:
+        linear-gradient(135deg, var(--win-dark) 25%, transparent 25%) -1px -1px,
+        linear-gradient(225deg, var(--win-dark) 25%, transparent 25%) -1px -1px;
+    background-size: 4px 4px;
+    width: 14px;
+    flex-shrink: 0;
+    margin-left: auto;
+}
+
+.status-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    border: 1px solid var(--win-shadow);
+}
+
+.status-dot.green { background: #00aa00; }
+.status-dot.red { background: #cc0000; }
+.status-dot.yellow { background: #cccc00; }
+
+/* ==================== 按钮 ==================== */
+button, .btn {
+    font-family: inherit;
+    font-size: 12px;
+    background: var(--win-gray);
+    border: 2px solid;
+    border-color: var(--win-light) var(--win-dark) var(--win-dark) var(--win-light);
+    outline: 1px dotted transparent;
+    padding: 3px 16px;
+    cursor: pointer;
+    min-width: 60px;
+    min-height: 23px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    color: #000;
+}
+
+button::after, .btn::after {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    border: 1px solid transparent;
+    pointer-events: none;
+}
+
+button:active, .btn:active,
+button.pressed, .btn.pressed {
+    border-color: var(--win-dark) var(--win-light) var(--win-light) var(--win-dark);
+    padding: 4px 15px 2px 17px;
+}
+
+button:focus-visible, .btn:focus-visible {
+    outline: 1px dotted #000;
+    outline-offset: -4px;
+}
+
+button:disabled, .btn.disabled {
+    color: var(--win-shadow);
+    text-shadow: 1px 1px 0 var(--win-light);
+    pointer-events: none;
+}
+
+.btn-primary {
+    font-weight: bold;
+}
+
+.btn-sm {
+    padding: 1px 8px;
+    min-width: 40px;
+    min-height: 20px;
+    font-size: 11px;
+}
+
+.btn-icon {
+    min-width: unset;
+    padding: 2px 6px;
+    min-height: unset;
+}
+
+.btn-block {
+    display: flex;
+    width: 100%;
+}
+
+/* ==================== 输入框 ==================== */
+input[type="text"],
+input[type="password"],
+input[type="number"],
+select,
+textarea {
+    font-family: inherit;
+    font-size: 12px;
+    background: var(--win-light);
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    padding: 2px 4px;
+    outline: none;
+    color: #000;
+}
+
+input:focus, select:focus, textarea:focus {
+    border-color: #000 var(--win-light) var(--win-light) #000;
+}
+
+select {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='%23000' stroke-width='1.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 2px center;
+    padding-right: 20px;
+    cursor: pointer;
+}
+
+/* ==================== 分组框 ==================== */
+fieldset, .group-box {
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    padding: 12px 8px 8px;
+    margin-bottom: 8px;
+    position: relative;
+}
+
+legend, .group-box-title {
+    position: absolute;
+    top: -8px;
+    left: 8px;
+    background: var(--win-gray);
+    padding: 0 4px;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.group-box .group-box-title {
+    position: static;
+    display: block;
+    margin: -18px -4px 6px;
+    padding: 0 4px;
+    font-weight: bold;
+    font-size: 12px;
+}
+
+/* ==================== 复选框 / 单选框 ==================== */
+.checkbox-group, .radio-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.checkbox-label, .radio-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.checkbox-label input[type="checkbox"],
+.radio-label input[type="radio"] {
+    appearance: none;
+    width: 13px; height: 13px;
+    border: 1px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    background: var(--win-light);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    cursor: pointer;
+}
+
+.radio-label input[type="radio"] {
+    border-radius: 50%;
+}
+
+.checkbox-label input[type="checkbox"]:checked::after {
+    content: '✓';
+    font-size: 13px;
+    line-height: 1;
+    font-weight: bold;
+    color: #000;
+}
+
+.radio-label input[type="radio"]:checked::after {
+    content: '●';
+    font-size: 8px;
+    line-height: 1;
+    color: #000;
+}
+
+/* ==================== 标签/文本 ==================== */
+label {
+    font-size: 12px;
+}
+
+.text-muted {
+    color: var(--win-shadow);
+}
+
+/* ==================== 电梯卡片 ==================== */
+.elevator-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.elevator-card {
+    background: var(--win-gray);
+    border: 2px solid;
+    border-color: var(--win-light) var(--win-dark) var(--win-dark) var(--win-light);
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    position: relative;
+    min-width: 160px;
+}
+
+.elevator-card .card-title {
+    font-weight: bold;
+    font-size: 12px;
+    border-bottom: 1px solid var(--win-shadow);
+    padding-bottom: 3px;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.elevator-card .card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.elevator-card .info-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+}
+
+.elevator-card .info-label {
+    color: #444;
+}
+
+.elevator-card .info-value {
+    font-weight: bold;
+}
+
+/* 楼层显示大数字 */
+.floor-display {
+    font-size: 28px;
+    font-weight: bold;
+    text-align: center;
+    font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
+    background: #000;
+    color: #00ff00;
+    padding: 4px 8px;
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    letter-spacing: 2px;
+    text-shadow: 0 0 4px #00ff00;
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* 方向指示 */
+.direction-indicator {
+    font-size: 20px;
+    line-height: 1;
+    font-weight: bold;
+}
+
+.direction-indicator.up { color: #00aa00; }
+.direction-indicator.down { color: #cc0000; }
+.direction-indicator.idle { color: #888; }
+
+/* 门状态 */
+.door-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border: 1px solid var(--win-shadow);
+    font-size: 11px;
+}
+
+.door-status.open { background: #ccffcc; }
+.door-status.closed { background: #ffcccc; }
+.door-status.opening { background: #ffffcc; }
+
+/* ==================== 指示灯 ==================== */
+.lamp-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    padding: 4px;
+}
+
+.lamp {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: bold;
+    transition: background 0.1s;
+}
+
+.lamp:active {
+    border-color: var(--win-light) var(--win-shadow) var(--win-shadow) var(--win-light);
+}
+
+.lamp.active {
+    background: #ffff00;
+    border-color: #cccc00 #666600 #666600 #cccc00;
+    box-shadow: 0 0 6px rgba(255, 255, 0, 0.5);
+}
+
+.lamp.inactive {
+    background: #333;
+    color: #888;
+}
+
+/* ==================== 建筑楼层图 ==================== */
+.building-view {
+    background: #000;
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    padding: 2px;
+    flex: 1;
+    min-height: 200px;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.floor-row {
+    display: flex;
+    align-items: center;
+    height: 32px;
+    border-bottom: 1px solid #333;
+    padding: 0 4px;
+    gap: 2px;
+}
+
+.floor-row .floor-label {
+    color: #888;
+    font-size: 10px;
+    width: 24px;
+    text-align: right;
+    padding-right: 4px;
+    flex-shrink: 0;
+}
+
+.floor-row .shaft {
+    flex: 1;
+    display: flex;
+    gap: 2px;
+    height: 100%;
+    align-items: center;
+}
+
+.floor-row .shaft-cell {
+    flex: 1;
+    height: 28px;
+    border: 1px solid #222;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+}
+
+.floor-row .shaft-cell .car-marker {
+    width: 20px;
+    height: 20px;
+    background: #cc0000;
+    border: 1px solid #ff6666;
+    border-radius: 2px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 8px;
+    color: white;
+    font-weight: bold;
+    box-shadow: 0 0 4px rgba(255, 0, 0, 0.5);
+}
+
+.floor-row .shaft-cell .car-marker.moving {
+    animation: car-pulse 0.5s ease-in-out infinite alternate;
+}
+
+@keyframes car-pulse {
+    from { box-shadow: 0 0 2px rgba(255, 0, 0, 0.3); }
+    to { box-shadow: 0 0 8px rgba(255, 0, 0, 0.8); }
+}
+
+/* ==================== 工具栏 ==================== */
+.toolbar {
+    background: var(--win-gray);
+    border-bottom: 1px solid var(--win-shadow);
+    padding: 4px 6px;
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+}
+
+.toolbar .separator {
+    width: 1px;
+    height: 20px;
+    background: var(--win-shadow);
+    border-right: 1px solid var(--win-light);
+    margin: 0 2px;
+}
+
+/* ==================== 弹窗/对话框 ==================== */
+.dialog-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.dialog-box {
+    background: var(--win-gray);
+    border: 2px solid;
+    border-color: var(--win-light) var(--win-darkest) var(--win-darkest) var(--win-light);
+    box-shadow: 2px 2px 0 rgba(0,0,0,0.3);
+    min-width: 300px;
+    max-width: 420px;
+}
+
+.dialog-box .title-bar {
+    cursor: default;
+}
+
+.dialog-body {
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.dialog-body .dialog-icon {
+    font-size: 32px;
+    text-align: center;
+}
+
+.dialog-footer {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px 16px 12px;
+}
+
+/* ==================== 表单布局 ==================== */
+.form-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.form-row label {
+    width: 80px;
+    text-align: right;
+    flex-shrink: 0;
+}
+
+.form-row .form-control {
+    flex: 1;
+}
+
+/* ==================== 滚动条（Win95 风格） ==================== */
+::-webkit-scrollbar {
+    width: 16px;
+    height: 16px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--win-gray);
+    border: 1px solid var(--win-shadow);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--win-gray);
+    border: 2px solid;
+    border-color: var(--win-light) var(--win-dark) var(--win-dark) var(--win-light);
+}
+
+::-webkit-scrollbar-button {
+    background: var(--win-gray);
+    border: 2px solid;
+    border-color: var(--win-light) var(--win-dark) var(--win-dark) var(--win-light);
+    height: 16px;
+    display: block;
+}
+
+/* ==================== Tab 控件 ==================== */
+.tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--win-shadow);
+    margin-bottom: 8px;
+}
+
+.tab {
+    background: var(--win-gray);
+    border: 2px solid;
+    border-color: var(--win-light) var(--win-dark) var(--win-shadow) var(--win-light);
+    padding: 4px 16px;
+    cursor: pointer;
+    font-size: 12px;
+    margin-bottom: -1px;
+    position: relative;
+    z-index: 1;
+}
+
+.tab.active {
+    border-bottom-color: var(--win-gray);
+    font-weight: bold;
+}
+
+/* ==================== 桌面图标 ==================== */
+.desktop-icons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px;
+    align-content: flex-start;
+}
+
+.desktop-icon {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 72px;
+    padding: 4px;
+    cursor: pointer;
+    text-align: center;
+    color: white;
+    font-size: 11px;
+    gap: 4px;
+}
+
+.desktop-icon:hover, .desktop-icon.selected {
+    background: rgba(0, 0, 128, 0.3);
+    outline: 1px dotted white;
+    outline-offset: -1px;
+}
+
+.desktop-icon .icon-img {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+}
+
+/* ==================== 进度条 ==================== */
+.progress-bar {
+    height: 18px;
+    background: var(--win-light);
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    position: relative;
+    overflow: hidden;
+}
+
+.progress-bar .progress-fill {
+    height: 100%;
+    background: #000080;
+    transition: width 0.3s;
+}
+
+.progress-bar .progress-text {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: bold;
+    color: white;
+    text-shadow: 1px 1px 0 #000;
+}
+
+/* ==================== 响应列表 ==================== */
+.response-log {
+    background: var(--win-light);
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    padding: 4px;
+    font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
+    font-size: 11px;
+    height: 120px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.response-log .log-entry {
+    padding: 1px 0;
+    border-bottom: 1px solid #eee;
+}
+
+.response-log .log-entry .log-time {
+    color: #888;
+}
+
+.response-log .log-entry .log-ok { color: #008000; }
+.response-log .log-entry .log-err { color: #cc0000; }
+
+/* ==================== 实用工具 ==================== */
+.flex-row { display: flex; align-items: center; gap: 6px; }
+.flex-col { display: flex; flex-direction: column; gap: 4px; }
+.flex-1 { flex: 1; }
+.flex-wrap { flex-wrap: wrap; }
+.gap-2 { gap: 2px; }
+.gap-4 { gap: 4px; }
+.gap-8 { gap: 8px; }
+.mb-4 { margin-bottom: 4px; }
+.mb-8 { margin-bottom: 8px; }
+.mt-4 { margin-top: 4px; }
+.mt-8 { margin-top: 8px; }
+.text-center { text-align: center; }
+.w-full { width: 100%; }
+.hidden { display: none !important; }
+
+/* ==================== 加载动画 ==================== */
+.loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    color: var(--win-shadow);
+    gap: 8px;
+}
+
+.loading::after {
+    content: '';
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--win-shadow);
+    border-top: 2px solid var(--win-title);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ==================== 小提示 / 通知 ==================== */
+.notification {
+    position: fixed;
+    bottom: 40px;
+    right: 16px;
+    background: var(--win-gray);
+    border: 2px solid;
+    border-color: var(--win-light) var(--win-darkest) var(--win-darkest) var(--win-light);
+    box-shadow: 2px 2px 0 rgba(0,0,0,0.3);
+    padding: 8px 16px;
+    z-index: 9999;
+    min-width: 200px;
+    animation: slide-in 0.3s ease-out;
+}
+
+@keyframes slide-in {
+    from { transform: translateX(100%); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+}
+
+/* ==================== 内联 Frame ==================== */
+.frame {
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    padding: 8px;
+    background: var(--win-light);
+}
+
+/* ==================== 连接状态条 ==================== */
+.connection-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border: 1px solid;
+    font-size: 10px;
+    font-weight: bold;
+}
+
+.connection-badge.connected {
+    background: #ccffcc;
+    border-color: #008000;
+    color: #008000;
+}
+
+.connection-badge.disconnected {
+    background: #ffcccc;
+    border-color: #800000;
+    color: #800000;
+}
+
+.connection-badge.connecting {
+    background: #ffffcc;
+    border-color: #808000;
+    color: #808000;
+}
+
+/* ==================== 数字七段管风格 ==================== */
+.seven-seg {
+    font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
+    font-size: 36px;
+    font-weight: bold;
+    background: #111;
+    color: #ff3300;
+    padding: 4px 10px;
+    border: 2px solid;
+    border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+    text-shadow: 0 0 8px rgba(255, 51, 0, 0.6);
+    letter-spacing: 4px;
+    text-align: center;
+}
+
+/* ==================== 楼层按钮网格 ==================== */
+.floor-btn-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 4px;
+    max-width: 300px;
+}
+
+.floor-btn {
+    height: 36px;
+    font-size: 13px;
+    font-weight: bold;
+    min-width: unset;
+    padding: 0;
+}
+
+.floor-btn.served {
+    background: #ffffcc;
+}
+
+/* ==================== 外召按钮 ==================== */
+.hall-call-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    max-width: 200px;
+}
+
+.hall-call-btn {
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    font-size: 11px;
+}
+
+.hall-call-btn .arrow { font-size: 14px; }
+.hall-call-btn.up .arrow { color: #00aa00; }
+.hall-call-btn.down .arrow { color: #cc0000; }
+
+/* ==================== 控制区布局 ==================== */
+.control-panels {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+@media (max-width: 700px) {
+    .control-panels {
+        grid-template-columns: 1fr;
+    }
+    .elevator-grid {
+        grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    }
+}

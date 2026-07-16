@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EET 电梯控制系统 - 监控面板</title>
+    <link rel="stylesheet" href="win95.css">
+    <style>
+        body { background: #008080; }
+
+        .main-window {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            border: none;
+            box-shadow: none;
+            background: var(--win-gray);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .dashboard-body {
+            flex: 1;
+            padding: 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            overflow: hidden;
+        }
+
+        /* 上下分栏 */
+        .dash-main {
+            flex: 1;
+            display: flex;
+            gap: 4px;
+            min-height: 0;
+        }
+
+        .dash-left {
+            flex: 2;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-width: 0;
+        }
+
+        .dash-right {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-width: 240px;
+        }
+
+        .panel-frame {
+            border: 2px solid;
+            border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+            background: var(--win-gray);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel-title {
+            background: var(--win-title);
+            color: white;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 2px 6px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .panel-body {
+            flex: 1;
+            padding: 4px;
+            overflow-y: auto;
+            background: var(--win-gray);
+        }
+
+        /* 电梯卡片 */
+        .elevator-cards {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+
+        .car-card {
+            border: 2px solid;
+            border-color: var(--win-light) var(--win-shadow) var(--win-shadow) var(--win-light);
+            padding: 6px 8px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            cursor: pointer;
+            background: var(--win-gray);
+        }
+
+        .car-card:hover {
+            background: #d4d4d4;
+        }
+
+        .car-card .car-id {
+            font-weight: bold;
+            font-size: 14px;
+            width: 44px;
+            text-align: center;
+            flex-shrink: 0;
+        }
+
+        .car-card .car-floor-box {
+            font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
+            font-size: 22px;
+            font-weight: bold;
+            background: #000;
+            color: #00ff00;
+            padding: 2px 8px;
+            min-width: 44px;
+            text-align: center;
+            text-shadow: 0 0 4px #00ff00;
+            border: 1px solid var(--win-shadow);
+            flex-shrink: 0;
+        }
+
+        .car-card .car-arrow {
+            font-size: 22px;
+            font-weight: bold;
+            width: 24px;
+            text-align: center;
+            flex-shrink: 0;
+        }
+
+        .car-card .car-arrow.up { color: #00aa00; }
+        .car-card .car-arrow.down { color: #cc0000; }
+        .car-card .car-arrow.idle { color: #888; }
+
+        .car-card .car-info {
+            flex: 1;
+            font-size: 11px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2px 12px;
+        }
+
+        .car-card .car-info span {
+            white-space: nowrap;
+        }
+
+        .car-card .car-info .label {
+            color: #666;
+        }
+
+        .door-badge {
+            padding: 1px 6px;
+            font-size: 10px;
+            font-weight: bold;
+            border: 1px solid;
+            display: inline-block;
+        }
+
+        .door-badge.open { background: #ccffcc; border-color: #008000; color: #008000; }
+        .door-badge.closed { background: #ffcccc; border-color: #800000; color: #800000; }
+        .door-badge.opening { background: #ffffcc; border-color: #808000; color: #808000; }
+
+        /* 载重条 */
+        .weight-row {
+            flex-basis: 100%;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            margin-top: 2px;
+        }
+
+        .weight-bar {
+            position: relative;
+            flex: 1;
+            height: 12px;
+            background: #fff;
+            border: 1px solid;
+            border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+            min-width: 80px;
+            max-width: 160px;
+        }
+
+        .weight-fill {
+            display: block;
+            height: 100%;
+            background: #00aa00;
+            transition: width 0.3s;
+        }
+
+        .weight-bar.w-warn .weight-fill { background: #cccc00; }
+        .weight-bar.w-over  .weight-fill { background: #cc0000; }
+
+        .weight-text {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 9px;
+            font-weight: bold;
+            color: #000;
+            text-shadow: 0 0 2px #fff;
+            line-height: 1;
+        }
+
+        /* 建筑视图 */
+        .building-hint {
+            font-size: 10px;
+            color: #000080;
+            background: #ffffcc;
+            border: 1px solid #cccc00;
+            padding: 2px 6px;
+            margin-bottom: 4px;
+            font-weight: bold;
+        }
+
+        .building-scroll {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .bldg-row {
+            display: flex;
+            align-items: center;
+            height: 26px;
+            border-bottom: 1px solid #ccc;
+            font-size: 10px;
+        }
+
+        .bldg-row .bldg-floor {
+            width: 48px;
+            text-align: right;
+            padding-right: 6px;
+            color: #666;
+            flex-shrink: 0;
+            font-size: 10px;
+        }
+
+        .bldg-row .bldg-shaft {
+            flex: 1;
+            display: flex;
+            gap: 1px;
+            height: 24px;
+            align-items: center;
+        }
+
+        .bldg-shaft .shaft-cell {
+            flex: 1;
+            height: 22px;
+            border: 1px solid #ddd;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            background: #f8f8f8;
+        }
+
+        .bldg-shaft .shaft-cell .car-pos {
+            width: 18px;
+            height: 18px;
+            background: #c00;
+            border: 1px solid #f66;
+            border-radius: 2px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 8px;
+            color: white;
+            font-weight: bold;
+            box-shadow: 0 0 6px rgba(204,0,0,0.6);
+        }
+
+        .bldg-shaft .shaft-cell .car-pos.mv {
+            animation: blink 0.6s ease-in-out infinite alternate;
+        }
+
+        @keyframes blink {
+            from { box-shadow: 0 0 2px rgba(204,0,0,0.3); }
+            to { box-shadow: 0 0 10px rgba(204,0,0,0.9); }
+        }
+
+        /* 日志 */
+        .log-box {
+            font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
+            font-size: 11px;
+            height: 100%;
+            overflow-y: auto;
+            padding: 2px 4px;
+            background: #fff;
+            border: 1px solid;
+            border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+        }
+
+        .log-entry {
+            padding: 1px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .log-entry .t { color: #999; }
+        .log-entry .info { color: #000080; }
+        .log-entry .ok { color: #008000; }
+        .log-entry .err { color: #cc0000; }
+        .log-entry .warn { color: #808000; }
+
+        /* 刷新的等待 */
+        .refreshing {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+
+        .toolbar-left {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            flex: 1;
+        }
+
+        /* 工具栏右側元数据 */
+        .meta-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 1px 6px;
+            border: 1px solid;
+            border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+            background: #fff;
+            font-size: 10px;
+            font-weight: bold;
+            color: #000;
+            white-space: nowrap;
+        }
+
+        .meta-badge.on {
+            background: #ccffcc;
+            color: #008000;
+        }
+
+        .meta-badge.off {
+            background: #ffcccc;
+            color: #800000;
+        }
+
+        .toolbar-right {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+    </style>
+</head>
+<body>
+    <div class="main-window">
+        <!-- 标题栏 -->
+        <div class="title-bar">
+            <span class="title-bar-text">EET 电梯系统监控面板 — [ 已连接 ]</span>
+            <div class="title-bar-controls">
+                <button class="title-btn close" onclick="logout()">←</button>
+            </div>
+        </div>
+
+        <!-- 菜单栏 -->
+        <div class="menu-bar">
+            <span class="menu-item" onclick="showAbout()">关于(A)</span>
+            <span class="menu-item" onclick="location.href='control.html'">控制面板(C)</span>
+            <span class="menu-item" onclick="forceRefresh()">刷新(R)</span>
+            <span class="menu-item" onclick="logout()">注销(L)</span>
+        </div>
+
+        <!-- 工具栏 -->
+        <div class="toolbar">
+            <div class="toolbar-left">
+                <button class="btn-sm" onclick="location.href='control.html'">控制面板</button>
+                <div class="separator"></div>
+                <span id="refreshStatus" style="font-size:11px;">就绪</span>
+            </div>
+            <div class="toolbar-right">
+                <span class="meta-badge" id="statusAlgorithm" title="调度算法">算法: --</span>
+                <span class="meta-badge" id="statusUsermode" title="大脑是否接客">用户模式: --</span>
+                <span class="meta-badge" id="statusSimulate" title="模拟/实机">模式: --</span>
+                <span class="meta-badge" id="statusInitDir" title="初始化方向">初始化: --</span>
+                <span id="connectionBadge" class="connection-badge disconnected">● 未连接</span>
+                <span id="clockDisplay">--:--:--</span>
+            </div>
+        </div>
+
+        <!-- 主体 -->
+        <div class="dashboard-body">
+            <div class="dash-main">
+                <!-- 左：电梯列表 -->
+                <div class="dash-left">
+                    <div class="panel-frame" style="flex:1;">
+                        <div class="panel-title"> 电梯运行状态</div>
+                        <div class="panel-body" id="elevatorList">
+                            <div class="loading">加载中...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 右：建筑视图 + 日志 -->
+                <div class="dash-right">
+                    <div class="panel-frame" style="flex:1; min-height: 140px;">
+                        <div class="panel-title"> 楼层分布图</div>
+                        <div class="panel-body" id="buildingView" style="padding: 2px;">
+                            <div class="loading">加载中...</div>
+                        </div>
+                    </div>
+                    <div class="panel-frame" style="flex:1; min-height: 80px;">
+                        <div class="panel-title"> 系统日志</div>
+                        <div class="panel-body" style="padding: 2px;">
+                            <div class="log-box" id="logBox">
+                                <div class="log-entry"><span class="t">[--:--:--]</span> <span class="info">系统就绪，等待数据...</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 状态栏 -->
+        <div class="status-bar">
+            <div class="status-bar-item" id="statusElevatorCount">电梯: --</div>
+            <div class="status-bar-item" id="statusLastUpdate">最后更新: --</div>
+            <div class="status-bar-item" id="statusDataSize">数据: --</div>
+            <div class="status-bar-item grip"></div>
+        </div>
+    </div>
+
+    <!-- Win95 关于对话框 -->
+    <div class="dialog-overlay hidden" id="aboutDialog">
+        <div class="dialog-box" style="width: 340px;">
+            <div class="title-bar">
+                <span class="title-bar-text">关于 EET 电梯控制系统</span>
+                <div class="title-bar-controls">
+                    <button class="title-btn close" onclick="closeDialog('aboutDialog')">✕</button>
+                </div>
+            </div>
+            <div class="dialog-body" style="align-items:center;">
+                <div style="font-size: 36px; text-align:center;">E</div>
+                <div style="text-align:center;">
+                    <b>EET 电梯控制系统 v1.0</b><br>
+                    <span style="color:#666;font-size:11px;">电梯控制 HMI 前端</span>
+                </div>
+                <div style="border-top:1px solid #ccc;padding-top:8px;font-size:11px;width:100%;">
+                    <div>GET /stattrak — 数据接口</div>
+                    <div>POST /control — 控制接口</div>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button onclick="closeDialog('aboutDialog')">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Win95 确认对话框 -->
+    <div class="dialog-overlay hidden" id="confirmDialog">
+        <div class="dialog-box" style="width: 300px;">
+            <div class="title-bar">
+                <span class="title-bar-text">确认</span>
+                <div class="title-bar-controls">
+                    <button class="title-btn close" onclick="closeDialog('confirmDialog')">✕</button>
+                </div>
+            </div>
+            <div class="dialog-body">
+                <div style="display:flex;align-items:center;gap:12px;">
+                    <span style="font-size:32px;">?</span>
+                    <span id="confirmMessage">确认注销退出？</span>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button onclick="confirmYes()">确定</button>
+                <button onclick="closeDialog('confirmDialog')">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ============================================================
+        //  全局状态
+        // ============================================================
+        const API_BASE = '';
+        let refreshTimer = null;
+        let isRefreshing = false;
+        let lastData = null;
+
+        const FLOOR_NAMES = {
+            0: '下基站', 1: '1F', 2: '2F', 3: '3F', 4: '4F',
+            5: '5F', 6: '6F', 7: '7F', 8: '8F', 9: '9F',
+            10: '10F', 11: '上基站'
+        };
+
+        // ============================================================
+        //  登录校验
+        // ============================================================
+        if (!sessionStorage.getItem('eet_login')) {
+            window.location.href = 'index.html';
+        }
+
+        // ============================================================
+        //  时钟
+        // ============================================================
+        function updateClock() {
+            const now = new Date();
+            document.getElementById('clockDisplay').textContent =
+                now.toLocaleTimeString('zh-CN', { hour12: false });
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        // ============================================================
+        //  日志
+        // ============================================================
+        function addLogEntry(message, type = 'info') {
+            const box = document.getElementById('logBox');
+            const now = new Date();
+            const time = now.toLocaleTimeString('zh-CN', { hour12: false });
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="t">[${time}]</span> <span class="${type}">${message}</span>`;
+            box.appendChild(entry);
+            box.scrollTop = box.scrollHeight;
+            // 保留最近100条
+            while (box.children.length > 100) box.removeChild(box.firstChild);
+        }
+
+        // ============================================================
+        //  从 /stattrak 获取数据
+        // ============================================================
+        async function fetchStattrak() {
+            if (isRefreshing) return;
+            isRefreshing = true;
+
+            const statusEl = document.getElementById('refreshStatus');
+            const badgeEl = document.getElementById('connectionBadge');
+            statusEl.textContent = '刷新中...';
+
+            try {
+                const resp = await fetch(`${API_BASE}/stattrak`, {
+                    method: 'GET',
+                    headers: { 'Accept': 'application/json' },
+                    signal: AbortSignal.timeout(5000)
+                });
+
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+                const data = await resp.json();
+                lastData = data;
+                badgeEl.className = 'connection-badge connected';
+                badgeEl.textContent = '● 已连接';
+                statusEl.textContent = `已更新 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+                addLogEntry('数据刷新成功', 'ok');
+                renderDashboard(data);
+                updateStatusBar(data);
+            } catch (err) {
+                badgeEl.className = 'connection-badge disconnected';
+                badgeEl.textContent = '● 未连接';
+                statusEl.textContent = '获取失败: ' + err.message;
+                addLogEntry('数据刷新失败: ' + err.message, 'err');
+
+                // 如果从未成功过，显示模拟数据
+                if (!lastData) {
+                    renderMockData();
+                }
+            } finally {
+                isRefreshing = false;
+            }
+        }
+
+        // ============================================================
+        //  渲染 - 电梯列表
+        // ============================================================
+        function renderDashboard(data) {
+            renderElevatorCards(data);
+            renderBuildingView(data);
+            renderBuildingHint(data);
+            updateMetaBar(data);
+        }
+
+        // ============================================================
+        //  元数据栏（顶部 toolbar 右侧）
+        // ============================================================
+        function updateMetaBar(data) {
+            const algoEl = document.getElementById('statusAlgorithm');
+            const userEl = document.getElementById('statusUsermode');
+            const simEl = document.getElementById('statusSimulate');
+            const initEl = document.getElementById('statusInitDir');
+
+            algoEl.textContent = `算法: ${data.algorithm || 'unknown'}`;
+
+            const usermode = !!data.usermode;
+            userEl.textContent = `用户模式: ${usermode ? '开' : '关'}`;
+            userEl.className = 'meta-badge ' + (usermode ? 'on' : 'off');
+
+            const sim = !!data.simulate;
+            simEl.textContent = `模式: ${sim ? '模拟' : '实机'}`;
+            simEl.className = 'meta-badge ' + (sim ? 'on' : 'off');
+
+            initEl.textContent = `初始化: ${data.init_direction || 'down'}`;
+        }
+
+        function renderElevatorCards(data) {
+            const container = document.getElementById('elevatorList');
+            const cars = data.cars || [];
+
+            if (cars.length === 0) {
+                container.innerHTML = '<div style="text-align:center;padding:20px;color:#888;">暂无电梯数据</div>';
+                return;
+            }
+
+            function stateLabel(s) {
+                if (s === 'ready') return '就绪';
+                if (s === 'fault') return '故障';
+                return '未知';
+            }
+
+            let html = '<div class="elevator-cards">';
+            cars.forEach(car => {
+                const pos = car.position !== undefined ? car.position : '?';
+                const dir = car.direction || 'idle';
+                const dirChar = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '◆';
+                const door = car.door_state || 'closed';
+                const doorLabel = door === 'open' ? '开门' : door === 'opening' ? '开门中' : door === 'closing' ? '关门中' : '关门';
+                const target = car.target_floor !== undefined && car.target_floor !== null ? car.target_floor : '-';
+
+                // 载重三态机（weight_kg / max_weight / weight_state）
+                const weightKg = car.weight_kg || 0;
+                const maxW = car.max_weight || 0;
+                const wState = car.weight_state || 0;
+                const wPercent = maxW > 0 ? Math.min(100, Math.round(weightKg / maxW * 100)) : 0;
+                let wClass = 'w-normal';
+                let wLabel = '正常';
+                if (wState === 1) { wClass = 'w-warn'; wLabel = '临界'; }
+                else if (wState === 2) { wClass = 'w-over'; wLabel = '超重'; }
+
+                html += `
+                    <div class="car-card" onclick="location.href='control.html?car=${car.car_id}'">
+                        <div class="car-id">#${car.car_id}</div>
+                        <div class="car-floor-box">${pos}</div>
+                        <div class="car-arrow ${dir}">${dirChar}</div>
+                        <div class="car-info">
+                            <span><span class="label">状态</span> ${stateLabel(car.state)}</span>
+                            <span><span class="label">目标</span> ${target === '-' ? '-' : target + 'F'}</span>
+                            <span><span class="label">显示</span> ${car.display ?? '-'}</span>
+                            <span>
+                                <span class="label">门</span>
+                                <span class="door-badge ${door}">${doorLabel}</span>
+                            </span>
+                            <span class="weight-row">
+                                <span class="label">载重</span>
+                                <span class="weight-bar ${wClass}" title="${wLabel}">
+                                    <span class="weight-fill" style="width:${wPercent}%"></span>
+                                    <span class="weight-text">${weightKg}/${maxW}kg</span>
+                                </span>
+                            </span>
+                        </div>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
+        // ============================================================
+        //  渲染 - 建筑楼层图（顶部加 simple_internal_call 提示）
+        // ============================================================
+        function renderBuildingHint(data) {
+            const panel = document.querySelector('#buildingView').parentElement;
+            // 移除旧提示（防重复）
+            const oldHint = panel.querySelector('.building-hint');
+            if (oldHint) oldHint.remove();
+
+            // 拿不到 data 时不画提示（避免覆盖 loading 文案）
+            if (!data) return;
+
+            const algo = data.algorithm || 'simple_internal_call';
+            const isSingle = algo === 'simple_internal_call';
+            const hint = document.createElement('div');
+            hint.className = 'building-hint';
+            hint.innerHTML = isSingle
+                ? `调度算法: <b>${algo}</b> — 单车独立调度，外召需 PassengerManager 分配`
+                : `调度算法: <b>${algo}</b>`;
+            panel.insertBefore(hint, panel.firstChild);
+        }
+
+        function renderBuildingView(data) {
+            const container = document.getElementById('buildingView');
+            const cars = data.cars || [];
+            const maxFloor = 11;
+            const minFloor = 0;
+
+            if (cars.length === 0) {
+                container.innerHTML = '<div style="text-align:center;padding:10px;color:#888;">暂无数据</div>';
+                return;
+            }
+
+            // 计算每部车的楼层位置
+            const positions = cars.map(c => ({
+                id: c.car_id,
+                floor: c.position,
+                moving: c.direction !== 'idle' && c.direction !== undefined,
+                dir: c.direction || 'idle'
+            }));
+
+            let html = '<div class="building-scroll">';
+            for (let f = maxFloor; f >= minFloor; f--) {
+                const floorName = FLOOR_NAMES[f] || f + 'F';
+                html += `<div class="bldg-row">
+                    <div class="bldg-floor">${floorName}</div>
+                    <div class="bldg-shaft">`;
+
+                positions.forEach(car => {
+                    const hasCar = car.position === f;
+                    html += '<div class="shaft-cell">';
+                    if (hasCar) {
+                        const mvClass = car.moving ? 'mv' : '';
+                        html += `<div class="car-pos ${mvClass}">${car.id}</div>`;
+                    }
+                    html += '</div>';
+                });
+
+                html += '</div></div>';
+            }
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
+        // ============================================================
+        //  状态栏更新
+        // ============================================================
+        function updateStatusBar(data) {
+            const cars = data.cars || [];
+            document.getElementById('statusElevatorCount').textContent = `电梯: ${cars.length} 部`;
+            document.getElementById('statusLastUpdate').textContent =
+                `最后更新: ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+            document.getElementById('statusDataSize').textContent =
+                `数据: ${JSON.stringify(data).length} bytes`;
+        }
+
+        // ============================================================
+        //  模拟数据（后端不存在时演示用）
+        // ============================================================
+        function renderMockData() {
+            const mock = {
+                algorithm: 'simple_internal_call',
+                usermode: false,
+                simulate: true,
+                init_direction: 'down',
+                cars: [
+                    { car_id: 1, state: 'ready', position: 5, direction: 'up', door_state: 'closed', target_floor: 8, display: 5, human_presence: 0, weight_kg: 200, max_weight: 1000, weight_state: 0 },
+                    { car_id: 2, state: 'ready', position: 3, direction: 'down', door_state: 'opening', target_floor: 1, display: 3, human_presence: 1, weight_kg: 970, max_weight: 1000, weight_state: 1 },
+                    { car_id: 3, state: 'ready', position: 9, direction: 'idle', door_state: 'open', target_floor: 9, display: 9, human_presence: -1, weight_kg: 0, max_weight: 1000, weight_state: 0 },
+                    { car_id: 4, state: 'ready', position: 1, direction: 'up', door_state: 'closed', target_floor: 6, display: 1, human_presence: 0, weight_kg: 100, max_weight: 1000, weight_state: 0 },
+                    { car_id: 5, state: 'ready', position: 7, direction: 'down', door_state: 'closed', target_floor: 4, display: 7, human_presence: 0, weight_kg: 300, max_weight: 1000, weight_state: 0 },
+                    { car_id: 6, state: 'fault', position: 2, direction: 'idle', door_state: 'closed', target_floor: null, display: 2, human_presence: -1, weight_kg: 0, max_weight: 1000, weight_state: 0 },
+                ],
+                hall_calls: [
+                    { floor: 3, direction: 'up', active: true },
+                    { floor: 7, direction: 'down', active: false }
+                ],
+                system_time: Date.now() / 1000,
+                connected: true
+            };
+
+            document.getElementById('connectionBadge').className = 'connection-badge connecting';
+            document.getElementById('connectionBadge').textContent = '● 模拟数据';
+            document.getElementById('refreshStatus').textContent = '演示模式（模拟数据）';
+            addLogEntry('使用模拟数据展示（后端未连接）', 'warn');
+
+            renderDashboard(mock);
+            updateStatusBar(mock);
+        }
+
+        // ============================================================
+        //  工具栏操作
+        // ============================================================
+        function forceRefresh() {
+            fetchStattrak();
+        }
+
+        function minimizeWindow() {
+        }
+
+        function maximizeWindow() {
+        }
+
+        function showAbout() {
+            showDialog('aboutDialog');
+        }
+
+        function logout() {
+            showConfirm('确认注销退出？', function() {
+                sessionStorage.clear();
+                window.location.href = 'index.html';
+            });
+        }
+
+        /* ---- Win95 风格对话框 ---- */
+        function showDialog(id) {
+            document.getElementById(id).classList.remove('hidden');
+        }
+
+        function closeDialog(id) {
+            document.getElementById(id).classList.add('hidden');
+        }
+
+        let _confirmCb = null;
+        function showConfirm(msg, callback) {
+            document.getElementById('confirmMessage').textContent = msg;
+            _confirmCb = callback;
+            document.getElementById('confirmDialog').classList.remove('hidden');
+        }
+
+        function confirmYes() {
+            closeDialog('confirmDialog');
+            if (_confirmCb) _confirmCb();
+            _confirmCb = null;
+        }
+
+        // ============================================================
+        //  自动刷新
+        // ============================================================
+        function startAutoRefresh() {
+            fetchStattrak();
+            refreshTimer = setInterval(fetchStattrak, 3000);
+        }
+
+        // 页面可见时自动刷新，不可见时暂停
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                clearInterval(refreshTimer);
+            } else {
+                startAutoRefresh();
+            }
+        });
+
+        // ============================================================
+        //  启动
+        // ============================================================
+        startAutoRefresh();
+        addLogEntry('监控面板启动，等待后端数据...', 'info');
+    </script>
+</body>
+</html>

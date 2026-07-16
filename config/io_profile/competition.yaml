@@ -227,7 +227,7 @@ input:
       top_limit_2: I28.5
       bottom_limit_1: I28.6
       bottom_limit_2: I28.7
-  auto_run: I29.0
+  auto_run: I29.1
   word_per_car:
     '1':
       weight:

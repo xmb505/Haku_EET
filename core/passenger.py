@@ -236,19 +236,30 @@ class PassengerManager:
                 if car.position != floor:
                     continue
                 if car.door_state in (DoorState.OPEN, DoorState.OPENING):
-                    # 门已开/正在开 → 只亮灯 + 取消关门 cron
-                    self._pickup_active[cid][(floor, direction)] = True
-                    self._app.cars[cid].last_dispatch_direction = (
-                        Direction.UP if direction == 'up' else Direction.DOWN)
-                    # 外召有人呼叫 → human_presence 至少 0，开灯开风扇
-                    await self._ensure_lights_on(cid)
-                    await self._app.set_hall_indicator(floor, direction, True)
-                    # ★ 同层开门时亮方向灯（否则乘客看不到电梯要往哪个方向）
-                    await self._app.executors[cid].motor.set_direction_indicator(direction)
-                    await self._app.cron.cancel(
-                        self._close_door_job_name(cid))
-                    self._log_stderr(f'[hall_call] {direction}@L{floor} → car{cid} door open, keep LED + cancel cron')
-                    return
+                    # 门已开:检查方向冲突——若车正在上行(有上方待响应外呼/内召)
+                    # 且外呼是 down@当前层,不应拦截(让 dispatch 派其他车),
+                    # 否则同层反向乘客等死
+                    has_pickup_above = any(
+                        f > floor for (f, d), a in self._pickup_active[cid].items() if a)
+                    has_pickup_below = any(
+                        f < floor for (f, d), a in self._pickup_active[cid].items() if a)
+                    if (direction == 'down' and has_pickup_above
+                            and not has_pickup_below):
+                        # 车要上行(只有上方请求),下行的同层外呼不拦截
+                        pass
+                    elif (direction == 'up' and has_pickup_below
+                          and not has_pickup_above):
+                        # 车要下行(只有下方请求),上行的同层外呼不拦截
+                        pass
+                    else:
+                        # 方向无冲突→走快捷路径:只亮灯,不 cancel 关门 cron
+                        self._pickup_active[cid][(floor, direction)] = True
+                        self._app.cars[cid].last_dispatch_direction = (
+                            Direction.UP if direction == 'up' else Direction.DOWN)
+                        await self._ensure_lights_on(cid)
+                        await self._app.set_hall_indicator(floor, direction, True)
+                        self._log_stderr(f'[hall_call] {direction}@L{floor} → car{cid} door open, keep LED')
+                        return
                 elif car.door_state == DoorState.CLOSING:
                     # 门正在关 → 亮灯 + 取消关门 cron + 中断关门 + 重新开门
                     self._pickup_active[cid][(floor, direction)] = True
@@ -256,8 +267,6 @@ class PassengerManager:
                         Direction.UP if direction == 'up' else Direction.DOWN)
                     await self._ensure_lights_on(cid)
                     await self._app.set_hall_indicator(floor, direction, True)
-                    # ★ 同层关门中重开时也亮方向灯
-                    await self._app.executors[cid].motor.set_direction_indicator(direction)
                     await self._app.cron.cancel(
                         self._close_door_job_name(cid))
                     # ★ 中断当前 CLOSE_DOOR 动作，让 executor 立即处理 OPEN_DOOR
@@ -277,6 +286,16 @@ class PassengerManager:
                 await self._app.set_hall_indicator(floor, direction, True)
                 # 记住这个待派请求
                 self._pending_hall_calls.add((floor, direction))
+                # 立即尝试用刚空闲的车派待派请求（不等到 _on_door_closed）
+                for cid in self._app.car_ids:
+                    car = self._app.cars[cid]
+                    if (car.state == CarState.READY
+                            and car.direction == Direction.IDLE
+                            and car.door_state == DoorState.CLOSED
+                            and car.position is not None):
+                        # 有空闲车，尝试派一个待派外呼
+                        await self._try_dispatch_pending_hall_calls(cid)
+                        break
                 # 诊断信息：列出每部车被过滤的原因,帮助现场排查
                 # (例:门开着 / 手动模式 / 未初始化 / 位置未知)
                 for cid in self._app.car_ids:

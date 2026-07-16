@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EET 电梯控制系统 - 控制面板</title>
+    <link rel="stylesheet" href="win95.css">
+    <style>
+        body { background: #008080; }
+
+        .main-window {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            border: none;
+            box-shadow: none;
+            background: var(--win-gray);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .ctrl-body {
+            flex: 1;
+            padding: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            overflow-y: auto;
+        }
+
+        .ctrl-top {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .ctrl-panel {
+            border: 2px solid;
+            border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+            background: var(--win-gray);
+            flex: 1;
+            min-width: 240px;
+        }
+
+        .ctrl-panel .panel-head {
+            background: var(--win-title);
+            color: white;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 2px 6px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .ctrl-panel .panel-body {
+            padding: 6px;
+        }
+
+        .car-selector {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+
+        .car-selector select {
+            min-width: 120px;
+        }
+
+        #carStatus {
+            font-size: 11px;
+            color: #666;
+            flex: 1;
+        }
+
+        /* 楼层按钮网格 */
+        .car-call-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 4px;
+        }
+
+        .car-call-grid .floor-btn {
+            height: 36px;
+            font-size: 13px;
+            font-weight: bold;
+            min-width: unset;
+            padding: 0;
+        }
+
+        .car-call-grid .floor-btn.pressed {
+            border-color: var(--win-dark) var(--win-light) var(--win-light) var(--win-dark);
+            padding: 1px 0 0 1px;
+            background: #ffffcc;
+        }
+
+        /* 外召 */
+        .hall-call-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 3px;
+        }
+
+        .hall-call-grid .hall-btn {
+            height: 30px;
+            font-size: 11px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            padding: 0 4px;
+            min-width: unset;
+        }
+
+        .hall-btn .h-arrow { font-size: 14px; font-weight: bold; }
+        .hall-btn.up .h-arrow { color: #00aa00; }
+        .hall-btn.down .h-arrow { color: #cc0000; }
+        .hall-btn.active { background: #ffffcc; }
+
+        /* 控制行 */
+        .ctrl-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+            flex-wrap: wrap;
+        }
+
+        /* 模块 / 调试面板 */
+        .module-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 6px 12px;
+        }
+
+        .module-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11px;
+        }
+
+        .module-label {
+            flex: 1;
+            color: #000;
+        }
+
+        .module-row select {
+            min-width: 130px;
+        }
+
+        .door-buttons {
+            display: flex;
+            gap: 4px;
+        }
+
+        .door-buttons button {
+            min-width: 60px;
+        }
+
+        .cmd-btn { min-width: 70px; }
+
+        /* 响应区 */
+        .response-area {
+            margin-top: 6px;
+        }
+
+        .response-box {
+            background: #fff;
+            border: 2px solid;
+            border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
+            font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
+            font-size: 11px;
+            padding: 4px;
+            height: 80px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .response-box .r-ok { color: #008000; }
+        .response-box .r-err { color: #cc0000; }
+        .response-box .r-info { color: #000080; }
+        .response-box .r-time { color: #999; }
+
+        .command-history {
+            max-height: 100px;
+            overflow-y: auto;
+        }
+
+        .history-item {
+            font-size: 10px;
+            padding: 1px 4px;
+            border-bottom: 1px solid #eee;
+            font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
+        }
+
+        .history-item .h-time { color: #999; }
+        .history-item .h-body { color: #333; }
+        .history-item .h-ok { color: #008000; }
+        .history-item .h-err { color: #cc0000; }
+    </style>
+</head>
+<body>
+    <div class="main-window">
+        <!-- 标题栏 -->
+        <div class="title-bar">
+            <span class="title-bar-text">EET 电梯控制面板 — [ 手动操控 ]</span>
+            <div class="title-bar-controls">
+                <button class="title-btn close" onclick="location.href='dashboard.html'">←</button>
+            </div>
+        </div>
+
+        <!-- 菜单栏 -->
+        <div class="menu-bar">
+            <span class="menu-item" onclick="showCtrlHelp()">操作说明(H)</span>
+            <span class="menu-item" onclick="location.href='dashboard.html'">监控面板(D)</span>
+            <span class="menu-item" onclick="clearHistory()">清除历史(C)</span>
+            <span class="menu-item" onclick="quickTest()">自检(T)</span>
+        </div>
+
+        <!-- 工具栏 -->
+        <div class="toolbar">
+            <span id="ctrlConnection" class="connection-badge disconnected">● 未连接</span>
+            <div class="separator"></div>
+            <span style="font-size:11px;" id="ctrlStatusText">就绪</span>
+        </div>
+
+        <!-- 主体 -->
+        <div class="ctrl-body">
+            <!-- 电梯选择 -->
+            <div class="ctrl-panel" style="flex:none;">
+                <div class="panel-head"> 选择电梯</div>
+                <div class="panel-body">
+                    <div class="car-selector">
+                        <label>当前电梯：</label>
+                        <select id="carSelect" onchange="onCarChange()">
+                            <option value="1">电梯 #1</option>
+                            <option value="2">电梯 #2</option>
+                            <option value="3">电梯 #3</option>
+                            <option value="4">电梯 #4</option>
+                            <option value="5">电梯 #5</option>
+                            <option value="6">电梯 #6</option>
+                        </select>
+                        <span id="carStatus">—</span>
+                        <button class="btn-sm" onclick="refreshCarStatus()">刷新状态</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="ctrl-top">
+                <!-- 内召按钮 -->
+                <div class="ctrl-panel">
+                    <div class="panel-head"> 内召按钮（轿厢内选层）</div>
+                    <div class="panel-body">
+                        <div class="car-call-grid" id="carCallGrid">
+                            <!-- 由 JS 生成 -->
+                        </div>
+                        <div style="font-size:10px;color:#888;margin-top:4px;">
+                            点击楼层按钮模拟内召，多次点击可叠加
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 外召按钮 -->
+                <div class="ctrl-panel">
+                    <div class="panel-head"> 外召按钮（厅外召唤）</div>
+                    <div class="panel-body">
+                        <div class="hall-call-grid" id="hallCallGrid">
+                            <!-- 由 JS 生成 -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 门控制 + 系统命令 -->
+            <div class="ctrl-top">
+                <div class="ctrl-panel">
+                    <div class="panel-head"> 门控制</div>
+                    <div class="panel-body">
+                        <div class="ctrl-row">
+                            <div class="door-buttons">
+                                <button class="cmd-btn" onclick="sendDoorCmd('open')">开门</button>
+                                <button class="cmd-btn" onclick="sendDoorCmd('close')">关门</button>
+                            </div>
+                        </div>
+                        <div style="font-size:10px;color:#888;margin-top:4px;">
+                            强制开门 / 关门请使用“初始化定位”后的手动模式
+                        </div>
+                    </div>
+                </div>
+
+                <div class="ctrl-panel">
+                    <div class="panel-head"> 系统命令</div>
+                    <div class="panel-body">
+                        <div class="ctrl-row">
+                            <button class="cmd-btn" onclick="sendSysCmd('init_all')">↻ 全部初始化</button>
+                            <button class="cmd-btn" onclick="sendSysCmd('emergency_stop')" style="background:#cc0000;color:#fff;">! 急停</button>
+                            <button class="cmd-btn" onclick="sendSysCmd('clear_outputs')">■ 清输出</button>
+                            <button class="cmd-btn" onclick="sendSysCmd('reload_config')">⟳ 热加载</button>
+                        </div>
+                        <div style="font-size:10px;color:#888;margin-top:4px;">
+                            对应 REPL: /car all init down | /car all stop | /clear | /reload
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模块 / 调试 -->
+            <div class="ctrl-panel">
+                <div class="panel-head"> 模块 / 调试</div>
+                <div class="panel-body">
+                    <div class="module-grid">
+                        <label class="module-row">
+                            <span class="module-label">用户模式</span>
+                            <select id="modUsermode" onchange="sendModuleCmd('usermode', this.value)">
+                                <option value="false">关（仅手动）</option>
+                                <option value="true">开（大脑接客）</option>
+                            </select>
+                        </label>
+                        <label class="module-row">
+                            <span class="module-label">站点吸附</span>
+                            <select id="modStationSeek" onchange="sendModuleCmd('station_seek', this.value)">
+                                <option value="false">关（默认）</option>
+                                <option value="true">开（到站反冲）</option>
+                            </select>
+                        </label>
+                        <label class="module-row">
+                            <span class="module-label">队列模式</span>
+                            <select id="modQueueMode" onchange="sendModuleCmd('queue', this.value)">
+                                <option value="discard">discard（过站丢弃）</option>
+                                <option value="keep">keep（全部保留）</option>
+                            </select>
+                        </label>
+                        <label class="module-row">
+                            <span class="module-label">低速刹车档位 (0-7)</span>
+                            <select id="modSlowBrake" onchange="sendModuleCmd('slow_brake', this.value)">
+                                <option value="0">0（不叠加）</option>
+                                <option value="1">1</option>
+                                <option value="2">2</option>
+                                <option value="3">3</option>
+                                <option value="4" selected>4（默认）</option>
+                                <option value="5">5</option>
+                                <option value="6">6</option>
+                                <option value="7">7（全刹）</option>
+                            </select>
+                        </label>
+                        <label class="module-row">
+                            <span class="module-label">手动模式</span>
+                            <select id="modManualMode" onchange="sendModuleCmd('manual', this.value)">
+                                <option value="">不切换</option>
+                                <option value="enter">进入手动</option>
+                                <option value="exit">退出手动</option>
+                            </select>
+                        </label>
+                    </div>
+                    <div style="font-size:10px;color:#888;margin-top:4px;">
+                        对应 REPL: /usermode | /module station_seek | /module queue | /settings slow_brake | /car N manual
+                    </div>
+                </div>
+            </div>
+
+            <!-- 手动指令输入 -->
+            <div class="ctrl-panel">
+                <div class="panel-head"> 自定义指令</div>
+                <div class="panel-body">
+                    <div class="ctrl-row">
+                        <input type="text" id="customCmd" placeholder='例如: {"command": "car_call", "floor": 5}' style="flex:1; font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace; font-size: 11px;">
+                        <button onclick="sendCustomCmd()">发送</button>
+                    </div>
+                    <div style="font-size:10px; color:#888;">
+                        格式: JSON 对象，支持 car_call / hall_call / door / system 等指令
+                    </div>
+                </div>
+            </div>
+
+            <!-- 响应日志 -->
+            <div class="ctrl-panel">
+                <div class="panel-head"> 命令响应</div>
+                <div class="panel-body">
+                    <div class="response-area">
+                        <div class="response-box" id="responseBox">
+                            <div class="r-info">系统就绪，等待发送命令...</div>
+                        </div>
+                    </div>
+                    <div style="margin-top:4px;">
+                        <span style="font-size:11px; font-weight:bold;">历史记录</span>
+                        <button class="btn-sm" style="float:right;" onclick="clearResponse()">清空</button>
+                    </div>
+                    <div class="command-history" id="cmdHistory"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 状态栏 -->
+        <div class="status-bar">
+            <div class="status-bar-item" id="ctrlStatusElevator">当前: 未选择</div>
+            <div class="status-bar-item" id="ctrlStatusCount">已发送: 0 条</div>
+            <div class="status-bar-item" id="ctrlStatusOk">成功: 0</div>
+            <div class="status-bar-item" id="ctrlStatusErr">失败: 0</div>
+            <div class="status-bar-item grip"></div>
+        </div>
+    </div>
+
+    <script>
+        // ============================================================
+        //  全局状态
+        // ============================================================
+        const API_BASE = '';
+        let cmdCount = 0, cmdOk = 0, cmdErr = 0;
+        let activeCarCalls = new Set();
+        let activeHallCalls = {};
+
+        // ============================================================
+        //  登录校验
+        // ============================================================
+        if (!sessionStorage.getItem('eet_login')) {
+            window.location.href = 'index.html';
+        }
+
+        // ============================================================
+        //  URL 参数读取（从监控面板跳转时可携带 car 参数）
+        // ============================================================
+        function getUrlParam(name) {
+            const params = new URLSearchParams(window.location.search);
+            return params.get(name);
+        }
+
+        // ============================================================
+        //  初始化
+        // ============================================================
+        function init() {
+            generateCarCallGrid();
+            generateHallCallGrid();
+
+            const carParam = getUrlParam('car');
+            if (carParam !== null) {
+                document.getElementById('carSelect').value = carParam;
+            }
+
+            onCarChange();
+            checkBackend();
+        }
+
+        // ============================================================
+        //  生成内召按钮
+        // ============================================================
+        function generateCarCallGrid() {
+            const grid = document.getElementById('carCallGrid');
+            // 楼层从 B1(0) 到 10F
+            const floors = [];
+            for (let i = 10; i >= 0; i--) {
+                floors.push(i);
+            }
+
+            let html = '';
+            floors.forEach(f => {
+                const label = f === 0 ? 'B1' : f;
+                html += `<button class="floor-btn btn-sm" data-floor="${f}" onclick="sendCarCall(${f}, this)">${label}</button>`;
+            });
+            grid.innerHTML = html;
+        }
+
+        // ============================================================
+        //  生成外召按钮
+        // ============================================================
+        function generateHallCallGrid() {
+            const grid = document.getElementById('hallCallGrid');
+            let html = '';
+            // 外召从 1F 到 10F，每个楼层有上/下两个方向
+            // 1F 只有上，顶楼只有下
+            for (let f = 10; f >= 1; f--) {
+                const label = f === 0 ? 'B1' : f + 'F';
+                if (f < 10) {
+                    html += `<button class="hall-btn up btn-sm" data-floor="${f}" data-dir="1" onclick="sendHallCall(${f}, 1, this)">
+                        <span class="h-arrow">▲</span> ${label}
+                    </button>`;
+                } else {
+                    html += `<button class="btn-sm" disabled style="visibility:hidden;"></button>`;
+                }
+                if (f > 1) {
+                    html += `<button class="hall-btn down btn-sm" data-floor="${f}" data-dir="-1" onclick="sendHallCall(${f}, -1, this)">
+                        <span class="h-arrow">▼</span> ${label}
+                    </button>`;
+                } else {
+                    html += `<button class="btn-sm" disabled style="visibility:hidden;"></button>`;
+                }
+            }
+            grid.innerHTML = html;
+        }
+
+        // ============================================================
+        //  获取当前选中的电梯 ID
+        // ============================================================
+        function getSelectedCar() {
+            return parseInt(document.getElementById('carSelect').value);
+        }
+
+        // ============================================================
+        //  电梯切换
+        // ============================================================
+        function onCarChange() {
+            const carId = getSelectedCar();
+            document.getElementById('carStatus').textContent = `当前操控电梯 #${carId}`;
+            document.getElementById('ctrlStatusElevator').textContent = `当前: 电梯 #${carId}`;
+            // 清除高亮
+            document.querySelectorAll('.car-call-grid .floor-btn.pressed').forEach(el => {
+                el.classList.remove('pressed');
+            });
+            refreshCarStatus();
+        }
+
+        // ============================================================
+        //  后端状态检测
+        // ============================================================
+        async function checkBackend() {
+            try {
+                const resp = await fetch(`${API_BASE}/stattrak`, {
+                    signal: AbortSignal.timeout(3000)
+                });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    document.getElementById('ctrlConnection').className = 'connection-badge connected';
+                    document.getElementById('ctrlConnection').textContent = '● 已连接';
+                    document.getElementById('ctrlStatusText').textContent = '后端在线';
+                    addResponse('后端连接成功', 'r-ok');
+                    // 同步内召状态
+                    syncCarCalls(data);
+                }
+            } catch (e) {
+                document.getElementById('ctrlConnection').className = 'connection-badge disconnected';
+                document.getElementById('ctrlConnection').textContent = '● 未连接';
+                document.getElementById('ctrlStatusText').textContent = '离线模式（仅演示）';
+            }
+        }
+
+        // ============================================================
+        //  刷新电梯状态
+        // ============================================================
+        async function refreshCarStatus() {
+            try {
+                const resp = await fetch(`${API_BASE}/stattrak`, {
+                    signal: AbortSignal.timeout(3000)
+                });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    syncCarCalls(data);
+                }
+            } catch (e) {
+                // 忽略
+            }
+        }
+
+        function syncCarCalls(data) {
+            const cars = data.cars || [];
+            const carId = getSelectedCar();
+            const car = cars.find(c => c.car_id === carId);
+            if (car) {
+                const pos = car.position !== undefined ? car.position : '?';
+                const dir = car.direction || 'idle';
+                const dirChar = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '◆';
+                const door = car.door_state || 'closed';
+                const doorLabel = door === 'open' ? '开门' : door === 'opening' ? '开门中' : door === 'closing' ? '关门中' : '关门';
+                document.getElementById('carStatus').textContent =
+                    `当前位置: ${pos}F | 方向: ${dirChar} | 门: ${doorLabel}`;
+            }
+        }
+
+        // ============================================================
+        //  API 调用 - 发送命令到 /control
+        // ============================================================
+        async function sendCommand(payload) {
+            cmdCount++;
+            updateCmdStats();
+
+            try {
+                const resp = await fetch(`${API_BASE}/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: AbortSignal.timeout(5000)
+                });
+
+                let result;
+                try {
+                    result = await resp.json();
+                } catch (e) {
+                    result = { status: resp.ok ? 'ok' : 'error', http: resp.status };
+                }
+
+                const resultStr = JSON.stringify(result, null, 2);
+                if (resp.ok) {
+                    cmdOk++;
+                    addResponse(`OK 成功: ${resultStr}`, 'r-ok');
+                    addHistory(payload, result, true);
+                } else {
+                    cmdErr++;
+                    addResponse(`[X] 失败 (HTTP ${resp.status}): ${resultStr}`, 'r-err');
+                    addHistory(payload, result, false);
+                }
+
+                updateCmdStats();
+                return result;
+            } catch (err) {
+                cmdErr++;
+                updateCmdStats();
+                const errMsg = `[X] 请求失败: ${err.message}`;
+                addResponse(errMsg, 'r-err');
+                addHistory(payload, { error: err.message }, false);
+
+                // 离线演示模式 — 模拟成功
+                if (!navigator.onLine || err.name === 'TypeError') {
+                    addResponse('! 离线模式 — 模拟命令已发送', 'r-warn');
+                    return { status: 'ok', simulated: true };
+                }
+                return { status: 'error', message: err.message };
+            }
+        }
+
+        // ============================================================
+        //  内召发送
+        // ============================================================
+        function sendCarCall(floor, btnEl) {
+            const carId = getSelectedCar();
+            const payload = {
+                elevator_id: carId,
+                command: 'car_call',
+                floor: floor
+            };
+
+            // 视觉反馈
+            btnEl.classList.toggle('pressed');
+
+            addResponse(`>> 内召: 电梯 #${carId} → ${floor}F`, 'r-info');
+            sendCommand(payload);
+        }
+
+        // ============================================================
+        //  外召发送
+        // ============================================================
+        function sendHallCall(floor, direction, btnEl) {
+            const payload = {
+                command: 'hall_call',
+                floor: floor,
+                direction: direction
+            };
+
+            btnEl.classList.toggle('active');
+
+            const dirStr = direction > 0 ? '上行' : '下行';
+            addResponse(`>> 外召: ${floor}F ${dirStr}`, 'r-info');
+            sendCommand(payload);
+        }
+
+        // ============================================================
+        //  门控制（对齐项目 /door N open|close）
+        // ============================================================
+        function sendDoorCmd(action) {
+            const carId = getSelectedCar();
+            if (action !== 'open' && action !== 'close') {
+                addResponse('[X] 门动作只能是 open / close', 'r-err');
+                return;
+            }
+            const payload = {
+                elevator_id: carId,
+                command: 'door',
+                action: action
+            };
+            const actionNames = { open: '开门', close: '关门' };
+            addResponse(`>> 门控制: 电梯 #${carId} ${actionNames[action]}`, 'r-info');
+            sendCommand(payload);
+        }
+
+        // ============================================================
+        //  系统命令（对齐项目 REPL 命令）
+        //   init_all       → /car all init down
+        //   emergency_stop → /car all stop
+        //   clear_outputs  → /clear
+        //   reload_config  → /reload
+        // ============================================================
+        const SYS_CMD_MAP = {
+            init_all:       { command: 'system', action: 'init_all',       label: '全部初始化' },
+            emergency_stop: { command: 'system', action: 'emergency_stop', label: '紧急停止' },
+            clear_outputs:  { command: 'system', action: 'clear_outputs',  label: '清所有输出' },
+            reload_config:  { command: 'system', action: 'reload_config',  label: '热加载配置' }
+        };
+
+        function sendSysCmd(action) {
+            const meta = SYS_CMD_MAP[action];
+            if (!meta) {
+                addResponse(`[X] 未知系统命令: ${action}`, 'r-err');
+                return;
+            }
+
+            // 急停需要二次确认（Win95 风格对话框，不调用浏览器 confirm()）
+            if (action === 'emergency_stop') {
+                showEmergencyConfirm(() => doSysCmd(meta));
+                return;
+            }
+
+            doSysCmd(meta);
+        }
+
+        function doSysCmd(meta) {
+            addResponse(`>> 系统命令: ${meta.label}`, 'r-info');
+            sendCommand(meta);
+        }
+
+        // ============================================================
+        //  模块/调试命令（对齐项目 REPL）
+        //   usermode       → /usermode true/false
+        //   station_seek   → /module station_seek on/off
+        //   queue          → /module queue discard/keep
+        //   slow_brake     → /settings slow_brake <0-7>
+        //   manual         → /car N manual (enter) / ESC (exit)
+        // ============================================================
+        function sendModuleCmd(kind, value) {
+            if (value === '' || value === null) return; // 占位项
+
+            const carId = getSelectedCar();
+            let payload, label;
+
+            switch (kind) {
+                case 'usermode':
+                    payload = { command: 'module', action: 'usermode', value: value === 'true' };
+                    label = `用户模式: ${value === 'true' ? '开' : '关'}`;
+                    break;
+                case 'station_seek':
+                    payload = { command: 'module', action: 'station_seek', value: value === 'true' };
+                    label = `站点吸附: ${value === 'true' ? '开' : '关'}`;
+                    break;
+                case 'queue':
+                    payload = { command: 'module', action: 'queue', mode: value };
+                    label = `队列模式: ${value}`;
+                    break;
+                case 'slow_brake':
+                    payload = { command: 'settings', key: 'slow_brake', value: parseInt(value) };
+                    label = `低速刹车档位: ${value}`;
+                    break;
+                case 'manual':
+                    payload = { command: 'car', action: 'manual', elevator_id: carId, sub_action: value };
+                    label = `手动模式 [电梯 #${carId}]: ${value === 'enter' ? '进入' : '退出'}`;
+                    break;
+                default:
+                    addResponse(`[X] 未知模块命令: ${kind}`, 'r-err');
+                    return;
+            }
+
+            addResponse(`>> ${label}`, 'r-info');
+            sendCommand(payload);
+        }
+
+        // ============================================================
+        //  自定义 JSON 命令
+        // ============================================================
+        function sendCustomCmd() {
+            const input = document.getElementById('customCmd');
+            const raw = input.value.trim();
+            if (!raw) {
+                addResponse('[X] 请输入 JSON 命令', 'r-err');
+                return;
+            }
+
+            try {
+                const payload = JSON.parse(raw);
+                addResponse(`>> 自定义: ${raw}`, 'r-info');
+                sendCommand(payload);
+                input.value = '';
+            } catch (e) {
+                addResponse(`[X] JSON 解析错误: ${e.message}`, 'r-err');
+            }
+        }
+
+        // ============================================================
+        //  快速自检
+        // ============================================================
+        function quickTest() {
+            addResponse('>> 开始系统自检...', 'r-info');
+
+            // 依次发送几个测试命令
+            setTimeout(() => {
+                sendCommand({ command: 'system', action: 'status' }).then(r => {
+                    if (r && r.status === 'ok') {
+                        addResponse('[OK] 自检完成 — 系统运行正常', 'r-ok');
+                    } else {
+                        addResponse('[!] 自检完成 — 部分功能不可用（离线模式）', 'r-warn');
+                    }
+                });
+            }, 300);
+        }
+
+        // ============================================================
+        //  帮助信息
+        // ============================================================
+        function showCtrlHelp() {
+            showDialog('helpDialog');
+        }
+
+
+        // ============================================================
+        //  命令响应区
+        // ============================================================
+        function addResponse(msg, className = '') {
+            const box = document.getElementById('responseBox');
+            const now = new Date();
+            const time = now.toLocaleTimeString('zh-CN', { hour12: false });
+            const entry = document.createElement('div');
+            entry.className = className || '';
+            entry.innerHTML = `<span class="r-time">[${time}]</span> ${msg}`;
+            box.appendChild(entry);
+            box.scrollTop = box.scrollHeight;
+            if (box.children.length > 50) box.removeChild(box.firstChild);
+        }
+
+        function clearResponse() {
+            const box = document.getElementById('responseBox');
+            box.innerHTML = '<div class="r-info">已清空</div>';
+        }
+
+        // ============================================================
+        //  命令历史
+        // ============================================================
+        function addHistory(payload, result, success) {
+            const container = document.getElementById('cmdHistory');
+            const now = new Date();
+            const time = now.toLocaleTimeString('zh-CN', { hour12: false });
+            const div = document.createElement('div');
+            div.className = 'history-item';
+            const statusClass = success ? 'h-ok' : 'h-err';
+            div.innerHTML = `<span class="h-time">[${time}]</span> <span class="${statusClass}">${success ? 'OK' : 'ERR'}</span> ` +
+                `<span class="h-body">${JSON.stringify(payload)}</span>`;
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+            if (container.children.length > 50) container.removeChild(container.firstChild);
+        }
+
+        function clearHistory() {
+            document.getElementById('cmdHistory').innerHTML = '';
+            addResponse('历史记录已清除', 'r-info');
+        }
+
+        // ============================================================
+        //  状态统计
+        // ============================================================
+        function updateCmdStats() {
+            document.getElementById('ctrlStatusCount').textContent = `已发送: ${cmdCount} 条`;
+            document.getElementById('ctrlStatusOk').textContent = `成功: ${cmdOk}`;
+            document.getElementById('ctrlStatusErr').textContent = `失败: ${cmdErr}`;
+        }
+
+        // ============================================================
+        //  键盘快捷键
+        // ============================================================
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                const active = document.activeElement;
+                if (active && active.id === 'customCmd') {
+                    sendCustomCmd();
+                }
+            }
+            if (e.key === 'Escape') {
+                document.getElementById('customCmd').blur();
+            }
+        });
+
+        // ============================================================
+        //  启动
+        // ============================================================
+        init();
+    </script>
+
+    <!-- Win95 紧急停止确认对话框 -->
+    <div class="dialog-overlay hidden" id="emergencyConfirmDialog">
+        <div class="dialog-box" style="width: 320px;">
+            <div class="title-bar">
+                <span class="title-bar-text">确认紧急停止</span>
+                <div class="title-bar-controls">
+                    <button class="title-btn close" onclick="cancelEmergency()">✕</button>
+                </div>
+            </div>
+            <div class="dialog-body">
+                <div style="display:flex;align-items:center;gap:12px;">
+                    <span style="font-size:32px;color:#cc0000;font-weight:bold;">!</span>
+                    <span>将对全部 6 部电梯执行紧急停止。此操作不可撤销。</span>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button onclick="confirmEmergency()">确定</button>
+                <button onclick="cancelEmergency()">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Win95 帮助对话框 -->
+    <div class="dialog-overlay hidden" id="helpDialog">
+        <div class="dialog-box" style="width: 360px;">
+            <div class="title-bar">
+                <span class="title-bar-text">操作说明</span>
+                <div class="title-bar-controls">
+                    <button class="title-btn close" onclick="closeDialog('helpDialog')">✕</button>
+                </div>
+            </div>
+            <div class="dialog-body">
+                <div style="border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:8px;">
+                    <b>EET 电梯控制面板 — 操作说明</b>
+                </div>
+                <div style="font-size:12px;line-height:1.8;">
+                    <div>1. 内召：点击对应楼层按钮，模拟轿厢内选层</div>
+                    <div>2. 外召：点击上下箭头按钮，模拟厅外召唤</div>
+                    <div>3. 门控制：开门 / 关门 / 停止门</div>
+                    <div>4. 系统命令：启动 / 停止 / 急停 / 复位</div>
+                    <div>5. 自定义指令：直接输入 JSON 发送到后端</div>
+                </div>
+                <div style="border-top:1px solid #ccc;padding-top:8px;margin-top:8px;font-size:11px;color:#666;">
+                    <div>POST /control — 控制接口</div>
+                    <div>GET /stattrak — 数据接口</div>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button onclick="closeDialog('helpDialog')">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    /* ---- Win95 风格对话框 ---- */
+    function showDialog(id) {
+        document.getElementById(id).classList.remove('hidden');
+    }
+    function closeDialog(id) {
+        document.getElementById(id).classList.add('hidden');
+    }
+
+    // ============================================================
+    //  紧急停止二次确认（Win95 风格）
+    // ============================================================
+    let _emergencyConfirmCb = null;
+    function showEmergencyConfirm(onConfirm) {
+        _emergencyConfirmCb = onConfirm;
+        showDialog('emergencyConfirmDialog');
+    }
+    function confirmEmergency() {
+        const cb = _emergencyConfirmCb;
+        _emergencyConfirmCb = null;
+        closeDialog('emergencyConfirmDialog');
+        if (typeof cb === 'function') cb();
+    }
+    function cancelEmergency() {
+        _emergencyConfirmCb = null;
+        closeDialog('emergencyConfirmDialog');
+    }
+    </script>
+</body>
+</html>

@@ -158,6 +158,13 @@ def _init_all_cars(app, pos=1):
     for cid in app.car_ids:
         app.cars[cid].state = CarState.READY
         app.cars[cid].position = pos
+    # 设置平层信号为 1（OPEN_DOOR 平层校验需要）
+    for cid in app.car_ids:
+        try:
+            app.io.observe_input(app.mapper.addr_input('level_up', cid), 1)
+            app.io.observe_input(app.mapper.addr_input('level_down', cid), 1)
+        except KeyError:
+            pass
 
 
 class TestPassengerManagerHallCall:

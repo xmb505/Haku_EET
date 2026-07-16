@@ -146,6 +146,7 @@ class App:
                 self.cars[cid].weight_threshold_kg = int(
                     w_cfg.get('max_weight', 0) * w_cfg.get('threshold', 0.95)
                 )
+                self.cars[cid].adc_full_scale_kg = w_cfg.get('adc_full_scale_kg', 0)
             self.action_queues[cid] = ActionQueue()
             self.pending_calls[cid] = []
             self.manual_mode[cid] = False
@@ -216,6 +217,9 @@ class App:
         # 用 bool 标志即可:asyncio 是协作式调度,await done_event.wait()
         # 期间事件循环可调度其他 coroutine,但其他 /door 调用会看到 busy=True 而退出。
         self._door_busy: dict[int, bool] = {cid: False for cid in self.car_ids}
+        # 是否在终端打印 UI 事件（外呼/轿内按钮等）。默认关
+        # 日志文件始终记录，不受此标志影响
+        self._print_ui_events: bool = False
 
         self._executor_task: asyncio.Task | None = None
         self.debug = False
@@ -335,6 +339,15 @@ class App:
             self._log_tee.close()
 
     # ===== IO 事件路由（按 car_id） =====
+
+    def _log_ui(self, msg: str) -> None:
+        """记录 UI 事件到日志文件，终端受 _print_ui_events 控制"""
+        if hasattr(self, '_log_file') and hasattr(self._log_file, 'write'):
+            self._log_file.write(msg + '\n')
+            self._log_file.flush()
+        if self._print_ui_events and hasattr(self, '_original_stderr'):
+            self._original_stderr.write(msg + '\n')
+            self._original_stderr.flush()
 
     async def _on_io_event(self, event: IOEvent) -> None:
         """IO 变化事件 → 查找归属轿厢 → 交给对应 executor"""
@@ -498,8 +511,7 @@ class App:
             return  # 无变化，跳过
         self._hall_call_last_state[key] = event.bit
         label = '按下' if event.bit else '松开'
-        sys.stderr.write(f'[io] 外呼 {direction}@L{floor} {label}\n')
-        sys.stderr.flush()
+        self._log_ui(f'[io] 外呼 {direction}@L{floor} {label}')
         await self.pm.on_hall_call(floor, direction, event.bit)
 
     async def _on_cabin_button_event(self, event: IOEvent) -> None:
@@ -516,15 +528,13 @@ class App:
 
         if event.bit == 1:
             # 内召按下 = 确定有人 → 设为 1
-            sys.stderr.write(f'[io] car{cid} 轿内按钮 L{floor} 按下\n')
-            sys.stderr.flush()
+            self._log_ui(f'[io] car{cid} 轿内按钮 L{floor} 按下')
             self.cars[cid].human_presence = 1
             await self.cron.cancel(self.pm._lights_off_job_name(cid))
             await self.ui[cid].set_cabin_button_led(floor, True)
             await self.pm.on_cabin_button(cid, floor)
         else:
-            sys.stderr.write(f'[io] car{cid} 轿内按钮 L{floor} 松开\n')
-            sys.stderr.flush()
+            self._log_ui(f'[io] car{cid} 轿内按钮 L{floor} 松开')
             # 内召松开：若按钮楼层 == 当前楼层 → 灭灯
             # （不在当前楼层的灯由 on_door_opened 到站时统一灭）
             car = self.cars[cid]
@@ -542,8 +552,7 @@ class App:
         if signal_name not in ('door_open_button', 'door_close_button'):
             return
         label = '按下' if event.bit else '松开'
-        sys.stderr.write(f'[io] car{cid} {signal_name} {label}\n')
-        sys.stderr.flush()
+        self._log_ui(f'[io] car{cid} {signal_name} {label}')
         # H3 钩子:开门按钮按下时更新重量状态
         if signal_name == 'door_open_button' and event.bit == 1:
             await self.weight_manager.on_door_open_button_pressed(cid)
@@ -971,6 +980,17 @@ class App:
         tf = target_floor if target_floor is not None else 1
         action = Action(ActionKind.INITIALIZE, floor=tf)
         await self.action_queues[cid].put(action)
+
+    def _get_car_init_config(self, car_id: int) -> tuple[str, int]:
+        """获取指定轿厢的初始化配置（方向 + 目标层）
+
+        优先读 per_car_init，fallback 到全局 initialization_direction 和 L1。
+        """
+        per_car = self.config.get('elevator', {}).get('per_car_init', {})
+        cfg = per_car.get(str(car_id), {})
+        direction = cfg.get('direction') or self.config.get('elevator', {}).get('initialization_direction', 'down')
+        target_floor = cfg.get('target_floor', 1)
+        return direction, target_floor
 
     async def reload(self) -> None:
         self._load_config()

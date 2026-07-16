@@ -472,8 +472,7 @@ class ActionExecutor:
         if self._station_seek_enabled:
             self._level_seek_active = True
             self._level_seek_skip_next = True
-            sys.stderr.write(f'[seek] car{self.car_id} 吸附激活\n')
-            sys.stderr.flush()
+            self._log(f'[seek] car{self.car_id} 吸附激活')
         await self._complete_action()
 
     async def _apply_init_decel(self, remaining: int) -> None:
@@ -530,9 +529,7 @@ class ActionExecutor:
 
         # 每层经过都写日志（始终写文件，终端受 exec_log_enabled 控制）
         self._log(f'[exec] car{self.car_id} 经过 L{new_pos}, 距目标 {abs(remaining)} 层')
-        # 同时写 stderr（终端可见，用于判断楼层计数器是否正常步进）
-        sys.stderr.write(f'[pass] car{self.car_id} L{new_pos}\n')
-        sys.stderr.flush()
+        # 终端通过 exec_log_enabled 控制，日志文件始终写入
 
         if self.debug:
             print(f'[exec] level reached: pos={new_pos} target={target} remaining={remaining} decel_state={self.decel_state}')
@@ -581,8 +578,7 @@ class ActionExecutor:
         self._level_correct_in_progress = True
         missing_dir = 'up' if dn_now == 0 else 'down'  # 缺下平层→向上找,缺上平层→向下找
         wait_signal = 'level_down' if dn_now == 0 else 'level_up'
-        sys.stderr.write(f'[seek] car{self.car_id} {missing_dir}反冲(↑{up_now}↓{dn_now})\n')
-        sys.stderr.flush()
+        self._log(f'[seek] car{self.car_id} {missing_dir}反冲(↑{up_now}↓{dn_now})')
         self._relevel_future = asyncio.get_running_loop().create_future()
         await self.motor.release_brakes()
         # 低速微调:高速反冲会过冲过头、低速洗 1 次就好
@@ -590,8 +586,7 @@ class ActionExecutor:
         try:
             await asyncio.wait_for(self._relevel_future, timeout=3.0)
         except asyncio.TimeoutError:
-            sys.stderr.write(f'[seek] car{self.car_id} 反冲超时(3s)\n')
-            sys.stderr.flush()
+            self._log(f'[seek] car{self.car_id} 反冲超时(3s)')
         finally:
             await self.motor.hold_stop()
             self._relevel_future = None
@@ -616,8 +611,7 @@ class ActionExecutor:
         if not enabled:
             # 关闭:清当前活跃 + 取消反冲
             self._level_seek_active = False
-            sys.stderr.write(f'[seek] car{self.car_id} 吸附关闭\n')
-            sys.stderr.flush()
+            self._log(f'[seek] car{self.car_id} 吸附关闭')
             if self._relevel_future is not None and not self._relevel_future.done():
                 self._relevel_future.cancel()
             self._relevel_future = None
@@ -683,6 +677,22 @@ class ActionExecutor:
                 await self._start_move_down()
 
             case ActionKind.OPEN_DOOR:
+                # 平层安全校验:等两个平层信号都为 1 才开门（防止停偏时开门在半空）
+                # 比赛传感器布局下，station_seek 反冲后 level 才稳定
+                if self._station_seek_enabled:
+                    try:
+                        up_addr = self.mapper.addr_input('level_up', self.car_id)
+                        dn_addr = self.mapper.addr_input('level_down', self.car_id)
+                    except KeyError:
+                        up_addr = dn_addr = None
+                    if up_addr is not None:
+                        for _ in range(10):  # 最多等 1 秒 (10 × 100ms)
+                            if (self.io.get_input(up_addr) == 1
+                                    and self.io.get_input(dn_addr) == 1):
+                                break
+                            await asyncio.sleep(0.1)
+                        else:
+                            self._log(f'[exec] car{self.car_id} 开门超时等待平层,继续开门')
                 self.car.door_state = DoorState.OPENING
                 self.door.set_car_position(self.car.position)
                 await self.door.open()
@@ -1004,11 +1014,23 @@ class ActionExecutor:
 
         # 进入安全回归
         self._safety_limb_active = True
-        await self._safety_limb_recovery()
+        recovered = await self._safety_limb_recovery()
         self._safety_limb_active = False
 
-    async def _safety_limb_recovery(self) -> None:
+        if recovered:
+            # 恢复成功:还原状态,清除 current_action,通知上层
+            car.state = CarState.READY
+            self.current_action = None
+            self._move_perfect_leveling_active = False
+            self._log(f'[CRASH] car{self.car_id} 已恢复为 READY,可重新调度')
+        else:
+            # 恢复失败:保持 FAULT
+            self._log(f'[CRASH] car{self.car_id} 安全回归失败,保持 FAULT 状态')
+
+    async def _safety_limb_recovery(self) -> bool:
         """慢速寻平层 → 触限位反冲 → 完美平层 → 开门停车
+
+        返回 True=成功恢复, False=超时/异常
 
         事件驱动的主循环:不轮询,利用 asyncio.Event 等待 IO 变化;
         当前循环内用 asyncio.sleep(0.02) 小步查,因为传感器变化频率
@@ -1026,13 +1048,13 @@ class ActionExecutor:
         await self.motor.start(high_speed=False, direction='up' if direction == Direction.UP else 'down')
         await self.motor.set_speed(high_speed=False)
 
+        recovered = False
         deadline = asyncio.get_event_loop().time() + 60  # 60s 超时 → 全停
         try:
             while True:
                 if asyncio.get_event_loop().time() > deadline:
                     self._log(f'[CRASH] car{self.car_id} 安全回归超时 60s,全停')
-                    await self._all_outputs_off()
-                    return
+                    return False
 
                 await asyncio.sleep(0.02)  # 50Hz 采样
 
@@ -1086,7 +1108,11 @@ class ActionExecutor:
                     car.door_state = DoorState.OPEN
                     self._log(f'\033[1;32m[CRASH] car{self.car_id} 安全回归: '
                               f'平层停车 + 开门,position=0\033[0m')
-                    return
+                    recovered = True
+                    return True
         finally:
-            await self._all_outputs_off()  # 保险:无论如何停电机
-            self._log(f'[CRASH] car{self.car_id} 安全回归结束')
+            if not recovered:
+                await self._all_outputs_off()  # 超时/异常:停电机保险
+                self._log(f'[CRASH] car{self.car_id} 安全回归失败')
+            else:
+                self._log(f'[CRASH] car{self.car_id} 安全回归成功')
