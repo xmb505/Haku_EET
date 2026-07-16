@@ -21,3 +21,4 @@ Thumbs.db
 # External projects (symlinked, not tracked)
 IO2HTTP
 IO2HTTP/
+logs/*.log

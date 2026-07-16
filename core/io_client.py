@@ -43,6 +43,9 @@ class IOClient:
         reconnect_delay: float = 3.0,
         tick_interval_ms: float = 100,
         shared_input_cache: dict | None = None,
+        word_read_url: str | None = None,
+        word_read_alias: str = 'weight',
+        word_read_timeout: float = 0.5,
     ) -> None:
         """shared_input_cache: 多 IOClient 共享缓存容器(传入 {'input': {}, 'output': {}}
         即跨实例共享输入/输出缓存;传 None 或纯 dict[str, int] 视为仅共享 input_cache)"""
@@ -53,6 +56,9 @@ class IOClient:
         self.debug = debug
         self.reconnect_delay = reconnect_delay
         self._tick_interval = max(0.01, tick_interval_ms / 1000.0)
+        self._word_read_url = word_read_url
+        self._word_read_alias = word_read_alias
+        self._word_read_timeout = word_read_timeout
 
         self._session: aiohttp.ClientSession | None = None
         self._ws_task: asyncio.Task | None = None
@@ -144,6 +150,9 @@ class IOClient:
         """写一个 DB 输出位（加入写缓冲区，下一个 tick 批量 flush）"""
         bit = 1 if value else 0
         self._output_cache[db_addr] = bit
+        # 输出日志回调（由 app 注入，翻译地址 + 写纯文件）
+        if hasattr(self, '_log_set') and self._log_set is not None:
+            self._log_set(db_addr, bit)
         if self.simulate:
             if self.debug:
                 print(f'[io:sim] SET {db_addr} = {bit}')
@@ -155,6 +164,8 @@ class IOClient:
         for addr, val in writes.items():
             bit = 1 if val else 0
             self._output_cache[addr] = bit
+            if hasattr(self, '_log_set') and self._log_set is not None:
+                self._log_set(addr, bit)
             if not self.simulate:
                 self._write_buffer[addr] = bit
 
@@ -214,6 +225,38 @@ class IOClient:
     def get_all_inputs(self) -> dict[str, int]:
         """返回当前所有 I 区状态的快照"""
         return dict(self._input_cache)
+
+    # ===== 模拟量 Word 读取 =====
+
+    async def read_word(self, db_num: int, byte: int) -> int | None:
+        """从 IO2HTTP 读取一个 WORD（16 位无符号整数）
+
+        POST /word_read → {"success":true,"readings":[{"byte":28,"word":950,...}]}
+        失败（success=false / 网络超时 / HTTP 错误）→ 返回 None
+        """
+        if self.simulate:
+            return 0
+        if not self._word_read_url or not self._session:
+            return None
+        payload = {
+            'alias': self._word_read_alias,
+            'db_num': db_num,
+            'byte': byte,
+            'count': 1,
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=self._word_read_timeout)
+            async with self._session.post(
+                self._word_read_url, json=payload, timeout=timeout,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if data.get('success') and data.get('readings'):
+                    return data['readings'][0]['word']
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError, Exception):
+            return None
 
     def set_known_i_addresses(self, addrs: set[str]) -> None:
         """设置已知 I 地址集合（来自 IOMapper）

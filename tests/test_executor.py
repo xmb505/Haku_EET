@@ -41,18 +41,26 @@ def i_to_event(mapper: IOMapper, signal: str, bit: int, car_id: int = 1) -> IOEv
 
 
 async def fire_perfect_level_pulse(executor: ActionExecutor, mapper: IOMapper,
-                                   car_id: int = 1) -> None:
+                                   io_client=None, car_id: int = 1) -> None:
     """模拟一次完整的"完美平层"脉冲：上升沿 (1,1) + 下降沿 (0,0)
 
     真实硬件行为：电梯经过一层平层区，level_up 和 level_down 同时=1 持续几百毫秒，
     然后同时回 0。executor 的上升沿触发 step，下降沿 reset 以接受下一个上升沿。
+
+    io_client：可选，传则同步 observe_input 缓存（MOVE 完美平层检测需要）。
     """
     addr_up = mapper.addr_input('level_up', car_id)
     addr_down = mapper.addr_input('level_down', car_id)
     # 上升沿：两个同时=1
+    if io_client is not None:
+        io_client.observe_input(addr_up, 1)
+        io_client.observe_input(addr_down, 1)
     await executor.on_io_event(IOEvent(i_addr=addr_up, bit=1))
     await executor.on_io_event(IOEvent(i_addr=addr_down, bit=1))
     # 下降沿：两个同时=0
+    if io_client is not None:
+        io_client.observe_input(addr_up, 0)
+        io_client.observe_input(addr_down, 0)
     await executor.on_io_event(IOEvent(i_addr=addr_up, bit=0))
     await executor.on_io_event(IOEvent(i_addr=addr_down, bit=0))
 
@@ -340,8 +348,9 @@ async def test_action_done_callback(setup):
     await queue.put(Action(ActionKind.MOVE_UP))
     await asyncio.sleep(0.02)
 
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))  # 3→4
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))  # 4→5
+    await fire_perfect_level_pulse(executor, mapper, io)  # 离开始发 L3
+    await fire_perfect_level_pulse(executor, mapper, io)  # 3→4
+    await fire_perfect_level_pulse(executor, mapper, io)  # 4→5 (target)
     await asyncio.sleep(0.02)
 
     # 回调被触发，传入刚完成的 action
@@ -491,7 +500,9 @@ async def test_direction_indicator_during_move(setup):
     assert car.display == 1  # 启动时还没移动,显示原位置
 
     # 经过 2 楼:display 应更新到 2 (中间层)
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 离开始发 L1
+    await asyncio.sleep(0.02)
+    await fire_perfect_level_pulse(executor, mapper, io)  # 1→2
     await asyncio.sleep(0.02)
     assert car.position == 2
     assert car.display == 2  # ← 关键:中间层也要更新
@@ -499,13 +510,13 @@ async def test_direction_indicator_during_move(setup):
     assert io.get_output(mapper.addr_output('up_indicator', 1)) == 1
 
     # 经过 3 楼:display 应更新到 3
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 2→3
     await asyncio.sleep(0.02)
     assert car.position == 3
     assert car.display == 3
 
     # 到达 4 楼 (target):display=4 + 两个灯都清
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 3→4 (target)
     await asyncio.sleep(0.02)
     assert car.position == 4
     assert car.display == 4
@@ -538,14 +549,16 @@ async def test_direction_indicator_during_move_down(setup):
     assert io.get_output(mapper.addr_output('down_indicator', 1)) == 1
 
     # 经过 4 楼
-    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 离开始发 L5
+    await asyncio.sleep(0.02)
+    await fire_perfect_level_pulse(executor, mapper, io)  # 5→4
     await asyncio.sleep(0.02)
     assert car.position == 4
     assert car.display == 4
 
     # 到达 2 楼,两个灯都清
-    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
-    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 4→3
+    await fire_perfect_level_pulse(executor, mapper, io)  # 3→2 (target)
     await asyncio.sleep(0.02)
     assert car.position == 2
     assert io.get_output(mapper.addr_output('up_indicator', 1)) == 0
@@ -599,18 +612,26 @@ def i_to_event(mapper: IOMapper, signal: str, bit: int, car_id: int = 1) -> IOEv
 
 
 async def fire_perfect_level_pulse(executor: ActionExecutor, mapper: IOMapper,
-                                   car_id: int = 1) -> None:
+                                   io_client=None, car_id: int = 1) -> None:
     """模拟一次完整的"完美平层"脉冲：上升沿 (1,1) + 下降沿 (0,0)
 
     真实硬件行为：电梯经过一层平层区，level_up 和 level_down 同时=1 持续几百毫秒，
     然后同时回 0。executor 的上升沿触发 step，下降沿 reset 以接受下一个上升沿。
+
+    io_client：可选，传则同步 observe_input 缓存（MOVE 完美平层检测需要）。
     """
     addr_up = mapper.addr_input('level_up', car_id)
     addr_down = mapper.addr_input('level_down', car_id)
     # 上升沿：两个同时=1
+    if io_client is not None:
+        io_client.observe_input(addr_up, 1)
+        io_client.observe_input(addr_down, 1)
     await executor.on_io_event(IOEvent(i_addr=addr_up, bit=1))
     await executor.on_io_event(IOEvent(i_addr=addr_down, bit=1))
     # 下降沿：两个同时=0
+    if io_client is not None:
+        io_client.observe_input(addr_up, 0)
+        io_client.observe_input(addr_down, 0)
     await executor.on_io_event(IOEvent(i_addr=addr_up, bit=0))
     await executor.on_io_event(IOEvent(i_addr=addr_down, bit=0))
 
@@ -937,14 +958,17 @@ async def test_move_up_completes_on_level_up(setup):
     assert car.direction == Direction.UP
 
     # 触发上平层 2 次（3→4→5）→ 到达 5 楼
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))  # 3→4
+    # 完美平层脉冲：先离开始发层(flag重置)，再计两层
+    await fire_perfect_level_pulse(executor, mapper, io)  # 离开始发 L3, flag 清空
+    await asyncio.sleep(0.02)
+    await fire_perfect_level_pulse(executor, mapper, io)  # L3→L4
     await asyncio.sleep(0.02)
     # 4 楼时 remaining=1，应切低速（dist=1），保持电机运行
     assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
     assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 0
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 1
 
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))  # 4→5
+    await fire_perfect_level_pulse(executor, mapper, io)  # L4→L5 (target)
     await asyncio.sleep(0.02)
 
     assert car.position == 5
@@ -1393,8 +1417,9 @@ async def test_action_done_callback(setup):
     await queue.put(Action(ActionKind.MOVE_UP))
     await asyncio.sleep(0.02)
 
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))  # 3→4
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))  # 4→5
+    await fire_perfect_level_pulse(executor, mapper, io)  # 离开始发 L3
+    await fire_perfect_level_pulse(executor, mapper, io)  # 3→4
+    await fire_perfect_level_pulse(executor, mapper, io)  # 4→5 (target)
     await asyncio.sleep(0.02)
 
     # 回调被触发，传入刚完成的 action
@@ -1880,7 +1905,9 @@ async def test_direction_indicator_during_move(setup):
     assert car.display == 1  # 启动时还没移动,显示原位置
 
     # 经过 2 楼:display 应更新到 2 (中间层)
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 离开始发 L1
+    await asyncio.sleep(0.02)
+    await fire_perfect_level_pulse(executor, mapper, io)  # 1→2
     await asyncio.sleep(0.02)
     assert car.position == 2
     assert car.display == 2  # ← 关键:中间层也要更新
@@ -1888,13 +1915,13 @@ async def test_direction_indicator_during_move(setup):
     assert io.get_output(mapper.addr_output('up_indicator', 1)) == 1
 
     # 经过 3 楼:display 应更新到 3
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 2→3
     await asyncio.sleep(0.02)
     assert car.position == 3
     assert car.display == 3
 
     # 到达 4 楼 (target):display=4 + 两个灯都清
-    await executor.on_io_event(i_to_event(mapper, 'level_up', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 3→4 (target)
     await asyncio.sleep(0.02)
     assert car.position == 4
     assert car.display == 4
@@ -2039,14 +2066,16 @@ async def test_direction_indicator_during_move_down(setup):
     assert io.get_output(mapper.addr_output('down_indicator', 1)) == 1
 
     # 经过 4 楼
-    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 离开始发 L5
+    await asyncio.sleep(0.02)
+    await fire_perfect_level_pulse(executor, mapper, io)  # 5→4
     await asyncio.sleep(0.02)
     assert car.position == 4
     assert car.display == 4
 
     # 到达 2 楼,两个灯都清
-    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
-    await executor.on_io_event(i_to_event(mapper, 'level_down', 1))
+    await fire_perfect_level_pulse(executor, mapper, io)  # 4→3
+    await fire_perfect_level_pulse(executor, mapper, io)  # 3→2 (target)
     await asyncio.sleep(0.02)
     assert car.position == 2
     assert io.get_output(mapper.addr_output('up_indicator', 1)) == 0

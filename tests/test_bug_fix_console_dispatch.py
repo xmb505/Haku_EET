@@ -49,7 +49,7 @@ async def test_dispatch_failure_prints_reason_state(app, capsys):
         await app.pm.on_hall_call(1, 'up', 1)
 
     captured = capsys.readouterr()
-    out = captured.out
+    out = captured.err  # passenger 输出已迁移到 stderr
     assert 'no available car' in out
     assert 'car1: state=unknown' in out or 'car1: state=' in out
     print("✓ 诊断输出包含车状态信息")
@@ -69,7 +69,7 @@ async def test_dispatch_failure_prints_reason_door(app, capsys):
         await app.pm.on_hall_call(1, 'up', 1)
 
     captured = capsys.readouterr()
-    out = captured.out
+    out = captured.err  # passenger 输出已迁移到 stderr
     # 新行为：快捷路径（门开着 → 亮灯 + cancel cron）
     # 旧行为：诊断输出（门=open）
     assert ('door open' in out or 'keep LED' in out
@@ -102,7 +102,7 @@ async def test_full_scenario_after_fix(app, capsys):
         await app.pm.on_hall_call(1, 'up', 1)
 
     captured = capsys.readouterr()
-    out = captured.out
+    out = captured.err  # passenger 输出已迁移到 stderr
     assert 'car1 at floor, opening' in out or '→ car' in out, \
         f"完整场景应成功派车,实际输出: {out}"
     print(f"✓ 完整场景修复后能正常派车: {out.strip()}")

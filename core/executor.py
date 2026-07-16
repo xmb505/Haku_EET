@@ -47,6 +47,7 @@ class ActionExecutor:
         on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
         on_breach: Callable[[], Awaitable[None]] | None = None,
         on_light_curtain: Callable[[], Awaitable[None]] | None = None,
+        on_close_door_starting: Callable[[int], Awaitable[bool]] | None = None,
         io_write: IOClient | None = None,
         station_seek_enabled: bool = False,
         action_queue: ActionQueue | None = None,
@@ -61,6 +62,7 @@ class ActionExecutor:
         self.bottom_base_floor = bottom_base_floor
         self.on_action_done = on_action_done
         self.on_emergency_stop = on_emergency_stop
+        self.on_close_door_starting = on_close_door_starting
         # 站点吸附总开关（默认关，运行时由 app.set_station_seek 切换）
         self._station_seek_enabled: bool = station_seek_enabled
         # ActionQueue 引用:auto-seek 撞 1 限位 fallback 入队 INITIALIZE 用
@@ -79,6 +81,7 @@ class ActionExecutor:
         # 日志回调（外部可注入，让 REPL 能正确显示后台任务的 print）
         # 默认走 stderr（不会被 prompt_toolkit 吞掉）
         self._log_stream = sys.stderr
+        self._log_term = sys.stderr
 
         self.current_action: Action | None = None
         # 等哪个信号 → (signal_name, expected_bit)
@@ -92,6 +95,8 @@ class ActionExecutor:
         self._init_reverse_mode: bool = False
         # 是否正处于"完美平层"瞬态（用于边沿检测：上升沿 step，下降沿 reset）
         self._init_perfect_leveling_active: bool = False
+        # MOVE 期间完美平层瞬态（↑1↓1 同时触发才算到一层）
+        self._move_perfect_leveling_active: bool = False
         # INITIALIZE 完成后轿厢所在的基站楼层（由方向决定：up→top, down→bottom）
         self._init_base_floor: int = 1
         # INITIALIZE 到达基站后还要移动到的目标楼层（/car N init <dir> <floor>）
@@ -107,6 +112,10 @@ class ActionExecutor:
         # 上一次 level_up / level_down 值，用于检测上升沿（经过平层点）
         self._last_level_up: int = 0
         self._last_level_down: int = 0
+        # MOVE 期间到达过的楼层（计数器崩溃检测:同一层被到达两次 → 崩溃）
+        self._reached_positions: set[int] = set()
+        self._last_move_direction: Direction = Direction.IDLE
+        self._safety_limb_active: bool = False
         # 平层信号防抖:记录 level_up/down 上次变 0 的时间戳
         # 用于过滤电机启动瞬间的瞬态抖动(避免 1→0→1 误触发 _on_level_reached)
         self._level_up_zero_time: float | None = None
@@ -145,16 +154,24 @@ class ActionExecutor:
             action = await queue.get()
             self.current_action = action
             self.waiting_sensor = None
+            # H1 钩子: CLOSE_DOOR 前检查重量（weight_manager 可能拦截关门）
+            if action.kind == ActionKind.CLOSE_DOOR and self.on_close_door_starting is not None:
+                skip = await self.on_close_door_starting(self.car_id)
+                if skip:
+                    await self._complete_action()  # 跳过关门,done 通知乘客层
+                    continue
             await self._start_action(action)
             # 如果是立即完成的动作（SET_DISPLAY / NOOP），已经 _complete_action 过了
             # 否则等待 on_io_event 推进
 
     def _log(self, msg: str) -> None:
-        """后台任务的 print：走 stderr + flush，避开 prompt_toolkit"""
-        if not self.exec_log_enabled:
-            return
-        self._log_stream.write(msg + '\n')
-        self._log_stream.flush()
+        """始终写日志文件；终端输出受 exec_log_enabled 控制（/debug show exec_trace）"""
+        if hasattr(self._log_stream, 'write'):
+            self._log_stream.write(msg + '\n')
+            self._log_stream.flush()
+        if self.exec_log_enabled and hasattr(self, '_log_term') and hasattr(self._log_term, 'write'):
+            self._log_term.write(msg + '\n')
+            self._log_term.flush()
 
     # ===== IO 事件入口 =====
 
@@ -347,12 +364,22 @@ class ActionExecutor:
                     self._init_perfect_leveling_active = False
                     return
 
-            # 3b. 正常 MOVE_UP/MOVE_DOWN 的减速曲线
-            if event.bit == 1 and self.current_action is not None:
-                if name == 'level_up' and self.current_action.kind == ActionKind.MOVE_UP:
-                    await self._on_level_reached(direction=Direction.UP)
-                elif name == 'level_down' and self.current_action.kind == ActionKind.MOVE_DOWN:
-                    await self._on_level_reached(direction=Direction.DOWN)
+            # 3b. 正常 MOVE - 完美平层(↑1↓1)才算到一层
+            # 比赛传感器布局（轿顶两个传感器，井道门上方磁铁）：
+            #   上行时：先触发上平层(进入平层区底部) → 再触发下平层(到达平层中心)
+            #   下行时：先触发下平层 → 再触发上平层
+            # 单信号触发时车还在平层区边缘，必须等 ↑1↓1 同时触发才确认到达该楼层
+            if not self._init_reverse_mode and self.current_action is not None:
+                kind = self.current_action.kind
+                if kind in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN):
+                    up_now = self.io.get_input(self._level_up_i)
+                    dn_now = self.io.get_input(self._level_down_i)
+                    if up_now == 1 and dn_now == 1 and not self._move_perfect_leveling_active:
+                        self._move_perfect_leveling_active = True
+                        direction = Direction.UP if kind == ActionKind.MOVE_UP else Direction.DOWN
+                        await self._on_level_reached(direction=direction)
+                    elif up_now == 0 and dn_now == 0 and self._move_perfect_leveling_active:
+                        self._move_perfect_leveling_active = False
             # 3c. 停车反冲中:只在两个平层信号同时=1时通知等待协程,不在任何 level=1 就停
             if name in ('level_up', 'level_down') and event.bit == 1 and self._relevel_future is not None:
                 try:
@@ -444,9 +471,9 @@ class ActionExecutor:
         await asyncio.sleep(0.1)
         if self._station_seek_enabled:
             self._level_seek_active = True
-            # 跳过激活后第一次 IO event 的 _level_seek_check,
-            # 避免与 _complete_action → on_action_done 推入的下一个 MOVE 冲突
             self._level_seek_skip_next = True
+            sys.stderr.write(f'[seek] car{self.car_id} 吸附激活\n')
+            sys.stderr.flush()
         await self._complete_action()
 
     async def _apply_init_decel(self, remaining: int) -> None:
@@ -478,6 +505,7 @@ class ActionExecutor:
             return
 
         # 1. 更新 position（经过一个平层点）
+        old_pos = self.car.position
         if direction == Direction.UP:
             self.car.position += 1
         else:
@@ -486,12 +514,25 @@ class ActionExecutor:
         new_pos = self.car.position
         remaining = target - new_pos  # 还差几层（正数=还需上行，负数=还需下行）
 
+        # ★ 计数器崩溃检测:同一层不能被 MOVE 到达两次
+        if new_pos in self._reached_positions and not self._safety_limb_active:
+            await self._handle_counter_collapse()
+            return
+        if not self._safety_limb_active:
+            self._reached_positions.add(new_pos)
+
         # 实时更新 7 段显示：每经过一层就刷新(中间层也显示)
         try:
             await self.display.show_number(new_pos, self.car_id)
             self.car.display = new_pos
         except Exception:
             pass
+
+        # 每层经过都写日志（始终写文件，终端受 exec_log_enabled 控制）
+        self._log(f'[exec] car{self.car_id} 经过 L{new_pos}, 距目标 {abs(remaining)} 层')
+        # 同时写 stderr（终端可见，用于判断楼层计数器是否正常步进）
+        sys.stderr.write(f'[pass] car{self.car_id} L{new_pos}\n')
+        sys.stderr.flush()
 
         if self.debug:
             print(f'[exec] level reached: pos={new_pos} target={target} remaining={remaining} decel_state={self.decel_state}')
@@ -538,9 +579,10 @@ class ActionExecutor:
             return  # 两层之间/停车后传感器驻留结束,不误反冲
 
         self._level_correct_in_progress = True
-        missing_dir = 'up' if up_now == 0 else 'down'  # 缺上→往上,缺下→往下
-        wait_signal = 'level_up' if up_now == 0 else 'level_down'
-        self._log(f'[exec] car{self.car_id} 保持: {missing_dir}反冲(✓→↑{up_now}↓{dn_now})')
+        missing_dir = 'up' if dn_now == 0 else 'down'  # 缺下平层→向上找,缺上平层→向下找
+        wait_signal = 'level_down' if dn_now == 0 else 'level_up'
+        sys.stderr.write(f'[seek] car{self.car_id} {missing_dir}反冲(↑{up_now}↓{dn_now})\n')
+        sys.stderr.flush()
         self._relevel_future = asyncio.get_running_loop().create_future()
         await self.motor.release_brakes()
         # 低速微调:高速反冲会过冲过头、低速洗 1 次就好
@@ -548,7 +590,8 @@ class ActionExecutor:
         try:
             await asyncio.wait_for(self._relevel_future, timeout=3.0)
         except asyncio.TimeoutError:
-            self._log(f'[exec] car{self.car_id} 保持反冲超时(3s)')
+            sys.stderr.write(f'[seek] car{self.car_id} 反冲超时(3s)\n')
+            sys.stderr.flush()
         finally:
             await self.motor.hold_stop()
             self._relevel_future = None
@@ -573,6 +616,8 @@ class ActionExecutor:
         if not enabled:
             # 关闭:清当前活跃 + 取消反冲
             self._level_seek_active = False
+            sys.stderr.write(f'[seek] car{self.car_id} 吸附关闭\n')
+            sys.stderr.flush()
             if self._relevel_future is not None and not self._relevel_future.done():
                 self._relevel_future.cancel()
             self._relevel_future = None
@@ -797,6 +842,12 @@ class ActionExecutor:
             return  # 门未关好，拒绝启动电机（防止门开着时行车导致计数器崩溃）
         self.decel_state = 'high_speed'
         self._last_level_up = 0
+        self._last_move_direction = Direction.UP
+        self._reached_positions.clear()
+        if self.car.position is not None:
+            self._reached_positions.add(self.car.position)
+        # 起点已处于完美平层，标记为已计数，防止刚启动就重复计当前层
+        self._move_perfect_leveling_active = True
         await self.motor.release_brakes()
         await self.motor.set_direction_indicator('up')
         # 短距离（1层）直接用低速，防止高速启动后刹不住过冲
@@ -806,7 +857,7 @@ class ActionExecutor:
                         and abs(target - pos) <= 1)
         await self.motor.start(high_speed=use_high, direction='up')
         self.car.direction = Direction.UP
-        self.waiting_sensor = None  # 不等特定传感器，靠 level_up 边沿推进
+        self.waiting_sensor = None  # 不等特定传感器，靠完美平层(↑1↓1)推进
 
     async def _start_move_down(self) -> None:
         """下行启动：释放刹车 + 点亮下行灯 + 电机"""
@@ -814,6 +865,12 @@ class ActionExecutor:
             return  # 门未关好，拒绝启动电机（防止门开着时行车导致计数器崩溃）
         self.decel_state = 'high_speed'
         self._last_level_down = 0
+        self._last_move_direction = Direction.DOWN
+        self._reached_positions.clear()
+        if self.car.position is not None:
+            self._reached_positions.add(self.car.position)
+        # 起点已处于完美平层，标记为已计数
+        self._move_perfect_leveling_active = True
         await self.motor.release_brakes()
         await self.motor.set_direction_indicator('down')
         # 短距离（1层）直接用低速，防止高速启动后刹不住过冲
@@ -922,3 +979,114 @@ class ActionExecutor:
                 updates['bottom_limit'] = event.bit == 1
         if updates:
             self.car.fault = dataclasses.replace(self.car.fault, **updates)
+
+    # ===== 计数器崩溃检测 + 安全回归 =====
+
+    async def _handle_counter_collapse(self) -> None:
+        """楼层计数器崩溃:亮故障灯 + 慢速寻平层 → 开门停车"""
+        car = self.car
+        car.state = CarState.FAULT
+        car.direction = Direction.IDLE
+
+        # 终端醒目打印
+        self._log(f'\n\033[1;31m[CRASH] car{self.car_id} 楼层计数器崩溃! '
+                  f'pos={car.position} 重复到达\033[0m')
+
+        # 紧急停车（不停车状态保持 current dir 用于安全回归）
+        await self.motor.stop()
+
+        # 亮故障指示灯
+        try:
+            f_addr = self.mapper.addr_output('fault_indicator', self.car_id)
+            await self.io.set(f_addr, 1)
+        except KeyError:
+            pass
+
+        # 进入安全回归
+        self._safety_limb_active = True
+        await self._safety_limb_recovery()
+        self._safety_limb_active = False
+
+    async def _safety_limb_recovery(self) -> None:
+        """慢速寻平层 → 触限位反冲 → 完美平层 → 开门停车
+
+        事件驱动的主循环:不轮询,利用 asyncio.Event 等待 IO 变化;
+        当前循环内用 asyncio.sleep(0.02) 小步查,因为传感器变化频率
+        高于 50Hz (PLC 扫描周期 ~20ms),不会错过边沿。
+        """
+        car = self.car
+        # 保持当前方向低速前进,至少往一个方向找平层
+        direction = self._last_move_direction if hasattr(self, '_last_move_direction') else car.direction
+        if direction == Direction.IDLE:
+            direction = Direction.DOWN  # default fallback
+        self._log(f'[CRASH] car{self.car_id} 安全回归: 开启慢速 {direction.value}')
+
+        await self.motor.release_brakes()
+        await self.motor.set_direction_indicator('up' if direction == Direction.UP else 'down')
+        await self.motor.start(high_speed=False, direction='up' if direction == Direction.UP else 'down')
+        await self.motor.set_speed(high_speed=False)
+
+        deadline = asyncio.get_event_loop().time() + 60  # 60s 超时 → 全停
+        try:
+            while True:
+                if asyncio.get_event_loop().time() > deadline:
+                    self._log(f'[CRASH] car{self.car_id} 安全回归超时 60s,全停')
+                    await self._all_outputs_off()
+                    return
+
+                await asyncio.sleep(0.02)  # 50Hz 采样
+
+                # 限位反冲
+                if direction == Direction.UP:
+                    try:
+                        top1 = self.io.get_input(self.mapper.addr_input('top_limit_1', self.car_id))
+                    except KeyError:
+                        top1 = 0
+                    if top1 == 1:
+                        self._log(f'[CRASH] car{self.car_id} 触顶限位 → 反向下行')
+                        await self.motor.stop()
+                        await self.motor.set_direction_indicator('down')
+                        await self.motor.start(high_speed=False, direction='down')
+                        await self.motor.set_speed(high_speed=False)
+                        direction = Direction.DOWN
+                        continue
+                else:
+                    try:
+                        bot1 = self.io.get_input(self.mapper.addr_input('bottom_limit_1', self.car_id))
+                    except KeyError:
+                        bot1 = 0
+                    if bot1 == 1:
+                        self._log(f'[CRASH] car{self.car_id} 触底限位 → 反向上行')
+                        await self.motor.stop()
+                        await self.motor.set_direction_indicator('up')
+                        await self.motor.start(high_speed=False, direction='up')
+                        await self.motor.set_speed(high_speed=False)
+                        direction = Direction.UP
+                        continue
+
+                # 完美平层检测
+                try:
+                    up = self.io.get_input(self.mapper.addr_input('level_up', self.car_id))
+                    dn = self.io.get_input(self.mapper.addr_input('level_down', self.car_id))
+                except KeyError:
+                    continue
+                if up == 1 and dn == 1:
+                    await self.motor.hold_stop()
+                    car.position = 0   # 标记为未知（不依赖崩溃前的计数）
+                    car.direction = Direction.IDLE
+                    # 熄故障灯
+                    try:
+                        f_addr = self.mapper.addr_output('fault_indicator', self.car_id)
+                        await self.io.set(f_addr, 0)
+                    except KeyError:
+                        pass
+                    # 开门
+                    await self.door.open()
+                    await self.door.wait_done()
+                    car.door_state = DoorState.OPEN
+                    self._log(f'\033[1;32m[CRASH] car{self.car_id} 安全回归: '
+                              f'平层停车 + 开门,position=0\033[0m')
+                    return
+        finally:
+            await self._all_outputs_off()  # 保险:无论如何停电机
+            self._log(f'[CRASH] car{self.car_id} 安全回归结束')

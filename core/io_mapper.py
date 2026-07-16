@@ -22,6 +22,7 @@ class IOMapper:
         self.config_path = Path(config_path)
         self._output_cache: dict[tuple[int, str], str] = {}
         self._input_cache: dict[tuple[int, str], str] = {}
+        self._word_input_cache: dict[tuple[int, str], tuple[int, int]] = {}
         # 反向索引：地址 → (car_id, signal_name)
         self._output_db_to_signal: dict[str, tuple[int, str]] = {}
         self._input_db_to_signal: dict[str, tuple[int, str]] = {}
@@ -35,6 +36,7 @@ class IOMapper:
 
         self._output_cache.clear()
         self._input_cache.clear()
+        self._word_input_cache.clear()
         self._output_db_to_signal.clear()
         self._input_db_to_signal.clear()
         self._i_to_signal.clear()
@@ -73,6 +75,15 @@ class IOMapper:
             self._input_db_to_signal[addr] = (0, 'auto_run')
             self._i_to_signal[addr] = (0, 'auto_run')
 
+        # Word 输入（DBW 地址，独立于 I 区 bitmap，通过 HTTP word_read 接口读取）
+        word_per_car = input_cfg.get('word_per_car', {})
+        for car_id_str, sigs in word_per_car.items():
+            car_id = int(car_id_str)
+            for sig, entry in sigs.items():
+                db_num = int(entry['db_num'])
+                byte = int(entry['byte'])
+                self._word_input_cache[(car_id, sig)] = (db_num, byte)
+
     # ===== 查表 =====
 
     def addr_output(self, signal: str, car_id: int = 1) -> str:
@@ -88,6 +99,13 @@ class IOMapper:
         if key not in self._input_cache:
             raise KeyError(f'未知输入信号: car_id={car_id} signal={signal!r}')
         return self._input_cache[key]
+
+    def addr_word_input(self, signal: str, car_id: int = 1) -> tuple[int, int]:
+        """Word 输入: 逻辑名 + car_id → (db_num, byte)（HTTP word_read 用）"""
+        key = (car_id, signal)
+        if key not in self._word_input_cache:
+            raise KeyError(f'未知 word 输入: car_id={car_id} signal={signal!r}')
+        return self._word_input_cache[key]
 
     def lookup_signal_by_i(self, i_addr: str) -> tuple[int, str] | None:
         """WebSocket bitmap 事件反查: I 地址 → (car_id, signal_name)"""

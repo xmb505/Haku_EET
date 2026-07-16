@@ -51,8 +51,8 @@ class VirtualPLC:
         bottom_base: int = -1,
         top_floor: int = 10,
         bottom_floor: int = 1,
-        floor_travel_time: float = 0.4,  # 跑一整层需要的时间（秒）
-        tick: float = 0.05,              # 主循环周期
+        floor_travel_time: float = 0.4,
+        tick: float = 0.05,
     ) -> None:
         self.io = io
         self.mapper = mapper
@@ -74,8 +74,7 @@ class VirtualPLC:
         self._last_bottom_limit_2_fired: bool = False
         # level 信号脉冲任务（fire 1 → 200ms → 0）
         self._level_pulses: dict[str, asyncio.Task] = {}
-        # 虚拟电梯内部位置（不写到 car.position——executor 自己跟踪，
-        # 避免虚拟 PLC 过层先改 pos、后 fire 平层被 executor 误读为"已是新楼层"）
+        # 虚拟电梯内部位置
         self._pos: int = 1
         # 门传感器模拟
         self._last_door_open_relay: int = 0
@@ -92,7 +91,6 @@ class VirtualPLC:
         if self.car.position is None:
             self.car.position = 1
         elif not isinstance(self.car.position, int):
-            # 拍回整数（之前可能累积了小数）
             self.car.position = int(round(self.car.position))
         self._pos = self.car.position
         self._task = asyncio.create_task(self._run())
@@ -111,6 +109,12 @@ class VirtualPLC:
         for t in list(self._door_done_tasks.values()):
             if not t.done():
                 t.cancel()
+
+    # ===== Word 读取（simulate 模式返 0） =====
+
+    def read_word(self, db_num: int, byte: int) -> int:
+        """simulate 模式: 返回 0，对应 weight_state=0（正常，满载守卫不触发）"""
+        return 0
 
     async def _run(self) -> None:
         """主循环：每 tick 检查接触器输出，驱动虚拟位置"""

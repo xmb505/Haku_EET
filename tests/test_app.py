@@ -131,9 +131,25 @@ async def test_move_to_5_floor_open_door(app: App):
     await app.call_internal(5)
     await asyncio.sleep(0.05)
 
-    # 1→5 要经过 4 次上平层（2、3、4、5）
+    # 1→5 要经过 4 次完美平层（2、3、4、5）
+    # 比赛传感器布局需先离开当前平层(↑0↓0)，再先后触发上平层和下平层(↑1↓1)
     for _ in range(4):
-        await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1))
+        # 离开当前楼层
+        addr_up = app.mapper.addr_input('level_up', 1)
+        addr_dn = app.mapper.addr_input('level_down', 1)
+        app.io.observe_input(addr_up, 0)
+        app.io.observe_input(addr_dn, 0)
+        await app.executor.on_io_event(i_event(app.mapper, 'level_up', 0, car_id=1))
+        await asyncio.sleep(0.01)
+        await app.executor.on_io_event(i_event(app.mapper, 'level_down', 0, car_id=1))
+        await asyncio.sleep(0.01)
+        # 进入下一楼层：先触发上平层
+        app.io.observe_input(addr_up, 1)
+        await app.executor.on_io_event(i_event(app.mapper, 'level_up', 1, car_id=1))
+        await asyncio.sleep(0.01)
+        # 再触发下平层（↑1↓1=完美平层，此时计数楼层）
+        app.io.observe_input(addr_dn, 1)
+        await app.executor.on_io_event(i_event(app.mapper, 'level_down', 1, car_id=1))
         await asyncio.sleep(0.02)
 
     assert app.car.position == 5
@@ -173,13 +189,21 @@ logging:
 @pytest.mark.asyncio
 async def test_simulate_input_via_app(app: App):
     """通过 /sim input 路径调用（间接通过 io.simulate_input）"""
-    # simulate_input 是同步方法，不能 await
+    # 使用两个 profile 都存在的信号 light_curtain（overload 在比赛模式不存在）
     app.io.simulate_input(
-        app.mapper.addr_input('overload', 1),
+        app.mapper.addr_input('light_curtain', 1),
         1,
     )
     await asyncio.sleep(0.02)
-    assert app.car.fault.overload is True
+    assert app.car.fault.light_curtain is True
+
+    # 再清掉
+    app.io.simulate_input(
+        app.mapper.addr_input('light_curtain', 1),
+        0,
+    )
+    await asyncio.sleep(0.02)
+    assert app.car.fault.light_curtain is False
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ passenger.py —— 乘客交互管理器（大脑）
 """
 
 import asyncio
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -165,20 +166,22 @@ class PassengerManager:
         self.ai_need_2_enabled: bool = False
 
     def _log_event(self, msg: str) -> None:
-        """受 ai_need_2 开关控制的事件级 print
-
-        归类: door_opened / door_button / door_closed / move_done 共 12 处
-        未开启时全部静默（默认），/debug show ai_need_2 启用后才输出。
-        """
+        """受 ai_need_2 开关控制的事件级 print（已废弃，保留兼容）"""
         if self.ai_need_2_enabled:
-            print(msg)
+            sys.stderr.write(msg + '\n')
+            sys.stderr.flush()
+
+    def _log_stderr(self, msg: str) -> None:
+        """写 stderr（已被 App 替换为 TeeStderr → 自动写文件+终端）"""
+        sys.stderr.write(msg + '\n')
+        sys.stderr.flush()
 
     def _reload_ui_config(self) -> None:
         try:
             with self._ui_config_path.open('r', encoding='utf-8') as f:
                 self._ui_config = yaml.safe_load(f) or {}
         except (FileNotFoundError, yaml.YAMLError) as e:
-            print(f'[pm] ui_config 加载失败: {e}，使用默认值')
+            self._log_stderr(f'[pm] ui_config 加载失败: {e}，使用默认值')
             self._ui_config = {}
 
     # ===== config helpers =====
@@ -244,7 +247,7 @@ class PassengerManager:
                     await self._app.executors[cid].motor.set_direction_indicator(direction)
                     await self._app.cron.cancel(
                         self._close_door_job_name(cid))
-                    print(f'[hall_call] {direction}@L{floor} → car{cid} door open, keep LED + cancel cron')
+                    self._log_stderr(f'[hall_call] {direction}@L{floor} → car{cid} door open, keep LED + cancel cron')
                     return
                 elif car.door_state == DoorState.CLOSING:
                     # 门正在关 → 亮灯 + 取消关门 cron + 中断关门 + 重新开门
@@ -261,7 +264,7 @@ class PassengerManager:
                     self._app.executors[cid].door.cancel_for_reopen()
                     await self._app.action_queues[cid].put(
                         Action(ActionKind.OPEN_DOOR))
-                    print(f'[hall_call] {direction}@L{floor} → car{cid} door closing, reopen')
+                    self._log_stderr(f'[hall_call] {direction}@L{floor} → car{cid} door closing, reopen')
                     return
             # 第一层防线：该 (floor, direction) 已被某部车服务 → 跳过
             for cid in self._app.car_ids:
@@ -269,7 +272,7 @@ class PassengerManager:
                     return
             target_cid = self._app._dispatch_hall_call(floor, direction)
             if target_cid is None:
-                print(f'[hall_call] {direction}@L{floor} no available car, keeping LED + pending')
+                self._log_stderr(f'[hall_call] {direction}@L{floor} no available car, keeping LED + pending')
                 # 仍然亮起外召指示灯
                 await self._app.set_hall_indicator(floor, direction, True)
                 # 记住这个待派请求
@@ -279,13 +282,13 @@ class PassengerManager:
                 for cid in self._app.car_ids:
                     car = self._app.cars[cid]
                     if car.state != CarState.READY:
-                        print(f'         · car{cid}: state={car.state.value}')
+                        self._log_stderr(f'         · car{cid}: state={car.state.value}')
                     elif car.position is None:
-                        print(f'         · car{cid}: position=None')
+                        self._log_stderr(f'         · car{cid}: position=None')
                     elif self._app.manual_mode.get(cid, False):
-                        print(f'         · car{cid}: 手动模式中')
+                        self._log_stderr(f'         · car{cid}: 手动模式中')
                     elif car.door_state != DoorState.CLOSED:
-                        print(f'         · car{cid}: 门={car.door_state.value}')
+                        self._log_stderr(f'         · car{cid}: 门={car.door_state.value}')
                 return
             # mark pickup, light indicator
             self._pickup_active[target_cid][(floor, direction)] = True
@@ -301,7 +304,7 @@ class PassengerManager:
                 await self._app.executors[target_cid].motor.set_direction_indicator(direction)
                 await self._app.action_queues[target_cid].put(
                     Action(ActionKind.OPEN_DOOR))
-                print(f'[hall_call] {direction}@L{floor} → car{target_cid} at floor, opening')
+                self._log_stderr(f'[hall_call] {direction}@L{floor} → car{target_cid} at floor, opening')
             else:
                 # 车不在当前层，尝试顺路改道（change_internal）
                 car = self._app.cars[target_cid]
@@ -314,13 +317,13 @@ class PassengerManager:
                     self._app.pending_call_origin[target_cid][floor] = 'hall'
                     if old_target is not None and old_target != floor:
                         self._app.pending_calls[target_cid].append(old_target)
-                    print(f'[hall_call] {direction}@L{floor} → car{target_cid} (顺路改道)')
+                    self._log_stderr(f'[hall_call] {direction}@L{floor} → car{target_cid} (顺路改道)')
                 else:
                     # 距离不够或不顺路，加入 pending_calls 等返回
                     await self._app.call_internal(floor, car_id=target_cid, origin='hall')
                     # 派车成功 → 通过小脑立即亮起预测方向（不等 MOVE 动作启动）
                     await self._app.set_predicted_direction_indicator(target_cid, floor)
-                    print(f'[hall_call] {direction}@L{floor} → car{target_cid}')
+                    self._log_stderr(f'[hall_call] {direction}@L{floor} → car{target_cid}')
         else:
             # bit=0: 按钮松开 → 判断车是否已到站
             for cid in self._app.car_ids:
@@ -361,9 +364,8 @@ class PassengerManager:
                 pq._items = remaining
                 return
             elif result == 'rejected':
-                # 刹不住车或方向不符，非法内呼，不在中途熄灭 LED
-                # 等终点站到站后统一清所有轿内灯
-                print(f'[cabin_button] car{cid} L{floor} rejected (too close/wrong dir)')
+                # 刹不住车或方向不符，作为新内呼入队（等当前行程完成后再去）
+                await self._app.call_internal(floor, car_id=cid)
                 return
             # result == 'not_running' → 车没在移动，作为普通内呼
             await self._app.call_internal(floor, car_id=cid)
@@ -777,10 +779,10 @@ class PassengerManager:
                     await self._app.executors[target_cid].motor.set_direction_indicator(direction)
                     await self._app.action_queues[target_cid].put(
                         Action(ActionKind.OPEN_DOOR))
-                    print(f'[hall_call] pending {direction}@L{floor} → car{target_cid} at floor, opening')
+                    self._log_stderr(f'[hall_call] pending {direction}@L{floor} → car{target_cid} at floor, opening')
                 else:
                     await self._app.call_internal(floor, car_id=target_cid, origin='hall')
-                    print(f'[hall_call] pending {direction}@L{floor} → car{target_cid}')
+                    self._log_stderr(f'[hall_call] pending {direction}@L{floor} → car{target_cid}')
                 break  # 只派一个，避免同一 tick 连推多个 MOVE
 
         for item in dispatched:
@@ -823,9 +825,12 @@ class PassengerManager:
             car = self._app.cars[car_id]
             if car.door_state not in (DoorState.OPEN, DoorState.OPENING):
                 return
+            # ★ 重量检查:状态 2 期间不调度关门(避免开门→关门 cron→立即再开循环)
+            if car.weight_state == 2:
+                return
             # ★ 检查外召按钮是否仍按住：按住则不关门，等松手后由 on_hall_call bit=0 重新调度
             if self._is_any_hall_button_held(car_id):
-                print(f'[cron] car{car_id} close aborted: hall button still held')
+                self._log_stderr(f'[cron] car{car_id} close aborted: hall button still held')
                 return  # 不调度关门，等 on_hall_call bit=0 handler 重新调度 cron
             # check light curtain before closing: if still blocked, reschedule
             if self._app.is_light_curtain_active(car_id):
@@ -915,7 +920,7 @@ class PassengerManager:
                 return
             exc = t.exception()
             if exc is not None:
-                print(f'[passenger] flash_loop car{car_id} 异常: {exc!r}')
+                self._log_stderr(f'[passenger] flash_loop car{car_id} 异常: {exc!r}')
 
         task.add_done_callback(_on_flash_done)
         self._flash_tasks[car_id][flash_key] = task

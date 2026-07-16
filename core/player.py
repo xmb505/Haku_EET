@@ -84,6 +84,11 @@ class Car:
     human_presence: int = -1                 # -1=确定无人, 0=不确定, 1=确定有人
     last_dispatch_direction: Direction = Direction.IDLE  # 最后一次外召派车方向（用于 compile 排序）
     ui: IndicatorState = field(default_factory=IndicatorState)  # UI 指示灯逻辑状态
+    # 重量三态机属性（小脑维护）
+    weight_kg: int = 0                      # 当前载重（kg，最后一次 read_word 结果）
+    weight_state: int = 0                   # 0=正常 / 1=临界 / 2=超重
+    max_weight: int = 0                     # 配置的最大载重（kg）
+    weight_threshold_kg: int = 0            # 临界阈值（kg，已计算 = max_weight * threshold）
 
     def is_ready(self) -> bool:
         return self.state == CarState.READY and not self.fault.service_mode
@@ -113,6 +118,9 @@ class Car:
                 'fan': self.ui.fan,
                 'cabin_button_leds': dict(self.ui.cabin_button_leds),
             },
+            'weight_kg': self.weight_kg,
+            'weight_state': self.weight_state,
+            'max_weight': self.max_weight,
         }
 
     def __repr__(self) -> str:

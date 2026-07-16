@@ -10,6 +10,8 @@ app.py —— 异步装配与主循环
 """
 
 import asyncio
+import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,8 @@ from .io_mapper import IOMapper
 from .player import Car, CarState, Direction, DoorState, IndicatorState
 from .ui import UiController
 from .virtual_plc import VirtualPLC
+from .weight_manager import WeightManager
+from .logging import init_log
 
 # PassengerManager is an optional plug-in module.
 # If missing, the cerebellum runs normally; usermode requires it.
@@ -63,12 +67,14 @@ class App:
         simulate: bool = False,
     ) -> None:
         self.config_path = Path(config_path)
-        self.io_config_path = Path(io_config_path)
         self.display_config_path = Path(display_config_path)
         self.simulate = simulate
 
         self.config: dict[str, Any] = {}
         self._load_config()
+
+        # 根据 io_profile 解析 io_config 路径（冷切换，启动时确定）
+        self.io_config_path = self._resolve_io_config_path(Path(io_config_path))
 
         # ===== 共享组件 =====
         io2http = self.config['io2http']
@@ -76,10 +82,14 @@ class App:
             http_url=io2http['http_url'],
             ws_url=io2http['ws_url'],
             simulate=simulate,
+            alias=io2http.get('alias', 'plc'),
+            word_read_url=io2http.get('word_read_url'),
+            word_read_alias=io2http.get('word_read_alias', 'weight'),
+            word_read_timeout=io2http.get('weight_read_timeout_ms', 500) / 1000.0,
             debug=False,
             tick_interval_ms=io2http.get('tick_interval_ms', 100),
         )
-        self.mapper = IOMapper(io_config_path)
+        self.mapper = IOMapper(self.io_config_path)
         self.algorithm: ElevatorAlgorithm = get_algorithm(
             self.config['algorithm']['name']
         )
@@ -128,6 +138,14 @@ class App:
 
         for cid in self.car_ids:
             self.cars[cid] = Car(car_id=cid)
+            # 注入每车重量配置
+            per_car_weight = self.config.get('elevator', {}).get('per_car_weight', {})
+            if str(cid) in per_car_weight:
+                w_cfg = per_car_weight[str(cid)]
+                self.cars[cid].max_weight = w_cfg.get('max_weight', 0)
+                self.cars[cid].weight_threshold_kg = int(
+                    w_cfg.get('max_weight', 0) * w_cfg.get('threshold', 0.95)
+                )
             self.action_queues[cid] = ActionQueue()
             self.pending_calls[cid] = []
             self.manual_mode[cid] = False
@@ -149,6 +167,19 @@ class App:
                 action_queue=self.action_queues[cid],
             )
 
+        # 日志:替换 sys.stderr 为 TeeStderr → 所有模块 stderr 输出自动进文件+终端
+        # executor._log 用纯文件 _log_file（始终写文件,终端受 exec_log_enabled 控制）
+        if not os.environ.get('PYTEST_CURRENT_TEST'):
+            self._log_tee, self._log_file = init_log('logs')
+            self._original_stderr = sys.stderr  # 保存原始 stderr 引用
+            sys.stderr = self._log_tee
+            # 注入输出日志回调（翻译 DB 地址 → 信号名 + 写纯文件）
+            self.io._log_set = self._log_output
+            for cid in self.car_ids:
+                self.io_write[cid]._log_set = self._log_output
+                self.executors[cid]._log_stream = self._log_file
+                self.executors[cid]._log_term = self._original_stderr
+
         # 应用 slow_brake 配置（低速阶段叠加刹车档位）
         _slow_brake = self.config['elevator'].get('slow_brake', 0)
         for cid in self.car_ids:
@@ -168,6 +199,14 @@ class App:
         # Hall indicator 是建筑级信号(car_id=0),不属于任何轿厢
         # 状态单独存在 App 上(不挂在 Car 上)
         self._hall_indicator_state: dict[tuple[int, str], bool] = {}
+
+        # ===== 重量三态机管理器（小脑模块）=====
+        self.weight_manager = WeightManager(self)
+        # 注入 executor 的关门重量检查回调
+        for cid in self.car_ids:
+            self.executors[cid].on_close_door_starting = (
+                self.weight_manager.on_close_door_starting
+            )
         # 外召灯 observer 列表（事件驱动，debug 监视器注册）
         self._hall_light_observers: list = []
         # 外召按钮边沿检测状态（防止 PLC 持续上报 bit=1 导致重复派车）
@@ -210,6 +249,32 @@ class App:
     def _load_config(self) -> None:
         with self.config_path.open('r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
+
+    def _log_output(self, db_addr: str, bit: int) -> None:
+        """输出日志回调:翻译 DB 地址 → 信号名,写纯文件（不刷终端）"""
+        sig = self.mapper._output_db_to_signal.get(db_addr)
+        if sig:
+            cid, name = sig
+            msg = f'[io:out] car{cid} {name} = {bit}\n'
+        else:
+            msg = f'[io:out] {db_addr} = {bit}\n'
+        if hasattr(self, '_log_file') and hasattr(self._log_file, 'write'):
+            self._log_file.write(msg)
+            self._log_file.flush()
+
+    def _resolve_io_config_path(self, default_path: Path) -> Path:
+        """根据 config.yaml 的 io_profile 字段解析 io_config 文件路径
+        
+        config/io_profile/{io_profile}.yaml 存在 → 用 profile 文件
+        否则 fallback 到 default_path（兼容旧 config/io_config.yaml）
+        """
+        profile = self.config.get('io_profile', '')
+        if profile:
+            profile_dir = self.config_path.parent / 'io_profile'
+            profile_path = profile_dir / f'{profile}.yaml'
+            if profile_path.exists():
+                return profile_path
+        return default_path
 
     # ===== 生命周期 =====
 
@@ -264,15 +329,45 @@ class App:
         for io_w in self.io_write.values():
             await io_w.stop()
         await self.io.stop()
+        # 关闭日志文件，恢复原始 stderr
+        if hasattr(self, '_log_tee'):
+            sys.stderr = self._original_stderr
+            self._log_tee.close()
 
     # ===== IO 事件路由（按 car_id） =====
 
     async def _on_io_event(self, event: IOEvent) -> None:
         """IO 变化事件 → 查找归属轿厢 → 交给对应 executor"""
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig:
+            cid, name = sig
+            # 写纯文件日志（不刷终端，bitmap 上电瞬间太多）
+            if hasattr(self, '_log_file') and hasattr(self._log_file, 'write'):
+                self._log_file.write(f'[io] car{cid} {name} = {event.bit}\n')
+                self._log_file.flush()
         cid = sig[0] if sig and sig[0] is not None else self.current_car_id
         if cid in self.executors:
             await self.executors[cid].on_io_event(event)
+
+    # ===== 重量查询（给 REPL /car status 用） =====
+
+    async def _read_car_weight(self, car_id: int) -> int | None:
+        """读一次 word → 更新 Car.weight_kg + weight_state → 返回 weight_kg
+        
+        返回 None = 当前 profile 无 weight_word / read 失败
+        """
+        try:
+            db_num, byte = self.mapper.addr_word_input('weight', car_id)
+        except KeyError:
+            return None
+        if self.io.simulate:
+            weight = self.virtual_plcs[car_id].read_word(db_num, byte)
+        else:
+            weight = await self.io.read_word(db_num, byte)
+        if weight is None:
+            return None
+        self.weight_manager._update_weight_state(self.cars[car_id], weight)
+        return weight
 
     def _dispatch_hall_call(self, floor: int, direction: str) -> int | None:
         """派车算法：顺向优先 + 空闲最近
@@ -308,6 +403,16 @@ class App:
             if (self.pm is not None):
                 opposite = 'down' if direction == 'up' else 'up'
                 if self.pm._pickup_active.get(cid, {}).get((floor, opposite), False):
+                    continue
+
+            # 载重过滤:有 weight_word 配置用三态机,否则用 overload 布尔
+            if car.max_weight > 0:
+                # 比赛/带重量模式:忽略 overload,用三态机
+                if car.weight_state >= 1:
+                    continue  # state=1 临界 / state=2 超重 → 不响应外呼
+            else:
+                # 本地练习模式:无 word,用 overload 布尔信号
+                if car.fault.overload:
                     continue
 
             pos = car.position
@@ -392,6 +497,9 @@ class App:
         if last == event.bit:
             return  # 无变化，跳过
         self._hall_call_last_state[key] = event.bit
+        label = '按下' if event.bit else '松开'
+        sys.stderr.write(f'[io] 外呼 {direction}@L{floor} {label}\n')
+        sys.stderr.flush()
         await self.pm.on_hall_call(floor, direction, event.bit)
 
     async def _on_cabin_button_event(self, event: IOEvent) -> None:
@@ -408,11 +516,15 @@ class App:
 
         if event.bit == 1:
             # 内召按下 = 确定有人 → 设为 1
+            sys.stderr.write(f'[io] car{cid} 轿内按钮 L{floor} 按下\n')
+            sys.stderr.flush()
             self.cars[cid].human_presence = 1
             await self.cron.cancel(self.pm._lights_off_job_name(cid))
             await self.ui[cid].set_cabin_button_led(floor, True)
             await self.pm.on_cabin_button(cid, floor)
         else:
+            sys.stderr.write(f'[io] car{cid} 轿内按钮 L{floor} 松开\n')
+            sys.stderr.flush()
             # 内召松开：若按钮楼层 == 当前楼层 → 灭灯
             # （不在当前楼层的灯由 on_door_opened 到站时统一灭）
             car = self.cars[cid]
@@ -429,6 +541,12 @@ class App:
         # ★ 只转发开门/关门按钮信号，忽略其他所有信号
         if signal_name not in ('door_open_button', 'door_close_button'):
             return
+        label = '按下' if event.bit else '松开'
+        sys.stderr.write(f'[io] car{cid} {signal_name} {label}\n')
+        sys.stderr.flush()
+        # H3 钩子:开门按钮按下时更新重量状态
+        if signal_name == 'door_open_button' and event.bit == 1:
+            await self.weight_manager.on_door_open_button_pressed(cid)
         # bit=1=按下, bit=0=松开都需转发到大脑(尤其开门松开后要启关门 cron)
         await self.pm.on_door_button(cid, signal_name, event.bit)
 
@@ -530,6 +648,10 @@ class App:
             except Exception as e:
                 print(f'[app] car{car_id} PM.on_action_done 异常: {e!r}')
 
+        # H2 钩子:关门完成后更新重量状态
+        if last_action.kind == ActionKind.CLOSE_DOOR:
+            await self.weight_manager.on_close_door_completed(car_id)
+
         if not advanced:
             await self._tick(car_id)
 
@@ -617,6 +739,25 @@ class App:
             if self.pm is not None:
                 await self.pm.on_light_curtain(car_id)
         return on_light_curtain
+
+    # ===== 高层 API（给大脑/console 用） =====
+
+    async def set_predicted_direction_indicator(self, car_id: int,
+                                                 target_floor: int) -> None:
+        """派车成功后立即亮起预测方向灯（不等 MOVE 动作启动）
+
+        大脑(乘客意图)→ 小脑(本方法)→ 脑干(motor IO)
+        已在目标层或位置未知时静默跳过；IO 异常吞掉不影响派车/开门。
+        """
+        car = self.cars[car_id]
+        pos = car.position
+        if pos is None or pos == target_floor:
+            return
+        direction = 'up' if target_floor > pos else 'down'
+        try:
+            await self.executors[car_id].motor.set_direction_indicator(direction)
+        except Exception:
+            pass
 
     # ===== 高层 API（给 console 用） =====
 

@@ -36,6 +36,7 @@ HELP_TEXT = """
   /debug show human_presence     toggle 人类预测状态变化监视（-1/0/1 三态转移）
   /debug show door_event         toggle 门事件监视（door_open/close_done,relay,lock,curtain）
   /debug show ui_light_listener   toggle UI 输出监视（轿内灯/外召灯/上下行指示灯）
+  /debug show weight_event       toggle 重量查询事件监视（查询时打印车号+重量+状态）
   /module <name> [true|false]        切换功能模块（默认关）
     模块: station_seek  站点吸附——到站后保持完美平层,偏离全速反冲
   /ui <car_id|all> <type> [true|false]   轿厢状态指示灯
@@ -47,6 +48,9 @@ HELP_TEXT = """
                                   用户模式——开启前需所有轿厢已初始化
                                   开启后 ready 信号置 1，可正常接客
                                   partial:只对已就绪车启用,跳过未就绪车（用于单步测试）
+  /competition [true|false]        比赛模式——监听自动运行信号(auto_run)
+                                    开启后，自动运行信号=1 时自动初始化所有轿厢
+                                    完成后自动启用 usermode（仅上升沿触发）
 
 示例:
   /car 1 init                    1 号梯初始化（完整流程：全速→触 1 限位→减速→完美平层）
@@ -101,6 +105,7 @@ class Console:
             'settings': self.cmd_settings,
             'ui': self.cmd_ui,
             'usermode': self.cmd_usermode,
+            'competition': self.cmd_competition,
         }
         # debug 监视项状态
         self.pass_floor_monitor_enabled: bool = False
@@ -133,6 +138,13 @@ class Console:
         self.ui_light_listener_enabled: bool = False
         self.ai_need_1_monitor_enabled: bool = False
         self._ai_need_1_monitor_ref = None
+        self.weight_event_monitor_enabled: bool = False
+        self._weight_event_ref = None
+
+        # 比赛模式状态
+        self._competition_enabled: bool = False
+        self._competition_listener_ref = None
+        self._competition_task: asyncio.Task | None = None
 
     def _resolve_car_id(self, args: list[str]) -> int:
         """从参数里提取 car_id（如果有），否则用当前选中的"""
@@ -236,13 +248,14 @@ class Console:
                 '/ui': ['max', 'warn', 'fan', 'light'],
                 '/buttonui': ['out', 'in'],
                 '/usermode': ['true', 'false', 'partial'],
+                '/competition': ['true', 'false'],
             }
             sub_sub_args: dict[str, list[str]] = {
                 'init': ['up', 'down'],
                 'call': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'change': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
                 'fireman': ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status', 'ui_listener', 'human_presence', 'door_event', 'ui_light_listener', 'ai_need_1'],
+                'show': ['pass_floor', 'input_change', 'websocket_connect_status', 'exec_trace', 'elevator_speed', 'level_check', 'station_seek', 'door_status', 'ui_listener', 'human_presence', 'door_event', 'ui_light_listener', 'ai_need_1', 'ai_need_2', 'weight_event'],
                 'station_seek': ['true', 'false'],
                 'max': ['true', 'false'],
                 'warn': ['true', 'false'],
@@ -570,6 +583,14 @@ class Console:
                             current_word, 'partial')
                     return
 
+                # 10. /competition 路径：true|false
+                if cmd == '/competition':
+                    if len(parts) < 2:
+                        yield from self._complete_sub_cmd(
+                            current_word, self.commands_with_subs[cmd])
+                        return
+                    return
+
             @staticmethod
             def _looks_like_car_id(raw: str) -> bool:
                 """判断 raw 是否像 car_id：纯数字 / all / 含 - / 含 , 且除 ,外都是数字"""
@@ -605,11 +626,15 @@ class Console:
                 break
             if cmd not in self._commands:
                 print(f'未知命令: /{cmd}，输入 /help 查看')
+                self._log_repl(f'未知命令: /{cmd}')
                 continue
             try:
                 await self._commands[cmd](args)
             except Exception as e:
                 print(f'错误: {e!r}')
+                self._log_repl(f'错误: /{cmd} {e!r}')
+            else:
+                self._log_repl(f'/{cmd} {" ".join(args)}')
             # 让事件循环有机会调度 executor 后台任务和 listener 回调链
             await asyncio.sleep(0.02)
         print()
@@ -639,11 +664,15 @@ class Console:
                 break
             if cmd not in self._commands:
                 print(f'未知命令: /{cmd}，输入 /help 查看')
+                self._log_repl(f'未知命令: /{cmd}')
                 continue
             try:
                 await self._commands[cmd](args)
             except Exception as e:
                 print(f'错误: {e!r}')
+                self._log_repl(f'错误: /{cmd} {e!r}')
+            else:
+                self._log_repl(f'/{cmd} {" ".join(args)}')
             await asyncio.sleep(0.02)
         print()
 
@@ -654,24 +683,36 @@ class Console:
 
     async def _do_status(self, args: list[str]) -> None:
         requested = self._resolve_car_id(args)
+        # 触发一次重量查询（/car status 按需读 word）
+        try:
+            await self.app._read_car_weight(requested)
+        except Exception:
+            pass
         snap = self.app.status_snapshot(car_id=requested)
         car = snap['car']
-        print(f'算法:        {snap["algorithm"]}')
-        print(f'模拟模式:    {snap["simulate"]}')
-        print(f'初始化方向:  {snap["init_direction"]}')
-        print(f'轿厢 ID:     {car["car_id"]}')
-        print(f'状态:        {car["state"]}')
+        lines: list[str] = []
+        def emit(s: str) -> None:
+            lines.append(s)
+            print(s)
+            # 写纯文件（不通过 stderr 避免终端重复显示）
+            if hasattr(self.app, '_log_file') and hasattr(self.app._log_file, 'write'):
+                self.app._log_file.write(s + '\n')
+        emit(f'算法:        {snap["algorithm"]}')
+        emit(f'模拟模式:    {snap["simulate"]}')
+        emit(f'初始化方向:  {snap["init_direction"]}')
+        emit(f'轿厢 ID:     {car["car_id"]}')
+        emit(f'状态:        {car["state"]}')
         pos = car['position'] if car['position'] is not None else '?'
-        print(f'当前位置:    L{pos}')
-        print(f'方向:        {car["direction"]}')
-        print(f'门状态:      {car["door_state"]}')
+        emit(f'当前位置:    L{pos}')
+        emit(f'方向:        {car["direction"]}')
+        emit(f'门状态:      {car["door_state"]}')
         target = car['target_floor']
-        print(f'目标楼层:    L{target}' if target else '目标楼层:    -')
-        print(f'显示:        {car["display"]}')
-        print(f'动作队列:    {snap["action_queue_size"]}')
+        emit(f'目标楼层:    L{target}' if target else '目标楼层:    -')
+        emit(f'显示:        {car["display"]}')
+        emit(f'动作队列:    {snap["action_queue_size"]}')
         mode = '手动' if snap['manual_mode'] else '自动'
-        print(f'控制模式:    {mode}')
-        print(f'待处理召唤:  {snap["pending_calls"]}')
+        emit(f'控制模式:    {mode}')
+        emit(f'待处理召唤:  {snap["pending_calls"]}')
         f = car['fault']
         active_faults = [
             name for name, val in [
@@ -682,19 +723,28 @@ class Console:
                 ('下限位', f['bottom_limit']),
             ] if val
         ]
-        print(f'故障:        {", ".join(active_faults) if active_faults else "无"}')
-        # 大脑状态
+        emit(f'故障:        {", ".join(active_faults) if active_faults else "无"}')
+        # 重量状态
+        w_kg = car.get('weight_kg', 0)
+        w_state = car.get('weight_state', 0)
+        w_labels = {0: '正常', 1: '临界', 2: '超重'}
+        w_label = w_labels.get(w_state, '?')
+        w_max = car.get('max_weight', 0)
+        if w_max > 0:
+            emit(f'重量:        {w_kg} kg (state={w_state} {w_label}, max={w_max}kg)')
+        else:
+            emit(f'重量:        N/A (未配置)')
         if self.app.pm is not None:
             pm = self.app.pm.status_snapshot(requested)
             if self.app.usermode_enabled:
-                print(f'大脑:        启用 | 模式={pm["queue_mode"]}')
-                print(f'  内召缓存:  {pm["button_cache"]}')
-                print(f'  请求队列:  {pm["passenger_queue"]}')
-                print(f'  接客中:    {pm["pickup_active"]}')
+                emit(f'大脑:        启用 | 模式={pm["queue_mode"]}')
+                emit(f'  内召缓存:  {pm["button_cache"]}')
+                emit(f'  请求队列:  {pm["passenger_queue"]}')
+                emit(f'  接客中:    {pm["pickup_active"]}')
             else:
-                print(f'大脑:        禁用')
+                emit(f'大脑:        禁用')
         else:
-            print(f'大脑:        未加载')
+            emit(f'大脑:        未加载')
 
     async def cmd_cars(self, args: list[str]) -> None:
         print('已启用的轿厢:')
@@ -1692,9 +1742,153 @@ class Console:
         else:
             print(f'未知参数: {args[0]}（要 true|false|partial）')
 
+    # ===== 比赛模式命令 =====
+
+    async def cmd_competition(self, args: list[str]) -> None:
+        """
+        /competition [true|false]  比赛模式
+
+        true:  启用比赛模式，监听 auto_run 输入信号
+               auto_run=1 时自动初始化所有轿厢 → usermode true
+        false: 禁用比赛模式，注销监听器
+        """
+        if not args:
+            enabled = self._competition_enabled
+            print(f'competition(比赛模式): {"启用" if enabled else "禁用"}')
+            return
+
+        arg = args[0].lower()
+        if arg in ('true', 'on'):
+            await self._enable_competition()
+        elif arg in ('false', 'off'):
+            await self._disable_competition()
+        else:
+            print(f'未知参数: {arg}（要 true|false）')
+
+    async def _enable_competition(self) -> None:
+        """启用比赛模式：注册 auto_run 监听器"""
+        if self._competition_enabled:
+            print('[competition] 比赛模式已启用')
+            return
+
+        # 检查 auto_run 信号是否在当前 io_config 中配置
+        try:
+            self.app.mapper.addr_input('auto_run', 0)
+        except KeyError:
+            print('[competition] 错误：当前 io_config 未配置 auto_run 信号')
+            print('       请确认 io_profile 使用了 competition.yaml')
+            return
+
+        self._competition_enabled = True
+        self._competition_listener_ref = self._on_auto_run_event
+        self.app.io.add_listener(self._competition_listener_ref)
+
+        print('[competition] 比赛模式已启用，等待自动运行信号(auto_run=1)...')
+        print('       检测到 auto_run=1 后自动执行：')
+        print('         1. 初始化所有轿厢')
+        print('         2. 启用用户模式(usermode)')
+
+        # 检查当前缓存中 auto_run 是否已为 1（应对信号在启用前已到达的情况）
+        try:
+            addr = self.app.mapper.addr_input('auto_run', 0)
+            if self.app.io.get_input(addr) == 1:
+                print('[competition] auto_run 当前已为 1，立即启动自动流程')
+                self._competition_task = asyncio.create_task(
+                    self._run_competition_flow())
+        except KeyError:
+            pass
+
+    async def _disable_competition(self) -> None:
+        """禁用比赛模式"""
+        self._competition_enabled = False
+        if self._competition_listener_ref is not None:
+            try:
+                self.app.io.remove_listener(self._competition_listener_ref)
+            except Exception:
+                pass
+            self._competition_listener_ref = None
+        if self._competition_task is not None and not self._competition_task.done():
+            self._competition_task.cancel()
+            self._competition_task = None
+        print('[competition] 比赛模式已禁用')
+
+    async def _on_auto_run_event(self, event: IOEvent) -> None:
+        """IO listener：auto_run 信号 0→1 上升沿时启动比赛流程"""
+        if not self._competition_enabled:
+            return
+        sig = self.app.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None or sig != (0, 'auto_run'):
+            return
+        if event.bit == 1:
+            print('[competition] 收到自动运行信号(auto_run=1)，启动自动流程')
+            # 一次性触发：立即注销监听器，防止重复触发
+            if self._competition_listener_ref is not None:
+                try:
+                    self.app.io.remove_listener(self._competition_listener_ref)
+                except Exception:
+                    pass
+                self._competition_listener_ref = None
+            self._competition_task = asyncio.create_task(
+                self._run_competition_flow())
+
+    async def _run_competition_flow(self) -> None:
+        """比赛流程：初始化所有轿厢 → 等待就绪 → 启用用户模式"""
+        from .player import CarState
+        print('[competition] === 比赛自动流程开始 ===')
+
+        car_ids = self.app.car_ids
+        init_dir = self.app.config['elevator']['initialization_direction']
+        print(f'[competition] 初始化 {len(car_ids)} 部轿厢: {car_ids}，方向={init_dir}')
+
+        # 1. 初始化所有轿厢（异步入队，不阻塞）
+        for cid in car_ids:
+            await self.app.reset(direction=init_dir, target_floor=1, car_id=cid)
+
+        # 2. 等待所有轿厢初始化完成（state=READY + position 非空）
+        print('[competition] 等待初始化完成...')
+        timeout = 60.0  # 60 秒超时兜底
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            if asyncio.get_running_loop().time() > deadline:
+                ready_cars = [cid for cid in car_ids
+                              if self.app.cars[cid].state == CarState.READY
+                              and self.app.cars[cid].position is not None]
+                failed = [cid for cid in car_ids if cid not in ready_cars]
+                print(f'[competition] ⚠️  初始化超时({timeout}s)，已就绪: {ready_cars}，失败: {failed}')
+                if not ready_cars:
+                    print('[competition] 无任何轿厢就绪，放弃 usermode')
+                    return
+                # 部分就绪 → 用 partial usermode
+                result = await self.app.set_usermode(True, cars=ready_cars)
+                enabled_cars = result.get('enabled_cars', [])
+                print(f'[competition] partial usermode: car {enabled_cars} 已启用')
+                print('[competition] === 比赛自动流程完成(partial) ===')
+                return
+
+            all_ready = all(
+                self.app.cars[cid].state == CarState.READY
+                and self.app.cars[cid].position is not None
+                for cid in car_ids
+            )
+            if all_ready:
+                break
+            await asyncio.sleep(0.1)
+
+        print(f'[competition] 所有 {len(car_ids)} 部轿厢初始化完成')
+
+        # 3. 启用用户模式
+        result = await self.app.set_usermode(True)
+        blocked = result.get('blocked', [])
+        enabled_cars = result.get('enabled_cars', [])
+        if blocked:
+            print(f'[competition] usermode 部分失败: {blocked} 未就绪')
+        if enabled_cars:
+            print(f'[competition] 用户模式已启用(car {enabled_cars}，ready=1，正常接客)')
+        print('[competition] === 比赛自动流程完成 ===')
+
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':
-            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek|ui_listener|human_presence|door_event|ui_light_listener|ai_need_1>')
+            print('用法: /debug show <pass_floor|input_change|websocket_connect_status|exec_trace|elevator_speed|level_check|station_seek|ui_listener|human_presence|door_event|ui_light_listener|ai_need_1|ai_need_2|weight_event>')
             return
         if len(args) < 2:
             # 显示当前所有监视项状态
@@ -1724,6 +1918,10 @@ class Console:
             print(f'ui_light_listener 监视:    {ull}')
             ain1 = '启用' if self.ai_need_1_monitor_enabled else '禁用'
             print(f'ai_need_1 诊断监视:       {ain1}')
+            ain2 = '启用' if self.app.pm.ai_need_2_enabled else '禁用'
+            print(f'ai_need_2 诊断监视:       {ain2}')
+            we = '启用' if self.weight_event_monitor_enabled else '禁用'
+            print(f'weight_event 监视:      {we}')
             return
         topic = args[1]
         if topic == 'pass_floor':
@@ -1752,6 +1950,10 @@ class Console:
             self._toggle_ui_light_listener()
         elif topic == 'ai_need_1':
             self._toggle_ai_need_1_monitor()
+        elif topic == 'ai_need_2':
+            self._toggle_ai_need_2_monitor()
+        elif topic == 'weight_event':
+            self._toggle_weight_event_monitor()
         else:
             print(f'未知 show 主题: {topic}')
 
@@ -2324,6 +2526,50 @@ class Console:
             print(f'  pickup_active:      {snap["pickup_active"]}')
             print(f'  _pending_hall_calls: {sorted(pm._pending_hall_calls)}')
         print('----------------------------------')
+
+    def _toggle_ai_need_2_monitor(self) -> None:
+        """toggle ai_need_2 诊断监视：passenger 事件级 print 总开关"""
+        if self.app.pm is None:
+            print('[debug] ai_need_2: passenger manager 未启用')
+            return
+        self.app.pm.ai_need_2_enabled = not self.app.pm.ai_need_2_enabled
+        status = '启用' if self.app.pm.ai_need_2_enabled else '禁用'
+        print(f'[debug] ai_need_2 诊断监视已{status}')
+
+    def _log_repl(self, msg: str) -> None:
+        """写 REPL 命令日志到纯文件（不刷终端）"""
+        log_file = getattr(self.app, '_log_file', None)
+        if log_file is not None:
+            log_file.write(f'[REPL] {msg}\n')
+            log_file.flush()
+
+    def _toggle_weight_event_monitor(self) -> None:
+        """toggle weight_event 监视：重量查询时打印车号+重量+状态变化"""
+        if self.weight_event_monitor_enabled:
+            self._disable_weight_event_monitor()
+        else:
+            self._enable_weight_event_monitor()
+
+    def _enable_weight_event_monitor(self) -> None:
+        self.weight_event_monitor_enabled = True
+        self.app.weight_manager.on_weight_event = self._on_weight_event
+        self._weight_event_ref = self._on_weight_event
+        print('[debug] weight_event 监视已启用')
+
+    def _disable_weight_event_monitor(self) -> None:
+        self.weight_event_monitor_enabled = False
+        self.app.weight_manager.on_weight_event = None
+        print('[debug] weight_event 监视已禁用')
+
+    async def _on_weight_event(self, car_id: int, weight_kg: int,
+                                old_state: int, new_state: int) -> None:
+        if not self.weight_event_monitor_enabled:
+            return
+        labels = {0: '正常', 1: '临界', 2: '超重'}
+        arrow = '→' if old_state != new_state else '='
+        print(f'[weight] car{car_id:<2} {weight_kg:>5}kg  {labels[old_state]} {arrow} {labels[new_state]}',
+              file=sys.stderr)
+        sys.stderr.flush()
 
     async def _ui_light_observer(self, car_id: int, signal: str, value: object) -> None:
         """UiController observer 回调 — 轿内灯/风扇/故障/满载"""
