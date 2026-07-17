@@ -47,6 +47,8 @@ class ActionExecutor:
         on_emergency_stop: Callable[[], Awaitable[None]] | None = None,
         on_breach: Callable[[], Awaitable[None]] | None = None,
         on_light_curtain: Callable[[], Awaitable[None]] | None = None,
+        on_lc_close: Callable[[], Awaitable[None]] | None = None,
+        on_open_done: Callable[[], Awaitable[None]] | None = None,
         on_close_door_starting: Callable[[int], Awaitable[bool]] | None = None,
         io_write: IOClient | None = None,
         station_seek_enabled: bool = False,
@@ -145,6 +147,27 @@ class ActionExecutor:
         except KeyError:
             self._level_up_i = None
             self._level_down_i = None
+
+        # ===== 重量轮询器（脑干层） =====
+        # 背景任务持续读 word → ADC 换算 → 更新 car.weight_kg / weight_state
+        # 上层（小脑/大脑）只读缓存值，不再直接访问 IO
+        self._weight_poll_task: asyncio.Task | None = None
+        self._weight_poll_interval_ms: int = 500  # 正常轮询间隔（app 注入）
+        # 预解析 weight word 地址
+        try:
+            self._weight_db_num, self._weight_byte = self.mapper.addr_word_input(
+                'weight', self.car_id)
+            self._weight_enabled: bool = True
+        except KeyError:
+            self._weight_db_num = 0
+            self._weight_byte = 0
+            self._weight_enabled = False
+        # overweight 回调：状态变为 2 时通知上层（开门+亮灯）
+        self.on_weight_overweight: Callable[[int], Awaitable[None]] | None = None
+        # normalized 回调：状态从 2 降回 1/0 时通知上层（熄灯+关门）
+        self.on_weight_normalized: Callable[[int], Awaitable[None]] | None = None
+        # 重量变化事件回调（debug 监视器用）
+        self.on_weight_event: Callable[[int, int, int, int], Awaitable[None]] | None = None
 
     # ===== 主循环 =====
 
@@ -1116,3 +1139,76 @@ class ActionExecutor:
                 self._log(f'[CRASH] car{self.car_id} 安全回归失败')
             else:
                 self._log(f'[CRASH] car{self.car_id} 安全回归成功')
+
+    # ===== 重量轮询器（脑干层：IO 读 + ADC 换算） =====
+
+    def start_weight_poller(self) -> None:
+        """启动重量后台轮询（幂等）"""
+        if not self._weight_enabled:
+            return
+        if self._weight_poll_task is not None and not self._weight_poll_task.done():
+            return
+        self._weight_poll_task = asyncio.create_task(self._weight_poll_loop())
+        self._log(f'[exec] car{self.car_id} 重量轮询器启动, '
+                  f'间隔={self._weight_poll_interval_ms}ms')
+
+    def stop_weight_poller(self) -> None:
+        """停止重量后台轮询"""
+        if self._weight_poll_task is not None and not self._weight_poll_task.done():
+            self._weight_poll_task.cancel()
+        self._weight_poll_task = None
+
+    async def _weight_poll_loop(self) -> None:
+        """后台循环：读 word → ADC 换算 → 更新 car.weight_kg/weight_state"""
+        while True:
+            try:
+                await self._poll_weight_once()
+            except Exception as e:
+                self._log(f'[exec] car{self.car_id} 重量轮询异常: {e!r}')
+            interval = self._weight_poll_interval_ms / 1000.0
+            await asyncio.sleep(interval)
+
+    async def _poll_weight_once(self) -> None:
+        """单次重量轮询：读 PLC word → ADC 换算 → 更新 car 状态
+
+        这是脑干层唯一的重量 IO 读入口。上层（小脑/大脑）只读 car.weight_kg
+        和 car.weight_state 缓存值。
+        """
+        car = self.car
+        raw = await self.io.read_word(self._weight_db_num, self._weight_byte)
+        if raw is None:
+            return  # read 失败，保持旧值
+        # ADC 模拟量换算（Siemens 0-27648 → kg）
+        if car.adc_full_scale_kg > 0:
+            weight_kg = round(raw * car.adc_full_scale_kg / 27648)
+        else:
+            weight_kg = raw
+
+        old_state = car.weight_state
+        old_weight = car.weight_kg
+        car.weight_kg = weight_kg
+
+        # 三态机计算
+        MAX = car.max_weight
+        THRESHOLD = car.weight_threshold_kg
+        if MAX <= 0:
+            car.weight_state = 0
+        elif weight_kg > MAX:
+            car.weight_state = 2
+        elif weight_kg >= THRESHOLD:
+            car.weight_state = 1
+        else:
+            car.weight_state = 0
+
+        new_state = car.weight_state
+
+        # 状态变化回调
+        if new_state == 2 and old_state != 2 and self.on_weight_overweight is not None:
+            await self.on_weight_overweight(self.car_id)
+        elif new_state != 2 and old_state == 2 and self.on_weight_normalized is not None:
+            await self.on_weight_normalized(self.car_id)
+
+        # debug 事件回调
+        if self.on_weight_event is not None:
+            if weight_kg != old_weight or new_state != old_state:
+                await self.on_weight_event(self.car_id, weight_kg, old_state, new_state)

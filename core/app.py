@@ -164,6 +164,8 @@ class App:
                 on_emergency_stop=self._make_on_emergency_stop(cid),
                 on_breach=self._make_on_breach(cid),
                 on_light_curtain=self._make_on_light_curtain(cid),
+                on_lc_close=self._make_on_lc_close(cid),
+                on_open_done=self._make_on_open_done_fault_off(cid),
                 station_seek_enabled=self.config['elevator'].get('station_seek', False),
                 action_queue=self.action_queues[cid],
             )
@@ -202,12 +204,21 @@ class App:
         self._hall_indicator_state: dict[tuple[int, str], bool] = {}
 
         # ===== 重量三态机管理器（小脑模块）=====
+        # 重量 IO 读 + ADC 换算已下沉到 executor._poll_weight_once()（脑干层）。
+        # weight_manager 只负责状态变化时的副作用动作（开门/亮灯/关门）。
         self.weight_manager = WeightManager(self)
-        # 注入 executor 的关门重量检查回调
+        weight_poll_ms = self.config.get('weight_poll_interval_ms', 500)
         for cid in self.car_ids:
-            self.executors[cid].on_close_door_starting = (
+            exe = self.executors[cid]
+            # H1: 关门重量检查（读 car.weight_state 缓存）
+            exe.on_close_door_starting = (
                 self.weight_manager.on_close_door_starting
             )
+            # 轮询间隔注入
+            exe._weight_poll_interval_ms = weight_poll_ms
+            # 状态变化回调：executor 轮询 → weight_manager 副作用
+            exe.on_weight_overweight = self.weight_manager.on_overweight
+            exe.on_weight_normalized = self.weight_manager.on_normalized
         # 外召灯 observer 列表（事件驱动，debug 监视器注册）
         self._hall_light_observers: list = []
         # 外召按钮边沿检测状态（防止 PLC 持续上报 bit=1 导致重复派车）
@@ -322,7 +333,14 @@ class App:
                 vplc.start()
             print(f'[vplc] 已启动 {len(self.car_ids)} 部虚拟 PLC')
 
+        # 启动每部电梯的重量后台轮询器（脑干层）
+        for cid in self.car_ids:
+            self.executors[cid].start_weight_poller()
+
     async def stop(self) -> None:
+        # 停止重量轮询器
+        for cid in self.car_ids:
+            self.executors[cid].stop_weight_poller()
         await self.cron.stop()
         if self.simulate:
             for vplc in getattr(self, 'virtual_plcs', {}).values():
@@ -365,22 +383,15 @@ class App:
     # ===== 重量查询（给 REPL /car status 用） =====
 
     async def _read_car_weight(self, car_id: int) -> int | None:
-        """读一次 word → 更新 Car.weight_kg + weight_state → 返回 weight_kg
-        
-        返回 None = 当前 profile 无 weight_word / read 失败
+        """返回 car.weight_kg（executor 轮询器持续更新，无需额外 IO 读）
+
+        返回 None = 当前 profile 无 weight_word 配置
         """
-        try:
-            db_num, byte = self.mapper.addr_word_input('weight', car_id)
-        except KeyError:
+        car = self.cars[car_id]
+        exe = self.executors[car_id]
+        if not exe._weight_enabled:
             return None
-        if self.io.simulate:
-            weight = self.virtual_plcs[car_id].read_word(db_num, byte)
-        else:
-            weight = await self.io.read_word(db_num, byte)
-        if weight is None:
-            return None
-        self.weight_manager._update_weight_state(self.cars[car_id], weight)
-        return weight
+        return car.weight_kg
 
     def _dispatch_hall_call(self, floor: int, direction: str) -> int | None:
         """派车算法：顺向优先 + 空闲最近
@@ -402,6 +413,8 @@ class App:
 
             if car.state != CarState.READY or car.position is None:
                 continue
+            if car.driver_mode:
+                continue  # 司机模式:不接受外呼
             if self.manual_mode.get(cid, False):
                 continue
             if car.door_state != DoorState.CLOSED:
@@ -530,7 +543,7 @@ class App:
             # 内召按下 = 确定有人 → 设为 1
             self._log_ui(f'[io] car{cid} 轿内按钮 L{floor} 按下')
             self.cars[cid].human_presence = 1
-            await self.cron.cancel(self.pm._lights_off_job_name(cid))
+            await self.cron.cancel(self.pm._human_presence_job_name(cid))
             await self.ui[cid].set_cabin_button_led(floor, True)
             await self.pm.on_cabin_button(cid, floor)
         else:
@@ -650,16 +663,17 @@ class App:
 
         advanced = await self._handle_algorithm_state_change(car_id, last_action)
 
+        # H2 钩子:关门完成后更新重量状态（必须在大脑决策之前）
+        # 否则 PM._on_door_closed dispatch 时读到的是 H1 时刻的过期 weight_state
+        if last_action.kind == ActionKind.CLOSE_DOOR:
+            await self.weight_manager.on_close_door_completed(car_id)
+
         # 通知大脑（PassengerManager 需要知道门开/门关完成）
         if self.pm is not None:
             try:
                 await self.pm.on_action_done(car_id, last_action)
             except Exception as e:
                 print(f'[app] car{car_id} PM.on_action_done 异常: {e!r}')
-
-        # H2 钩子:关门完成后更新重量状态
-        if last_action.kind == ActionKind.CLOSE_DOOR:
-            await self.weight_manager.on_close_door_completed(car_id)
 
         if not advanced:
             await self._tick(car_id)
@@ -748,6 +762,18 @@ class App:
             if self.pm is not None:
                 await self.pm.on_light_curtain(car_id)
         return on_light_curtain
+
+    def _make_on_lc_close(self, car_id: int):
+        """关门中光幕触发 → 亮故障灯警示乘客"""
+        async def on_lc_close():
+            await self.ui[car_id].set_fault(True)
+        return on_lc_close
+
+    def _make_on_open_done_fault_off(self, car_id: int):
+        """开门到位 → 熄故障灯"""
+        async def on_open_done():
+            await self.ui[car_id].set_fault(False)
+        return on_open_done
 
     # ===== 高层 API（给大脑/console 用） =====
 
@@ -1011,6 +1037,9 @@ class App:
         slow_brake = self.config['elevator'].get('slow_brake', 0)
         for cid in self.car_ids:
             self.executors[cid].motor.slow_brake_level = slow_brake
+        # ui_config reload 同步（熄灯延时/关门延时等）
+        if self.pm is not None:
+            self.pm._reload_ui_config()
         print(f'[reload] config reloaded: init_dir={self.config["elevator"]["initialization_direction"]}, '
               f'station_seek={station_seek_enabled}, slow_brake={slow_brake}')
 
@@ -1264,6 +1293,69 @@ class App:
         await self.executors[cid]._emergency_stop(reason='async_stop')
         self.cars[cid].state = CarState.UNKNOWN
         self.cars[cid].position = None
+        # 清空 action 队列
+        q = self.action_queues[cid]
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except Exception:
+                break
+
+    async def emergency_escape_all(self) -> None:
+        """火警模式：所有轿厢就近平层停车→亮故障灯→忘掉楼层→开门"""
+        for cid in self.car_ids:
+            car = self.cars[cid]
+            # 紧急停车 + 清 pending calls
+            self.manual_mode[cid] = False
+            self.pending_calls[cid].clear()
+            car.target_floor = None
+            await self.executors[cid]._emergency_stop(reason='escape')
+            car.state = CarState.UNKNOWN
+            car.position = None
+            q = self.action_queues[cid]
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
+            # 如果车在楼层之间（无平层信号），慢速寻平层
+            exe = self.executors[cid]
+            try:
+                up_addr = self.mapper.addr_input('level_up', cid)
+                dn_addr = self.mapper.addr_input('level_down', cid)
+            except KeyError:
+                up_addr = dn_addr = None
+            if up_addr is not None:
+                up = self.io.get_input(up_addr)
+                dn = self.io.get_input(dn_addr)
+                if not (up == 1 and dn == 1):
+                    self._log(f'[escape] car{cid} 寻平层...')
+                    dir_str = 'up' if car.direction != Direction.DOWN else 'down'
+                    await exe.motor.release_brakes()
+                    await exe.motor.start(high_speed=False, direction=dir_str)
+                    deadline = asyncio.get_event_loop().time() + 10
+                    found = False
+                    while asyncio.get_event_loop().time() < deadline:
+                        await asyncio.sleep(0.1)
+                        up = self.io.get_input(up_addr)
+                        dn = self.io.get_input(dn_addr)
+                        if up == 1 and dn == 1:
+                            found = True
+                            break
+                    await exe.motor.hold_stop()
+                    if not found:
+                        self._log(f'[escape] car{cid} 寻平层超时')
+            # 亮故障灯
+            try:
+                f_addr = self.mapper.addr_output('fault_indicator', cid)
+                await self.io.set(f_addr, 1)
+            except KeyError:
+                pass
+            # 开门
+            await exe.door.open()
+            await exe.door.wait_done()
+            car.door_state = DoorState.OPEN
+            self._log(f'[escape] car{cid} 已停车,开门,点亮故障灯')
 
     async def manual_auto(self, car_id: int | None = None) -> None:
         cid = car_id if car_id is not None else self.current_car_id

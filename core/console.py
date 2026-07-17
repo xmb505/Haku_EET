@@ -93,6 +93,7 @@ class Console:
         # 当前选中的 car_id（/car <id> 切换）
         self.current_car_id: int = app.car.car_id
         self._commands: dict[str, Callable[[list[str]], Awaitable[None]]] = {
+            'escape': self.cmd_escape,
             'buttonui': self.cmd_buttonui,
             'car': self.cmd_car,
             'clear': self.cmd_clear,
@@ -145,6 +146,8 @@ class Console:
         self._competition_enabled: bool = False
         self._competition_listener_ref = None
         self._competition_task: asyncio.Task | None = None
+        # 火警模式状态
+        self._escape_active: bool = False
 
     def _resolve_car_id(self, args: list[str]) -> int:
         """从参数里提取 car_id（如果有），否则用当前选中的"""
@@ -724,6 +727,8 @@ class Console:
             ] if val
         ]
         emit(f'故障:        {", ".join(active_faults) if active_faults else "无"}')
+        if f.get('driver_mode'):
+            emit('司机模式:    启用')
         # 重量状态
         w_kg = car.get('weight_kg', 0)
         w_state = car.get('weight_state', 0)
@@ -756,9 +761,11 @@ class Console:
         /car <id> <action> [args...]  切换或路由命令到指定 car
         /car <id>                     切换当前选中的 car（影响后续命令默认值）
         /car 1,2,3,4,5,6 init down 1,2,3,4,5,6  批量 init
+        /car 1 driver true            启用司机模式(忽略外呼,不自动关门,仅关门按钮关门)
+        /car 1 driver false           关闭司机模式
         """
         if not args:
-            print('用法: /car <id> [init|call|status|manual|auto] [...]')
+            print('用法: /car <id> [init|call|status|manual|auto|driver] [...]')
             return
         try:
             car_ids = self._parse_car_list(args[0])
@@ -812,10 +819,28 @@ class Console:
             await self.app.manual_auto(car_id=car_id)
         elif sub_action == 'stop':
             await self._do_stop([car_id])
+        elif sub_action == 'driver':
+            await self._do_driver(car_id, sub_args)
         elif sub_action == 'goto':
             await self._do_call(sub_args)
         else:
             print(f'未知子命令: {sub_action}')
+
+    async def _do_driver(self, car_id: int, args: list[str]) -> None:
+        """司机模式开关：/car N driver true / false"""
+        if not args:
+            print(f'car{car_id} 司机模式: {self.app.cars[car_id].driver_mode}')
+            print('用法: /car <id> driver <true|false>')
+            return
+        val = args[0].lower()
+        if val in ('true', '1', 'on'):
+            self.app.cars[car_id].driver_mode = True
+            print(f'[driver] car{car_id} 司机模式已启用 — 忽略外呼,不自动关门')
+        elif val in ('false', '0', 'off'):
+            self.app.cars[car_id].driver_mode = False
+            print(f'[driver] car{car_id} 司机模式已关闭')
+        else:
+            print(f'参数错误: {args[0]}，应为 true/false')
 
     async def _do_stop(self, car_ids: list[int]) -> None:
         """emergency stop + forget position"""
@@ -1765,6 +1790,58 @@ class Console:
         else:
             print(f'未知参数: {arg}（要 true|false）')
 
+    async def cmd_escape(self, args: list[str]) -> None:
+        """火警模式：/escape true / false
+
+        触发后所有电梯找最近楼层停车→亮故障灯→忘掉楼层→开门。
+        退出后所有轿厢需重新初始化才能运行。
+        """
+        if not args:
+            print(f'火警模式: {"启用" if self._escape_active else "禁用"}')
+            print('用法: /escape <true|false>')
+            return
+        val = args[0].lower()
+        if val in ('false', '0', 'off'):
+            if not self._escape_active:
+                print('[escape] 当前未处于火警模式')
+                return
+            self._escape_active = False
+            for cid in self.app.car_ids:
+                car = self.app.cars[cid]
+                car.state = CarState.UNKNOWN
+                car.position = None
+                car.direction = Direction.IDLE
+                car.door_state = DoorState.CLOSED
+                car.target_floor = None
+                try:
+                    f_addr = self.app.mapper.addr_output('fault_indicator', cid)
+                    await self.app.io.set(f_addr, 0)
+                except KeyError:
+                    pass
+                self.app.pending_calls[cid].clear()
+                q = self.app.action_queues[cid]
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except Exception:
+                        break
+            print('[escape] 火警模式已退出：所有轿厢已重置，需 /car N init 后才可运行')
+            return
+
+        if val in ('true', '1', 'on'):
+            if self._escape_active:
+                print('[escape] 已处于火警模式')
+                return
+            self._escape_active = True
+            print('[escape] === 火警模式已触发 ===')
+            print('[escape] 正在调度所有轿厢就近停车...')
+            await self.app.emergency_escape_all()
+            print('[escape] 所有轿厢已就近平层停车并开门')
+            print('[escape] 输入 /escape false 退出火警模式并重置轿厢')
+            return
+
+        print(f'未知参数: {val}（要 true|false）')
+
     async def _enable_competition(self) -> None:
         """启用比赛模式：注册 auto_run 监听器"""
         if self._competition_enabled:
@@ -1847,7 +1924,8 @@ class Console:
 
         # 2. 等待所有轿厢初始化完成（state=READY + position 非空）
         print('[competition] 等待初始化完成...')
-        timeout = 60.0  # 60 秒超时兜底
+        timeout = self.app.config.get('elevator', {}).get(
+            'competition_init_timeout', 60.0)  # 默认 60 秒超时兜底
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             if asyncio.get_running_loop().time() > deadline:
@@ -2553,13 +2631,14 @@ class Console:
 
     def _enable_weight_event_monitor(self) -> None:
         self.weight_event_monitor_enabled = True
-        self.app.weight_manager.on_weight_event = self._on_weight_event
-        self._weight_event_ref = self._on_weight_event
+        for cid in self.app.car_ids:
+            self.app.executors[cid].on_weight_event = self._on_weight_event
         print('[debug] weight_event 监视已启用')
 
     def _disable_weight_event_monitor(self) -> None:
         self.weight_event_monitor_enabled = False
-        self.app.weight_manager.on_weight_event = None
+        for cid in self.app.car_ids:
+            self.app.executors[cid].on_weight_event = None
         print('[debug] weight_event 监视已禁用')
 
     async def _on_weight_event(self, car_id: int, weight_kg: int,
