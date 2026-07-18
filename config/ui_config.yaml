@@ -13,6 +13,11 @@ passenger:
   #   设为 0 = 按钮释放后下一 tick 立即关门
   door_close_delay_ms: 2000
 
+  # CLOSING 状态超时保护(秒): 关门动作发起后多久未收到 door_close_done 触发保护
+  #   超时后主动查 IO:若 door_close_done=1 则无事发生;若仍为 0 则亮故障灯并停止调度
+  #   设为 0 = 禁用超时保护
+  closing_timeout_seconds: 10
+
   # human_presence 确认无人延时(秒): 门关 + 无召唤后多久推到 -1
   # （三态机: 0=不确定 → 此延时后 → -1=确定无人，灯/风扇随之关闭）
   human_presence_off_delay: 5

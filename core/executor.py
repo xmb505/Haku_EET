@@ -53,6 +53,7 @@ class ActionExecutor:
         io_write: IOClient | None = None,
         station_seek_enabled: bool = False,
         action_queue: ActionQueue | None = None,
+        closing_timeout_seconds: float = 10,
     ) -> None:
         self.car = car
         self.io = io
@@ -65,6 +66,7 @@ class ActionExecutor:
         self.on_action_done = on_action_done
         self.on_emergency_stop = on_emergency_stop
         self.on_close_door_starting = on_close_door_starting
+        self.closing_timeout_seconds = closing_timeout_seconds
         # 站点吸附总开关（默认关，运行时由 app.set_station_seek 切换）
         self._station_seek_enabled: bool = station_seek_enabled
         # ActionQueue 引用:auto-seek 撞 1 限位 fallback 入队 INITIALIZE 用
@@ -737,6 +739,36 @@ class ActionExecutor:
                     self.car.door_state = DoorState.CLOSING
                     self._log(f'[exec] car{self.car_id} CLOSE_DOOR start: door_close_done=0, closing')
                     await self.door.close()
+                    # ★ CLOSING 超时保护：如果超过配置时间未收到 door_close_done，主动查 IO
+                    # 场景：PLC 边沿检测漏掉导致 door_close_done 信号永久不触发
+                    # 保护策略：超时后读 IO 状态，若仍为 0 则亮故障灯并停止调度
+                    if self.closing_timeout_seconds > 0:
+                        try:
+                            await asyncio.wait_for(
+                                self.door.wait_done(), timeout=self.closing_timeout_seconds)
+                        except asyncio.TimeoutError:
+                            # 超时：主动查 IO 状态
+                            try:
+                                close_done_addr = self.mapper.addr_input(
+                                    'door_close_done', self.car_id)
+                                current_state = self.io.get_input(close_done_addr)
+                            except KeyError:
+                                current_state = 0
+                            if current_state == 1:
+                                # IO 已确认关好，正常完成
+                                self._log(f'[exec] car{self.car_id} CLOSE_DOOR timeout but IO confirmed closed')
+                                self.car.door_state = DoorState.CLOSED
+                                self.door.cancel()  # 清理 wait_done 的内部 event
+                                await self._complete_action()
+                                return
+                            else:
+                                # IO 仍为 0：亮故障灯，保持 CLOSING 状态，停止调度
+                                self._log(f'[exec] car{self.car_id} CLOSE_DOOR timeout: door_close_done still 0, fault!')
+                                await self.io.set(
+                                    self.mapper.addr_output('fault_indicator', self.car_id), 1)
+                                self.car.fault = dataclasses.replace(
+                                    self.car.fault, door=True)
+                                return  # 不完成动作，等人工干预
                     result = await self.door.wait_done()
                     self._log(f'[exec] car{self.car_id} CLOSE_DOOR done: result={result}')
                     if self._emergency_stop_flag:

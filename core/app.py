@@ -168,6 +168,8 @@ class App:
                 on_open_done=self._make_on_open_done_fault_off(cid),
                 station_seek_enabled=self.config['elevator'].get('station_seek', False),
                 action_queue=self.action_queues[cid],
+                closing_timeout_seconds=self.config.get('passenger', {}).get(
+                    'closing_timeout_seconds', 10),
             )
 
         # 日志:替换 sys.stderr 为 TeeStderr → 所有模块 stderr 输出自动进文件+终端
@@ -411,6 +413,13 @@ class App:
 
         同优先级按距离升序；距离相同取小 car_id。
 
+        门状态策略：
+            - CLOSED：一定可用
+            - CLOSING：允许派车，但必须 door_close_done == 1（PLC 已确认关好）
+              → 此时车在等关门完成，call_internal 会把目标排到队列，等关门动作
+                 完成后由 _on_action_done 推 MOVE 启动，不会"关着门就发车"
+            - OPEN / OPENING：禁止派车（乘客还在上下车，强制启动会撞人）
+
         Returns:
             选中的 car_id，或 None（无可用轿厢）
         """
@@ -425,8 +434,20 @@ class App:
                 continue  # 司机模式:不接受外呼
             if self.manual_mode.get(cid, False):
                 continue
-            if car.door_state != DoorState.CLOSED:
-                continue  # 门开着（接客/开门/关门中）不派新外召
+            # 门状态过滤:CLOSED 直接通过;CLOSING 仅在 PLC 报告 door_close_done=1 时通过
+            if car.door_state == DoorState.CLOSED:
+                pass
+            elif car.door_state == DoorState.CLOSING:
+                try:
+                    close_done_addr = self.mapper.addr_input(
+                        'door_close_done', cid)
+                    if self.io.get_input(close_done_addr) != 1:
+                        continue  # PLC 还没确认关好,关门动作还在路上
+                except KeyError:
+                    continue
+            else:
+                # OPEN / OPENING → 拒绝派车,避免乘客还在上下时车跑掉
+                continue
             # 第二层防线：该车已在服务此 (floor, direction) pickup → 跳过
             if (self.pm is not None
                     and self.pm._pickup_active.get(cid, {}).get(
@@ -841,9 +862,24 @@ class App:
     async def call_internal(self, floor: int, car_id: int | None = None,
                             origin: str = 'internal') -> bool:
         cid = car_id if car_id is not None else self.current_car_id
-        if self.cars[cid].door_state != DoorState.CLOSED:
-            self._log_ui(f'[call_internal] car{cid} rejected: door={self.cars[cid].door_state.value}')
-            return False  # door not closed — reject call
+        # ★ 发车前再次校验门状态:必须是 CLOSED 或 (CLOSING + door_close_done=1)
+        # 防止 _dispatch_hall_call 选中后状态在间隙内变化导致"关门未完就发车"
+        car = self.cars[cid]
+        if car.door_state == DoorState.CLOSED:
+            pass
+        elif car.door_state == DoorState.CLOSING:
+            try:
+                close_done_addr = self.mapper.addr_input(
+                    'door_close_done', cid)
+                if self.io.get_input(close_done_addr) != 1:
+                    self._log_ui(f'[call_internal] car{cid} rejected: door=closing, close_done≠1')
+                    return False
+            except KeyError:
+                self._log_ui(f'[call_internal] car{cid} rejected: door=closing, no close_done addr')
+                return False
+        else:
+            self._log_ui(f'[call_internal] car{cid} rejected: door={car.door_state.value}')
+            return False  # OPEN/OPENING:拒绝,避免乘客还在上下时车跑掉
         if floor in self.pending_calls[cid]:
             self._log_ui(f'[call_internal] car{cid} rejected: floor L{floor} already pending={self.pending_calls[cid]}')
             return False
