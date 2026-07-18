@@ -648,6 +648,32 @@ class PassengerManager:
             # 无外召 pickup（内召到站/纯开门）→ 灭方向灯
             await app.executors[car_id].motor.set_direction_indicator(None)
 
+        # ★ 孤儿 hall_indicator 清理：找出没有任何 pickup 但灯仍亮的外召，清零
+        # 场景：外呼按钮在派车过程中松开，但 pickup_active 已设 → 灯保留
+        #       直到车开门接客时才清零；如果该车被改道/取消任务，灯就永久残留
+        # 解决：每次开门时，扫描所有车的 pickup_active，找出"灯亮但无 pickup"的外召，清零
+        all_pickup_keys = set()
+        for cid in self._app.car_ids:
+            for (floor, direction), active in self._pickup_active[cid].items():
+                if active:
+                    all_pickup_keys.add((floor, direction))
+        # 检查所有可能的 hall_indicator（10 层 × 2 方向）
+        building = self._app.config.get('building', {})
+        min_f = building.get('min_floor', 1)
+        max_f = building.get('max_floor', 10)
+        for floor in range(min_f, max_f + 1):
+            for direction in ('up', 'down'):
+                if (floor, direction) not in all_pickup_keys:
+                    # 没有任何 pickup 指向这个外召 → 检查灯是否仍亮
+                    try:
+                        addr = self._app.mapper.addr_input(
+                            f'hall_call_{direction}_{floor}', 0)
+                        button_pressed = self._app.io.get_input(addr) == 1
+                    except KeyError:
+                        button_pressed = False
+                    if not button_pressed:
+                        # 灯亮但无 pickup 且按钮未按下 → 清零
+                        await app.set_hall_indicator(floor, direction, False)
 
         held_pickups: list[tuple[int, str]] = []     # 按钮仍按住
         released_pickups: list[tuple[int, str]] = []  # 按钮已松开
