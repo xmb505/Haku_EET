@@ -663,6 +663,26 @@ class ActionExecutor:
                 await self._start_move_down()
 
             case ActionKind.OPEN_DOOR:
+                # ★ 冗余开门防护：如果 PLC 已报 door_open_done=1（门已物理开到位），
+                # 跳过物理开门，直接标记 OPEN。
+                # 原因：MOVE 完成时外召回调 (_handle_algorithm_state_change) 与
+                # 乘客队列回调 (_on_move_done) 可能同时入队两个 OPEN_DOOR，
+                # 第一次开门完成后继电器仍为 1，第二次 door.open() 不会产生上升沿，
+                # VPLC 的 door_open_done 延时任务不会触发，wait_done() 将永久阻塞。
+                try:
+                    open_done_addr = self.mapper.addr_input('door_open_done', self.car_id)
+                    already_opened = self.io.get_input(open_done_addr) == 1
+                except KeyError:
+                    already_opened = False
+                if already_opened:
+                    self._log(f'[exec] car{self.car_id} OPEN_DOOR skip: door_open_done=1, silent complete (no callback)')
+                    self.car.door_state = DoorState.OPEN
+                    # ★ 不调 _complete_action：冗余开门不应触发 on_action_done 回调链
+                    # 否则 PM._on_door_opened 会误设 pickup_active / 重复调度 close cron，
+                    # 导致外呼 LED 状态混乱或 cron 重复入队。
+                    self.current_action = None
+                    self.waiting_sensor = None
+                    return
                 # 平层安全校验:等两个平层信号都为 1 才开门（防止停偏时开门在半空）
                 # 比赛传感器布局下，station_seek 反冲后 level 才稳定
                 if self._station_seek_enabled:
