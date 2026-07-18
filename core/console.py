@@ -13,7 +13,7 @@ from typing import Awaitable, Callable
 
 from .app import App
 from .io_client import IOEvent
-from .player import CarState, Direction
+from .player import CarState, Direction, DoorState
 
 
 HELP_TEXT = """
@@ -1902,16 +1902,15 @@ class Console:
         if sig is None or sig != (0, 'auto_run'):
             return
         if event.bit == 1:
-            print('[competition] 收到自动运行信号(auto_run=1)，启动自动流程')
-            # 一次性触发：立即注销监听器，防止重复触发
-            if self._competition_listener_ref is not None:
-                try:
-                    self.app.io.remove_listener(self._competition_listener_ref)
-                except Exception:
-                    pass
-                self._competition_listener_ref = None
-            self._competition_task = asyncio.create_task(
-                self._run_competition_flow())
+            # 判断是否已经触发过第一轮
+            if self._competition_task is None or self._competition_task.done():
+                print('[competition] 收到第一次自动运行信号(auto_run=1)，启动首次流程')
+                self._competition_task = asyncio.create_task(
+                    self._run_competition_flow())
+            else:
+                print('[competition] 收到第二次自动运行信号(auto_run=1)，启动重新初始化流程')
+                self._competition_task = asyncio.create_task(
+                    self._run_recompetition_flow())
 
     async def _run_competition_flow(self) -> None:
         """比赛流程：初始化所有轿厢 → 等待就绪 → 启用用户模式"""
@@ -1969,6 +1968,95 @@ class Console:
         if enabled_cars:
             print(f'[competition] 用户模式已启用(car {enabled_cars}，ready=1，正常接客)')
         print('[competition] === 比赛自动流程完成 ===')
+
+    async def _run_recompetition_flow(self) -> None:
+        """二次 auto_run 信号：强制重新初始化
+        流程：
+            1. usermode false（停止接客）
+            2. 强制关门（door_close_relay=1）
+            3. 清所有输出（clear_outputs）
+            4. 等待 10s（让 IO2HTTP 把所有命令下达完）
+            5. 重新初始化所有轿厢
+            6. usermode true
+        """
+        from .player import CarState
+        print('[competition] === 二次初始化流程开始 ===')
+
+        car_ids = self.app.car_ids
+
+        # 1. 关闭用户模式
+        print('[competition] 1/6 关闭用户模式...')
+        await self.app.set_usermode(False)
+
+        # 2. 强制关门：写 door_close_relay=1，door_open_relay=0
+        print('[competition] 2/6 强制关门...')
+        for cid in car_ids:
+            try:
+                open_addr = self.app.mapper.addr_output('door_open_relay', cid)
+                close_addr = self.app.mapper.addr_output('door_close_relay', cid)
+                await self.app.io_write[cid].set_many({
+                    open_addr: 0,
+                    close_addr: 1,
+                })
+            except KeyError:
+                pass
+            # 同步门状态为 CLOSING（物理上可能还在开，但逻辑上标记为正在关）
+            self.app.cars[cid].door_state = DoorState.CLOSING
+
+        # 3. 清所有输出（让继电器全部归零，IO2HTTP 会下达）
+        print('[competition] 3/6 清所有输出...')
+        await self.app.clear_outputs()
+
+        # 4. 等待 10s（让 IO2HTTP 把所有命令下达完）
+        print('[competition] 4/6 等待 10s（让 IO2HTTP 下达所有命令）...')
+        await asyncio.sleep(10)
+
+        # 5. 重新初始化所有轿厢
+        print(f'[competition] 5/6 重新初始化 {len(car_ids)} 部轿厢: {car_ids}')
+        for cid in car_ids:
+            init_dir, init_target = self.app._get_car_init_config(cid)
+            print(f'[competition]  car{cid}: direction={init_dir}, target={init_target}')
+            await self.app.reset(direction=init_dir, target_floor=init_target, car_id=cid)
+
+        # 6. 等待就绪 + 启用用户模式
+        print('[competition] 6/6 等待初始化完成...')
+        timeout = self.app.config.get('elevator', {}).get(
+            'competition_init_timeout', 60.0)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            if asyncio.get_running_loop().time() > deadline:
+                ready_cars = [cid for cid in car_ids
+                              if self.app.cars[cid].state == CarState.READY
+                              and self.app.cars[cid].position is not None]
+                failed = [cid for cid in car_ids if cid not in ready_cars]
+                print(f'[competition] ⚠️  初始化超时({timeout}s)，已就绪: {ready_cars}，失败: {failed}')
+                if not ready_cars:
+                    print('[competition] 无任何轿厢就绪，放弃 usermode')
+                    return
+                result = await self.app.set_usermode(True, cars=ready_cars)
+                enabled_cars = result.get('enabled_cars', [])
+                print(f'[competition] partial usermode: car {enabled_cars} 已启用')
+                print('[competition] === 二次初始化流程完成(partial) ===')
+                return
+
+            all_ready = all(
+                self.app.cars[cid].state == CarState.READY
+                and self.app.cars[cid].position is not None
+                for cid in car_ids
+            )
+            if all_ready:
+                break
+            await asyncio.sleep(0.1)
+
+        print(f'[competition] 所有 {len(car_ids)} 部轿厢重新初始化完成')
+        result = await self.app.set_usermode(True)
+        blocked = result.get('blocked', [])
+        enabled_cars = result.get('enabled_cars', [])
+        if blocked:
+            print(f'[competition] usermode 部分失败: {blocked} 未就绪')
+        if enabled_cars:
+            print(f'[competition] 用户模式已启用(car {enabled_cars}，ready=1，正常接客)')
+        print('[competition] === 二次初始化流程完成 ===')
 
     async def cmd_debug(self, args: list[str]) -> None:
         if not args or args[0] != 'show':
