@@ -52,12 +52,13 @@ elevator:
   # 门动作完成超时(秒):/door open/close 派发后,等 door_open_done/close_done 信号
   # 超过此时间视为 PLC 异常,cron 兜底自动释放 _door_busy + 打印警告。
   door_complete_timeout: 1
-  # 关门延时(秒):开门后等待多久自动关门
-  # 当前控制层不读(已剥离 _schedule_close_door 副作用),留给未来 passenger_flow 模块
-  door_close_delay: 1
-  # 熄灯节能延时(秒):关门后等待多久自动熄灯
-  # 当前控制层不读(已剥离 _schedule_lights_off 副作用),留给未来 passenger_flow 模块
-  light_off_delay: 600
+  # 比赛模式初始化超时(秒):收到 auto_run=1 信号后,等待所有轿厢 READY 的最长时间
+  # 比赛现场如果电梯距离基站较远,可调大该值(如 5 车太远可设 120 或 180)
+  # 修改后执行 /reload 生效(下次 auto_run 触发时生效)
+  competition_init_timeout: 120
+  # 关门延时: 由 ui_config.yaml 的 passenger.door_close_delay_ms 控制，单位为毫秒
+  # 当前值 500ms = 0.5 秒。此字段仅作文档占位，代码实际读 ui_config.yaml
+  door_close_delay: 0.5
   # 每部电梯载重配置（用于重量三态机）
   # max_weight: 最大载重（kg）。threshold: 临界百分比（0.95 = 95%）。
   # 临界 = max * threshold ≤ weight ≤ max → state=1（不响应外呼）
@@ -70,7 +71,7 @@ elevator:
     '5': { max_weight: 900, threshold: 0.95, adc_full_scale_kg: 2000 }
     '6': { max_weight: 900, threshold: 0.95, adc_full_scale_kg: 2000 }
   # 超重应急 polling 间隔（毫秒）:状态 2 期间每 200ms 查一次 word,wait_weight ≤ max 退出
-  weight_poll_interval_ms: 1000
+  weight_poll_interval_ms: 200
 
 algorithm:
   # 首版只实现 simple_internal_call（响应内召，到目标层开门）

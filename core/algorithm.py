@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from typing import Iterable
 
 from .actions import Action, ActionKind
-from .player import Car, CarState
+from .player import Car, CarState, DoorState
 
 
 class ElevatorAlgorithm(ABC):
@@ -63,6 +63,10 @@ class SimpleInternalCall(ElevatorAlgorithm):
         # 当前由控制层兜底——OPEN_DOOR 完成时 _handle_algorithm_state_change
         # 返回 True 阻止 _tick 运行。等门关了（/door close 或未来 passenger_flow
         # 关门）CLOSE_DOOK 完成后 _tick 才恢复调度。
+
+        # ★ 门未关好，拒绝派 MOVE（防止 _start_move_up/down 静默失败）
+        if car.door_state != DoorState.CLOSED:
+            return []
 
         # 优先使用 call_internal 设的"立即目标" target_floor；
         # 没有再退回 pending_calls 取一个（队列非空）。

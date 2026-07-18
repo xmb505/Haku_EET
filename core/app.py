@@ -182,6 +182,7 @@ class App:
                 self.io_write[cid]._log_set = self._log_output
                 self.executors[cid]._log_stream = self._log_file
                 self.executors[cid]._log_term = self._original_stderr
+                self.executors[cid].door._log_file = self._log_file
 
         # 应用 slow_brake 配置（低速阶段叠加刹车档位）
         _slow_brake = self.config['elevator'].get('slow_brake', 0)
@@ -338,6 +339,13 @@ class App:
             self.executors[cid].start_weight_poller()
 
     async def stop(self) -> None:
+        # 停止站点吸附（清标志 + 停反冲电机）
+        for cid in self.car_ids:
+            exe = self.executors[cid]
+            exe._level_seek_active = False
+            if exe._level_correct_in_progress:
+                exe._level_correct_in_progress = False
+                await exe.motor.hold_stop()
         # 停止重量轮询器
         for cid in self.car_ids:
             self.executors[cid].stop_weight_poller()
@@ -583,6 +591,7 @@ class App:
             print(f'[tick] car={cid} pos={self.cars[cid].position} '
                   f'pending={self.pending_calls[cid]}')
         actions = self.algorithm.decide(self.cars[cid], self.pending_calls[cid])
+        self._log_ui(f'[tick] car{cid} pos={self.cars[cid].position} pending={self.pending_calls[cid]} door={self.cars[cid].door_state.value} actions={[a.kind.value for a in actions]}')
         for action in actions:
             # skip duplicate MOVE if executor already has one running
             if action.kind in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN):
@@ -669,6 +678,7 @@ class App:
             await self.weight_manager.on_close_door_completed(car_id)
 
         # 通知大脑（PassengerManager 需要知道门开/门关完成）
+        pm_dispatched = False
         if self.pm is not None:
             try:
                 await self.pm.on_action_done(car_id, last_action)
@@ -676,7 +686,39 @@ class App:
                 print(f'[app] car{car_id} PM.on_action_done 异常: {e!r}')
 
         if not advanced:
-            await self._tick(car_id)
+            # CLOSE_DOOR → PM._on_door_closed 已通过 call_internal → _tick 派车
+            # OPEN_DOOR → PM._on_door_opened 只调度 cron，不派车，仍需 _tick
+            # 避免双重 _tick 导致重复 MOVE 入队（第二个 MOVE 到站开门后静默失败）
+            if last_action.kind != ActionKind.CLOSE_DOOR:
+                await self._tick(car_id)
+
+        # ★ 车变空闲时尝试派 pending 外召
+        # 防止外召卡在 _pending_hall_calls 里：所有车都忙时外召被加入 pending，
+        # 但车完成后再无 door_close 事件触发重试，外召永远无人响应。
+        if (self.pm is not None
+                and self.pm._pending_hall_calls
+                and self.executors[car_id].current_action is None
+                and self.cars[car_id].door_state == DoorState.CLOSED):
+            await self.pm._try_dispatch_pending_hall_calls(car_id)
+
+        # ★ 兜底：车变空闲且门关着 + 无请求 → 启动 HP timer
+        # 场景：origin=internal 到站不开门 / _on_door_closed 因 pending 非空没调度 HP
+        # 这两种情况 _hp_timer 永远不会启动，灯永远亮
+        if (self.pm is not None
+                and self.executors[car_id].current_action is None
+                and self.cars[car_id].door_state == DoorState.CLOSED
+                and self.cars[car_id].state == CarState.READY):
+            jn = self.pm._human_presence_job_name(car_id)
+            # 没在 pending_calls / pending_hall_calls / pickup_active
+            no_pending = (not self.pending_calls[car_id]
+                          and not self.pm._pending_hall_calls
+                          and not any(self.pm._pickup_active.get(car_id, {}).values()))
+            if no_pending:
+                # 检查 cron 是否已经 schedule
+                scheduled = any(j.name == jn for j in self.cron._jobs.values())
+                if not scheduled:
+                    await self.pm._start_human_presence_timer(car_id)
+                    self._log_ui(f'[hp_fallback] car{car_id} 没收到 door_close,主动启动 HP timer')
 
     async def _handle_algorithm_state_change(
         self, car_id: int, last_action: Action
@@ -800,8 +842,10 @@ class App:
                             origin: str = 'internal') -> bool:
         cid = car_id if car_id is not None else self.current_car_id
         if self.cars[cid].door_state != DoorState.CLOSED:
+            self._log_ui(f'[call_internal] car{cid} rejected: door={self.cars[cid].door_state.value}')
             return False  # door not closed — reject call
         if floor in self.pending_calls[cid]:
+            self._log_ui(f'[call_internal] car{cid} rejected: floor L{floor} already pending={self.pending_calls[cid]}')
             return False
         if self.cars[cid].position == floor and not self.pending_calls[cid]:
             return False
@@ -978,9 +1022,6 @@ class App:
         exe._level_seek_active = False
         exe._level_seek_skip_next = False
         exe._level_correct_in_progress = False
-        if exe._relevel_future is not None and not exe._relevel_future.done():
-            exe._relevel_future.cancel()
-        exe._relevel_future = None
         exe._auto_seek_active = False
         self._door_busy[cid] = False
         # PM cron 由 self.pm.reset(cid) 在 _reset_state 中取消

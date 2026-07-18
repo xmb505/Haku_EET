@@ -9,16 +9,13 @@ passenger:
   #   keep:    全部保留，到达终点后继续处理（商用电梯模式）
   queue_mode: discard
 
-  # 关门延时(秒): 开门后外召按钮释放、等待多久关门
+  # 关门延时(毫秒): 开门后外召按钮释放、等待多久关门
   #   设为 0 = 按钮释放后下一 tick 立即关门
-  door_close_delay: 10
+  door_close_delay_ms: 500
 
-  # 熄灯节能延时(秒): 关门后等待多久自动熄灯
-  light_off_delay: 600
-  
   # human_presence 确认无人延时(秒): 门关 + 无召唤后多久推到 -1
-  # （三态机: 1=有人 → 0=不确定 → 10min 无活动 → -1=确定无人）
-  human_presence_off_delay: 600
+  # （三态机: 0=不确定 → 此延时后 → -1=确定无人，灯/风扇随之关闭）
+  human_presence_off_delay: 5
   
   # 外召指示灯闪烁间隔(毫秒)
   #   车减速靠近目标层时，外召灯按此频率闪烁

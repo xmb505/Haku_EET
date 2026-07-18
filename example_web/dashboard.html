@@ -161,6 +161,7 @@
         .door-badge.open { background: #ccffcc; border-color: #008000; color: #008000; }
         .door-badge.closed { background: #ffcccc; border-color: #800000; color: #800000; }
         .door-badge.opening { background: #ffffcc; border-color: #808000; color: #808000; }
+        .door-badge.closing { background: #ffe0cc; border-color: #804000; color: #804000; }
 
         /* 载重条 */
         .weight-row {
@@ -349,6 +350,49 @@
             flex-wrap: wrap;
             justify-content: flex-end;
         }
+
+        /* 菜单栏下拉 */
+        .menu-item-wrap {
+            position: relative;
+            padding: 2px 8px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .menu-item-wrap > .menu-item {
+            padding: 0;
+        }
+        .menu-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            background: var(--win-gray);
+            border: 2px solid;
+            border-color: var(--win-light) var(--win-darkest) var(--win-darkest) var(--win-light);
+            box-shadow: 2px 2px 0 rgba(0,0,0,0.3);
+            min-width: 160px;
+            z-index: 500;
+            padding: 2px 0;
+        }
+        .menu-dropdown.show { display: block; }
+        .menu-dropdown-item {
+            padding: 4px 12px;
+            font-size: 12px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .menu-dropdown-item:hover {
+            background: var(--win-title);
+            color: white;
+        }
+        .menu-dropdown-item.danger {
+            color: #cc0000;
+            font-weight: bold;
+        }
+        .menu-dropdown-item.danger:hover {
+            background: #cc0000;
+            color: white;
+        }
     </style>
 </head>
 <body>
@@ -365,6 +409,12 @@
         <div class="menu-bar">
             <span class="menu-item" onclick="showAbout()">关于(A)</span>
             <span class="menu-item" onclick="location.href='control.html'">控制面板(C)</span>
+            <div class="menu-item-wrap" onclick="toggleEmergencyMenu(event)">
+                <span class="menu-item">紧急动作(E)</span>
+                <div class="menu-dropdown" id="emergencyMenu">
+                    <div class="menu-dropdown-item danger" onclick="sendEscapeCmd(); closeEmergencyMenu();">! 火灾逃生模式（系统级）</div>
+                </div>
+            </div>
             <span class="menu-item" onclick="forceRefresh()">刷新(R)</span>
             <span class="menu-item" onclick="logout()">注销(L)</span>
         </div>
@@ -681,7 +731,9 @@
             hint.innerHTML = isSingle
                 ? `调度算法: <b>${algo}</b> — 单车独立调度，外召需 PassengerManager 分配`
                 : `调度算法: <b>${algo}</b>`;
-            panel.insertBefore(hint, panel.firstChild);
+            // 插入到 panel-body (#buildingView) 之前，而非 title-bar 之前
+            const bodyEl = document.getElementById('buildingView');
+            panel.insertBefore(hint, bodyEl);
         }
 
         function renderBuildingView(data) {
@@ -711,7 +763,7 @@
                     <div class="bldg-shaft">`;
 
                 positions.forEach(car => {
-                    const hasCar = car.position === f;
+                    const hasCar = car.floor === f;
                     html += '<div class="shaft-cell">';
                     if (hasCar) {
                         const mvClass = car.moving ? 'mv' : '';
@@ -816,6 +868,35 @@
             closeDialog('confirmDialog');
             if (_confirmCb) _confirmCb();
             _confirmCb = null;
+        }
+
+        // ============================================================
+        //  菜单栏紧急动作下拉
+        // ============================================================
+        function toggleEmergencyMenu(e) {
+            e.stopPropagation();
+            document.getElementById('emergencyMenu').classList.toggle('show');
+        }
+        function closeEmergencyMenu() {
+            document.getElementById('emergencyMenu').classList.remove('show');
+        }
+        document.addEventListener('click', function(e) {
+            if (!e.target.closest('.menu-item-wrap')) closeEmergencyMenu();
+        });
+
+        // ============================================================
+        //  火灾逃生（系统级：/escape true，所有电梯就近停车开门）
+        // ============================================================
+        function sendEscapeCmd() {
+            showConfirm('确认触发火灾逃生模式？将对所有电梯执行就近停车、点亮故障灯、开门。退出后需重新初始化。', function() {
+                addLogEntry('火灾逃生已触发（系统级）', 'err');
+                fetch(`${API_BASE}/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: 'system', action: 'escape', value: true }),
+                    signal: AbortSignal.timeout(5000)
+                }).catch(err => addLogEntry('火灾逃生发送失败: ' + err.message, 'err'));
+            });
         }
 
         // ============================================================

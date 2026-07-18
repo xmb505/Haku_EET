@@ -72,7 +72,7 @@ class TestCar:
         assert snap['display'] == 1
         assert set(snap['fault'].keys()) == {
             'overload', 'service_mode', 'light_curtain',
-            'top_limit', 'bottom_limit',
+            'top_limit', 'bottom_limit', 'driver_mode',
         }
 
     def test_repr(self):

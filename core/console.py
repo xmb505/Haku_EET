@@ -1856,6 +1856,11 @@ class Console:
             print('       请确认 io_profile 使用了 competition.yaml')
             return
 
+        # ★ 立即清理所有输出（不等 auto_run 信号）
+        # 防止上次运行残留信号在等待期间持续刷 IO2HTTP 造成延迟
+        print('[competition] 清理所有输出...')
+        await self.app.clear_outputs()
+
         self._competition_enabled = True
         self._competition_listener_ref = self._on_auto_run_event
         self.app.io.add_listener(self._competition_listener_ref)

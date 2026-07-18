@@ -179,23 +179,36 @@ class DoorController:
 
     on_breach callback fires when light_curtain interrupts closing.
     on_light_curtain callback fires on any light_curtain=true during open/close cycles.
+    on_lc_close callback fires on light_curtain during close (for fault light).
+    on_open_done callback fires when door_open_done received.
     """
 
     def __init__(self, io: IOClient, mapper: IOMapper, car_id: int,
                  io_write: IOClient | None = None,
                  on_breach: Callable[[], Awaitable[None]] | None = None,
-                 on_light_curtain: Callable[[], Awaitable[None]] | None = None) -> None:
+                 on_light_curtain: Callable[[], Awaitable[None]] | None = None,
+                 on_lc_close: Callable[[], Awaitable[None]] | None = None,
+                 on_open_done: Callable[[], Awaitable[None]] | None = None) -> None:
         self.io = io
         self.io_write = io_write if io_write is not None else io
         self.mapper = mapper
         self.car_id = car_id
         self._on_breach = on_breach
         self._on_light_curtain = on_light_curtain
+        self._on_lc_close = on_lc_close
+        self._on_open_done = on_open_done
 
         self._done = asyncio.Event()
         self._result: str = 'done'
         self._listeners: list[Callable] = []
         self._car_pos: int | None = None
+        self._log_file = None  # set by app for file-only diagnostic logging
+
+    def _log(self, msg: str) -> None:
+        """写日志文件（不刷终端）"""
+        if self._log_file is not None and hasattr(self._log_file, 'write'):
+            self._log_file.write(msg + '\n')
+            self._log_file.flush()
 
     # ---- public API ----
 
@@ -224,6 +237,7 @@ class DoorController:
         })
         # ★ 立即 flush，确保关门命令先到达 PLC，防止 breach 覆盖缓冲区
         await self.io_write.flush_now()
+        self._log(f'[door] car{self.car_id} close(): relay sent, listener registered')
 
     async def wait_done(self) -> str:
         """await door action completion; returns 'done' | 'breach' | 'wrong_floor'"""
@@ -263,6 +277,8 @@ class DoorController:
 
         if name == 'door_open_done' and event.bit == 1:
             self._remove_listeners()
+            if self._on_open_done is not None:
+                await self._on_open_done()
             self._done.set()
 
         elif name == 'light_curtain' and event.bit == 1:
@@ -281,6 +297,16 @@ class DoorController:
                 self._remove_listeners()
                 self._done.set()
 
+    async def _on_force_close_event(self, event: IOEvent) -> None:
+        """仅监听 door_close_done，忽略 light_curtain（强制关门）"""
+        sig = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig is None or sig[0] != self.car_id:
+            return
+        name = sig[1]
+        if name == 'door_close_done' and event.bit == 1:
+            self._remove_listeners()
+            self._done.set()
+
     async def _on_close_event(self, event: IOEvent) -> None:
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
         if sig is None or sig[0] != self.car_id:
@@ -288,24 +314,18 @@ class DoorController:
         name = sig[1]
 
         if name == 'door_close_done' and event.bit == 1:
+            self._log(f'[door] car{self.car_id} _on_close_event: door_close_done=1, done')
             self._remove_listeners()
             self._done.set()
 
         elif name == 'light_curtain' and event.bit == 1:
-            print(f'[door] car{self.car_id} breach, reversing to open')
-            # breach: reverse to open
-            self._remove_listeners()
-            self._result = 'breach'
-            # cut close relay, engage open relay
-            await self.io_write.set_many({
-                self.mapper.addr_output('door_open_relay', self.car_id): 1,
-                self.mapper.addr_output('door_close_relay', self.car_id): 0,
-            })
-            # broadcast breach event to upper layers
-            if self._on_breach is not None:
-                await self._on_breach()
-            # register open listener and wait for door_open_done
-            self._listeners.append(self.io.add_listener(self._on_open_event))
+            # ★ 光幕触发时不重开门：仅通知上层亮故障灯
+            if self._on_lc_close is not None:
+                await self._on_lc_close()
+        elif name == 'light_curtain' and event.bit == 0:
+            # 光幕清除 → 通知上层熄故障灯
+            if self._on_open_done is not None:
+                await self._on_open_done()
 
     # ---- internal helpers ----
 

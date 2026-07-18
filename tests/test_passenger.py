@@ -171,21 +171,19 @@ class TestPassengerManagerHallCall:
     """外召事件测试"""
 
     @pytest.mark.asyncio
-    async def test_hall_call_same_floor_opens_door(self, app: App):
-        """外召同层：hall_call_up_1 + car at L1 → 开门"""
-        # 准备：所有车就绪，启用 usermode
+    async def test_hall_call_same_floor_closed_door_opens(self, app: App):
+        """外呼同层门已关 → 派车开门接客"""
         _init_all_cars(app)
         await app.set_usermode(True)
         app.cars[1].position = 1
+        app.cars[1].door_state = DoorState.CLOSED
 
-        # 模拟 hall_call_up_1 按下
         i_addr = hall_call_i_addr(app, 'hall_call_up_1')
         app.io.simulate_input(i_addr, 1)
         await asyncio.sleep(0.1)
 
-        # 验证：OPEN_DOOR 已由 executor 开始处理
-        assert app.cars[1].door_state in (
-            DoorState.OPENING, DoorState.OPEN), f'door_state 应为 OPENING/OPEN，实际 {app.cars[1].door_state}'
+        # 门应重新打开接客
+        assert app.cars[1].door_state in (DoorState.OPENING, DoorState.OPEN)
 
     @pytest.mark.asyncio
     async def test_hall_call_pickup_state(self, app: App):
@@ -193,6 +191,8 @@ class TestPassengerManagerHallCall:
         _init_all_cars(app)
         await app.set_usermode(True)
         app.cars[1].position = 1
+        # 门开着 → dispatch 门开着跳过，但同层快捷路径标 pickup
+        app.cars[1].door_state = DoorState.OPENING
 
         i_addr = hall_call_i_addr(app, 'hall_call_up_1')
         app.io.simulate_input(i_addr, 1)
@@ -382,8 +382,8 @@ class TestPassengerManagerDoorFlow:
         await pm.on_action_done(1, Action(ActionKind.CLOSE_DOOR))
         await asyncio.sleep(0.05)
 
-        jn = pm._lights_off_job_name(1)
-        assert jn in pm._app.cron._jobs, f'熄灯 cron {jn} 应存在'
+        jn = pm._human_presence_job_name(1)
+        assert jn in pm._app.cron._jobs, f'human_presence cron {jn} 应存在'
 
 
 class TestPassengerManagerDismissedFloors:
@@ -544,7 +544,7 @@ class TestDoorCloseHallButtonProtection:
 
     @pytest.mark.asyncio
     async def test_door_close_cron_aborted_when_hall_held(self, app: App):
-        """关门 cron 触发时外召仍按住 → 不执行关门"""
+        """关门 cron 触发时即使外呼按住也照常关门"""
         _init_all_cars(app)
         await app.set_usermode(True)
         app.cars[1].position = 1
@@ -571,8 +571,8 @@ class TestDoorCloseHallButtonProtection:
         assert job is not None, 'cron job 应存在'
         await job.action()
 
-        # action_queue 中不应有 CLOSE_DOOR
-        assert app.action_queues[1].empty(), '外召按住时 cron 不应发送 CLOSE_DOOR'
+        # action_queue 中应有 CLOSE_DOOR（外呼不再续命，按住也照关）
+        assert not app.action_queues[1].empty(), '外呼按住时也应发送 CLOSE_DOOR'
 
 
 class TestDoorOpenButtonRelease:

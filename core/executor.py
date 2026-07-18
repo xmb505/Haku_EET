@@ -132,8 +132,6 @@ class ActionExecutor:
         self._level_seek_skip_next: bool = False
         # 保持模式反冲中(防止重入)
         self._level_correct_in_progress: bool = False
-        # 微调 Events
-        self._relevel_future: asyncio.Future | None = None
         # Auto-seek 状态:active 时车在下跑找 (↑1↓1),找到了就停 + 激活 hold,
         # 撞 bottom_limit_1 就 fallback 入队 INITIALIZE down 1
         self._auto_seek_active: bool = False
@@ -243,17 +241,9 @@ class ActionExecutor:
                             await self.action_queue.put(Action(ActionKind.INITIALIZE, floor=1))
                         return
 
-            # 站点吸附反冲中:level_up/down=1 → 只在 (↑1↓1) 时通知等待协程
-            if (sig2 is not None and sig2[0] == self.car_id
-                    and sig2[1] in ('level_up', 'level_down') and event.bit == 1
-                    and self._relevel_future is not None):
-                if self._level_up_i is not None and self._level_down_i is not None:
-                    up = self.io.get_input(self._level_up_i)
-                    dn = self.io.get_input(self._level_down_i)
-                    if up == 1 and dn == 1:
-                        self._relevel_future.set_result(True)
-            # 事件驱动平层检测:level_up/level_down 变化 → 检查偏离启动反冲
-            await self._level_seek_check()
+            # 站点吸附（事件驱动）：车空闲时每次 IO 事件都检查平层信号
+            if self._level_seek_active:
+                await self._level_seek_check()
             return
 
         sig = self.mapper.lookup_signal_by_i(event.i_addr)
@@ -403,20 +393,7 @@ class ActionExecutor:
                         await self._on_level_reached(direction=direction)
                     elif up_now == 0 and dn_now == 0 and self._move_perfect_leveling_active:
                         self._move_perfect_leveling_active = False
-            # 3c. 停车反冲中:只在两个平层信号同时=1时通知等待协程,不在任何 level=1 就停
-            if name in ('level_up', 'level_down') and event.bit == 1 and self._relevel_future is not None:
-                try:
-                    up = self.io.get_input(self.mapper.addr_input('level_up', self.car_id))
-                    dn = self.io.get_input(self.mapper.addr_input('level_down', self.car_id))
-                    if up == 1 and dn == 1:
-                        self._relevel_future.set_result(True)
-                except KeyError:
-                    pass
             return
-
-        # 3d. 保持模式:每个 IO 事件(不只是 level)都检查平层偏离,
-        # 发现信号偏了立刻反冲刹回,不会因为没有 level 事件而"睡觉"。
-        await self._level_seek_check()
 
         # 4. 等待特定传感器的动作（OPEN/CLOSE_DOOR 等）
         if self.waiting_sensor is None:
@@ -448,9 +425,6 @@ class ActionExecutor:
         self._level_seek_active = False
         self._level_seek_skip_next = False
         self._level_correct_in_progress = False
-        if self._relevel_future is not None and not self._relevel_future.done():
-            self._relevel_future.cancel()
-        self._relevel_future = None
         # Auto-seek 同步清场:否则 limit_2 撞 FAULT 后还可能继续往 (↑1↓1) 走
         self._auto_seek_active = False
         if self.on_emergency_stop is not None:
@@ -494,7 +468,6 @@ class ActionExecutor:
         await asyncio.sleep(0.1)
         if self._station_seek_enabled:
             self._level_seek_active = True
-            self._level_seek_skip_next = True
             self._log(f'[seek] car{self.car_id} 吸附激活')
         await self._complete_action()
 
@@ -576,69 +549,60 @@ class ActionExecutor:
                 self.decel_state = 'decel'
 
     async def _level_seek_check(self) -> None:
-        """保持模式:检查平层信号,偏离就反冲刹回（纯事件驱动，无轮询）
+        """站点吸附：纯事件驱动，无轮询无阻塞
 
-        在 _level_seek_active 时,每次 IO 事件后调用。
-        如果检测到偏离✓(↑1↓1),立刻释放刹车、向偏离反方向微动、
-        等待信号恢复后刹停。不 sleep / 无心跳定时器。
+        每次 IO 事件时调用（不受 current_action 限制）。
+        - 上平层=0 → 车往下漂 → 释放刹车 + 慢速向上 → 等上平层=1 事件来了刹死
+        - 下平层=0 → 车往上漂 → 释放刹车 + 慢速向下 → 等下平层=1 事件来了刹死
+        - 修正中信号恢复(=1) → 立即刹死
         """
-        if self._level_correct_in_progress or not self._level_seek_active:
+        if self._level_up_i is None or self._level_down_i is None:
             return
-        # 刚激活 hold 时跳过第一次检查,避免与 _complete_action 推入的下一个 MOVE 冲突
-        if self._level_seek_skip_next:
-            self._level_seek_skip_next = False
+        up = self.io.get_input(self._level_up_i)
+        dn = self.io.get_input(self._level_down_i)
+
+        if self._level_correct_in_progress:
+            # 修正中：任一信号恢复到完美平层 → 刹死
+            if up == 1 and dn == 1:
+                self._log(f'[seek] car{self.car_id} 平层恢复(↑1↓1) → 刹死')
+                await self.motor.hold_stop()
+                self._level_correct_in_progress = False
+                # 机械稳定窗口：150ms 内忽略后续抖动事件，防止反弹循环
+                self._level_seek_skip_next = True
+                asyncio.get_running_loop().call_later(
+                    0.15, self._clear_seek_skip)
             return
 
-        up = self.mapper.addr_input('level_up', self.car_id)
-        dn = self.mapper.addr_input('level_down', self.car_id)
-        up_now = self.io.get_input(up)
-        dn_now = self.io.get_input(dn)
-        if up_now == 1 and dn_now == 1:
-            return  # 完美平层,不动
-        if up_now == 0 and dn_now == 0:
-            return  # 两层之间/停车后传感器驻留结束,不误反冲
-
+        # 未修正中：检测漂移
+        if up == 1 and dn == 1:
+            return  # 完美平层
+        if up == 0 and dn == 0:
+            return  # 两层之间，不修正
+        # 缺哪个信号就往哪个方向反冲
+        correct_dir = 'up' if up == 0 else 'down'
         self._level_correct_in_progress = True
-        missing_dir = 'up' if dn_now == 0 else 'down'  # 缺下平层→向上找,缺上平层→向下找
-        wait_signal = 'level_down' if dn_now == 0 else 'level_up'
-        self._log(f'[seek] car{self.car_id} {missing_dir}反冲(↑{up_now}↓{dn_now})')
-        self._relevel_future = asyncio.get_running_loop().create_future()
+        self._log(f'[seek] car{self.car_id} {correct_dir}反冲(↑{up}↓{dn})')
         await self.motor.release_brakes()
-        # 低速微调:高速反冲会过冲过头、低速洗 1 次就好
-        await self.motor.start(high_speed=False, direction=missing_dir)
-        try:
-            await asyncio.wait_for(self._relevel_future, timeout=3.0)
-        except asyncio.TimeoutError:
-            self._log(f'[seek] car{self.car_id} 反冲超时(3s)')
-        finally:
-            await self.motor.hold_stop()
-            self._relevel_future = None
-            self._level_correct_in_progress = False
-            # 注:此 sleep 违反"无 sleep/wait"哲学,但与 _arrive_and_brake 同理——
-            # PLC 物理时序的必备 dead time。若 hold_stop 后机械反弹产生 level
-            # 边沿事件(常见于机械惯性大/制动响应慢的车),该事件会立即触发下一轮
-            # 反冲,形成"释放-刹车-反弹-再释放"的无限循环。150ms 稳定窗口足够
-            # 机械稳定 + level 抖动衰减,允许的事件驱动反冲节流到 ≥ 1 次/150ms。
-            # 不允许改成 cron 或删除,除非实机复现反弹 bug 且有 PLC 反馈信号替换方案。
-            await asyncio.sleep(0.15)
+        await self.motor.start(high_speed=False, direction=correct_dir)
+
+    def _clear_seek_skip(self) -> None:
+        """150ms 机械稳定窗口结束后清除跳过标志"""
+        self._level_seek_skip_next = False
 
     def set_station_seek(self, enabled: bool) -> None:
-        """切换站点吸附总开关（不影响正在运行的车）
+        """切换站点吸附总开关
 
-        开启只改 flag,实际激活由 _arrive_and_brake 在车空闲时点开。
-        关闭则立即卸载:清 hold_active + 取消任何反冲中的 future。
-
-        注意:auto-seek 逻辑由 app.set_station_seek 负责,本方法只管 flag。
+        开启只改 flag,实际激活由 _arrive_and_brake 在车到站时点开。
+        关闭则立即卸载:清 active + 取消任何反冲中的电机。
         """
         self._station_seek_enabled = enabled
         if not enabled:
-            # 关闭:清当前活跃 + 取消反冲
             self._level_seek_active = False
+            if self._level_correct_in_progress:
+                # 反冲电机还在跑，立即刹死（不 await，fire-and-forget）
+                self._level_correct_in_progress = False
+                asyncio.ensure_future(self.motor.hold_stop())
             self._log(f'[seek] car{self.car_id} 吸附关闭')
-            if self._relevel_future is not None and not self._relevel_future.done():
-                self._relevel_future.cancel()
-            self._relevel_future = None
-            self._level_correct_in_progress = False
 
     def is_station_seek_enabled(self) -> bool:
         return self._station_seek_enabled
@@ -665,14 +629,13 @@ class ActionExecutor:
 
     async def _start_action(self, action: Action) -> None:
         """展开 Action 为 IO 序列，设置等待传感器"""
-        # 有新动作 → 退出保持模式,取消任何正在进行的反冲
+        # 有新动作 → 退出保持模式,停止任何反冲电机
         # NOOP 不退出保持模式（算法在空闲时持续发 NOOP,每隔退出 hold 会让吸附永久不激活）
         if action.kind != ActionKind.NOOP:
             self._level_seek_active = False
-            if self._relevel_future is not None and not self._relevel_future.done():
-                self._relevel_future.cancel()
-            self._relevel_future = None
-            self._level_correct_in_progress = False
+            if self._level_correct_in_progress:
+                await self.motor.hold_stop()
+                self._level_correct_in_progress = False
         if self.debug:
             print(f'[exec] start {action}')
 
@@ -732,21 +695,40 @@ class ActionExecutor:
                 await self._complete_action()
 
             case ActionKind.CLOSE_DOOR:
-                self.car.door_state = DoorState.CLOSING
-                await self.door.close()
-                result = await self.door.wait_done()
-                if self._emergency_stop_flag:
-                    return  # emergency stop cancelled the door action
-                if result == 'cancelled':
-                    # 关门被重开请求打断 → 不改 door_state，让 OPEN_DOOR 接管
-                    pass
-                elif result == 'breach':
-                    self.car.door_state = DoorState.OPEN
-                    # breach reverses to open — report as OPEN_DOOR completion
-                    self.current_action = Action(ActionKind.OPEN_DOOR)
-                else:
+                # ★ 冗余关门防护：如果 PLC 已报 door_close_done=1（门已物理关好），
+                # 跳过物理关门，直接标记 CLOSED。
+                # 原因：cron / hall_call 松手等多路径可能向队列推入冗余 CLOSE_DOOR，
+                # 此时 PLC 的 door_close_done 已是 1，再发 door_close_relay=1 不会
+                # 产生上升沿事件，wait_done() 将永久阻塞导致车卡死在 CLOSING 状态。
+                try:
+                    close_done_addr = self.mapper.addr_input('door_close_done', self.car_id)
+                    already_closed = self.io.get_input(close_done_addr) == 1
+                except KeyError:
+                    already_closed = False
+                if already_closed:
+                    self._log(f'[exec] car{self.car_id} CLOSE_DOOR skip: door_close_done=1, silent discard (no callback)')
                     self.car.door_state = DoorState.CLOSED
-                await self._complete_action()
+                    # ★ 不调 _complete_action：冗余关门不应触发 on_action_done 回调链
+                    # 否则 PM._on_door_closed 会误清刚设好的 pickup_active，
+                    # 导致外呼 LED 永远不熄、pending hall call 看似已派但无人响应。
+                    self.current_action = None
+                    self.waiting_sensor = None
+                else:
+                    self.car.door_state = DoorState.CLOSING
+                    self._log(f'[exec] car{self.car_id} CLOSE_DOOR start: door_close_done=0, closing')
+                    await self.door.close()
+                    result = await self.door.wait_done()
+                    self._log(f'[exec] car{self.car_id} CLOSE_DOOR done: result={result}')
+                    if self._emergency_stop_flag:
+                        return
+                    if result == 'cancelled':
+                        pass
+                    elif result == 'breach':
+                        self.car.door_state = DoorState.OPEN
+                        self.current_action = Action(ActionKind.OPEN_DOOR)
+                    else:
+                        self.car.door_state = DoorState.CLOSED
+                    await self._complete_action()
 
             case ActionKind.SET_DISPLAY:
                 if action.glyph is not None:
@@ -872,7 +854,11 @@ class ActionExecutor:
     async def _start_move_up(self) -> None:
         """上行启动：释放刹车 + 点亮上行灯 + 电机（之后靠 _on_level_reached 减速）"""
         if self.car.door_state != DoorState.CLOSED:
-            return  # 门未关好，拒绝启动电机（防止门开着时行车导致计数器崩溃）
+            # 门未关好，拒绝启动电机（防止门开着时行车导致计数器崩溃）
+            # 必须 _complete_action 清理 current_action，否则 executor 永久卡在 MOVE_UP
+            self._log(f'[exec] car{self.car_id} MOVE_UP abort: door_state={self.car.door_state.value}')
+            await self._complete_action()
+            return
         self.decel_state = 'high_speed'
         self._last_level_up = 0
         self._last_move_direction = Direction.UP
@@ -895,7 +881,11 @@ class ActionExecutor:
     async def _start_move_down(self) -> None:
         """下行启动：释放刹车 + 点亮下行灯 + 电机"""
         if self.car.door_state != DoorState.CLOSED:
-            return  # 门未关好，拒绝启动电机（防止门开着时行车导致计数器崩溃）
+            # 门未关好，拒绝启动电机（防止门开着时行车导致计数器崩溃）
+            # 必须 _complete_action 清理 current_action，否则 executor 永久卡在 MOVE_DOWN
+            self._log(f'[exec] car{self.car_id} MOVE_DOWN abort: door_state={self.car.door_state.value}')
+            await self._complete_action()
+            return
         self.decel_state = 'high_speed'
         self._last_level_down = 0
         self._last_move_direction = Direction.DOWN

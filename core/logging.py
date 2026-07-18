@@ -8,15 +8,38 @@ logging.py —— 日志文件 + stderr 分流
 
 import sys
 import os
+import time
 from datetime import datetime
 
 
+class TimestampedFile:
+    """每行写入自动加 [HH:MM:SS.mmm] 时间戳"""
+    def __init__(self, file_obj):
+        self._file = file_obj
+
+    def write(self, msg: str) -> int:
+        ts = datetime.now().strftime('%H:%M:%S.') + f'{int(time.time() * 1000) % 1000:03d}'
+        if msg.endswith('\n'):
+            self._file.write(f'[{ts}] {msg}')
+        else:
+            self._file.write(f'[{ts}] {msg}\n')
+        self._file.flush()
+        return len(msg)
+
+    def flush(self) -> None:
+        self._file.flush()
+
+    @property
+    def raw(self):
+        """无时间戳的底层文件对象"""
+        return self._file
+
+
 class TeeStderr:
-    """同时写入原始 stderr 和日志文件的 stream 包装器"""
-    def __init__(self, original_stderr, log_file_path: str) -> None:
+    """同时写入原始 stderr 和日志文件（带时间戳）"""
+    def __init__(self, original_stderr, log_file) -> None:
         self._stderr = original_stderr
-        self._file = open(log_file_path, 'a', encoding='utf-8', buffering=1)
-        self._file_path = log_file_path
+        self._file = log_file  # TimestampedFile 或普通 file
 
     def write(self, msg: str) -> int:
         self._stderr.write(msg)
@@ -33,11 +56,10 @@ class TeeStderr:
         return self._stderr.fileno()
 
     def close(self) -> None:
-        self._file.close()
-
-    @property
-    def path(self) -> str:
-        return self._file_path
+        if hasattr(self._file, 'raw'):
+            self._file.raw.close()
+        else:
+            self._file.close()
 
 
 def init_log(log_dir: str = 'logs') -> tuple:
@@ -59,12 +81,13 @@ def init_log(log_dir: str = 'logs') -> tuple:
         n += 1
 
     # 纯文件（executor._log 用，终端受开关控制）
-    file_stream = open(path, 'a', encoding='utf-8', buffering=1)
+    raw_file = open(path, 'a', encoding='utf-8', buffering=1)
+    ts_file = TimestampedFile(raw_file)
 
-    # TeeStderr（替换 sys.stderr，所有模块的 stderr 输出自动进文件）
-    tee = TeeStderr(sys.stderr, path)
+    # TeeStderr（替换 sys.stderr，所有模块的 stderr 输出自动进文件+终端）
+    tee = TeeStderr(sys.stderr, ts_file)
 
-    file_stream.write(f'# Haku_EET 日志启动 {datetime.now().isoformat()}\n')
-    file_stream.flush()
+    raw_file.write(f'# Haku_EET 日志启动 {datetime.now().isoformat()}\n')
+    raw_file.flush()
 
-    return tee, file_stream
+    return tee, ts_file
