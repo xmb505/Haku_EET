@@ -6,6 +6,36 @@
     <title>EET 电梯控制系统 - 登录</title>
     <link rel="stylesheet" href="win95.css">
     <style>
+        @font-face {
+            font-family: 'FP12';
+            src: url('fusion-pixel-12px-proportional-latin.ttf') format('truetype');
+        }
+        @font-face {
+            font-family: 'FP12';
+            src: url('fusion-pixel-12px-proportional-zh_hans.ttf') format('truetype');
+            unicode-range: U+4E00-9FFF, U+3400-4DBF, U+FF00-FFEF, U+3000-303F;
+        }
+
+        * {
+            -webkit-font-smoothing: none;
+            -moz-osx-font-smoothing: unset;
+            font-smooth: never;
+            font-weight: normal !important;
+            font-family: 'FP12', monospace;
+            image-rendering: pixelated;
+        }
+
+        ::-webkit-scrollbar { width: 16px; height: 16px; }
+        ::-webkit-scrollbar-track {
+            background: repeating-conic-gradient(#c0c0c0 0% 25%, #fff 0% 50%) 0 0 / 2px 2px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #c0c0c0;
+            border: 2px solid;
+            border-color: #fff #404040 #404040 #fff;
+        }
+        ::-webkit-scrollbar-corner { background: #c0c0c0; }
+
         body {
             display: flex;
             align-items: center;
@@ -45,13 +75,11 @@
 
         .login-footer button {
             min-width: 80px;
+            font-weight: normal;
         }
 
-        .version-text {
-            font-size: 10px;
-            color: var(--win-shadow);
-            text-align: center;
-            padding: 4px 0 8px;
+        .title-bar-text {
+            font-weight: normal;
         }
     </style>
 </head>
@@ -72,34 +100,37 @@
             </div>
             <div class="form-row">
                 <label for="password">密　码：</label>
-                <input type="password" id="password" class="form-control" placeholder="请输入密码" value="12345678">
+                <input type="text" id="password" class="form-control" placeholder="请输入密码" autocomplete="off">
             </div>
         </div>
 
         <div class="login-footer">
-            <button onclick="doLogin()" class="btn-primary">确 定</button>
+            <button onclick="doLogin()" class="btn-primary">登 录</button>
             <button onclick="resetForm()">重 置</button>
-        </div>
-
-        <div class="version-text">
-            版本 1.0.0 — 模拟模式 | 系统时间: <span id="sysTime">—</span>
         </div>
     </div>
 
     <script>
-        // 系统时间显示
-        function updateTime() {
-            const now = new Date();
-            document.getElementById('sysTime').textContent =
-                now.toLocaleString('zh-CN', { hour12: false });
-        }
-        updateTime();
-        setInterval(updateTime, 1000);
+        let realPass = '12345678';
+        const passEl = document.getElementById('password');
+        passEl.value = '*'.repeat(realPass.length);
+
+        passEl.addEventListener('focus', function () {
+            this.value = realPass;
+            this.select();
+        });
+        passEl.addEventListener('blur', function () {
+            realPass = this.value;
+            this.value = '*'.repeat(realPass.length);
+        });
+        passEl.addEventListener('input', function () {
+            realPass = this.value;
+        });
 
         // 登录后跳转
         function doLogin() {
             const user = document.getElementById('username').value.trim();
-            const pass = document.getElementById('password').value.trim();
+            const pass = realPass.trim();
             const errEl = document.getElementById('loginError');
 
             if (!user || !pass) {
@@ -116,7 +147,8 @@
 
         function resetForm() {
             document.getElementById('username').value = '';
-            document.getElementById('password').value = '';
+            realPass = '';
+            passEl.value = '';
             document.getElementById('loginError').classList.remove('show');
         }
 

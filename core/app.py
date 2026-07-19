@@ -28,6 +28,7 @@ from .io_mapper import IOMapper
 from .player import Car, CarState, Direction, DoorState, IndicatorState
 from .ui import UiController
 from .virtual_plc import VirtualPLC
+from .watchdog import DoorWatchdog
 from .weight_manager import WeightManager
 from .logging import init_log
 
@@ -241,14 +242,24 @@ class App:
         self._usermode = False
         self.cron = Cron()
         self.pending_call_origin: dict[int, dict[int, str]] = {}
+        self._saved_internal_calls: dict[int, list[int]] = {}
         for cid in self.car_ids:
             self.pending_call_origin[cid] = {}
+            self._saved_internal_calls[cid] = []
 
         # ===== 上层乘客交互（大脑 — 可选插件） =====
         self.ui_config_path = self.config_path.parent / 'ui_config.yaml'
         self.pm: PassengerManager | None = None
         if PassengerManager is not None:
             self.pm = PassengerManager(self, self.ui_config_path)
+
+        # ===== 独立看门狗：CLOSING 卡死检测 =====
+        _wd_cfg = self.config.get('elevator', {})
+        self.door_watchdog = DoorWatchdog(
+            self,
+            timeout=_wd_cfg.get('door_watchdog_timeout', 5.0),
+            interval=_wd_cfg.get('door_watchdog_interval', 1.0),
+        )
 
     @property
     def car(self) -> Car:
@@ -353,7 +364,12 @@ class App:
             except Exception as e:
                 print(f'[web] 启动失败: {e}')
 
+        # 独立看门狗启动（CLOSING 卡死检测）
+        self.door_watchdog.start()
+
     async def stop(self) -> None:
+        # 停止看门狗
+        self.door_watchdog.stop()
         # 停止 Web 服务
         if hasattr(self, '_web_runner'):
             await self._web_runner.cleanup()
@@ -388,6 +404,11 @@ class App:
         """Car 状态 → JSON-safe dict（供 HMI / WebSocket 用）"""
         car = self.cars[car_id]
         per_car_w = self.config.get('elevator', {}).get('per_car_weight', {}).get(str(car_id), {})
+        exe = self.executors.get(car_id)
+        initializing = (
+            car.state == CarState.UNKNOWN
+            or (exe is not None and exe.current_action is not None
+                and exe.current_action.kind == ActionKind.INITIALIZE))
         return {
             'car_id': car_id,
             'state': car.state.value if car.state else 'unknown',
@@ -397,12 +418,46 @@ class App:
             'door_state': car.door_state.value if car.door_state else 'closed',
             'display': car.display,
             'fault': car.fault.any_active(),
+            'initializing': initializing,
             'weight_state': getattr(car, 'weight_state', 0),
             'weight_kg': getattr(car, 'weight_kg', 0),
             'max_weight': per_car_w.get('max_weight', 0),
             'driver_mode': getattr(car, 'driver_mode', False),
             'pending_calls': list(self.pending_calls.get(car_id, [])),
+            'operation_status': self._compute_operation_status(car_id),
         }
+
+    def _compute_operation_status(self, car_id: int) -> str:
+        """计算轿厢的操作状态（供 HMI 显示）
+
+        优先级: fault > initializing > boarding > decelerating > running > idle
+        """
+        car = self.cars[car_id]
+
+        # 故障优先
+        if car.state == CarState.FAULT:
+            return 'fault'
+
+        # 定位中
+        if car.state == CarState.UNKNOWN:
+            return 'initializing'
+        exe = self.executors.get(car_id)
+        if (exe is not None and exe.current_action is not None
+                and exe.current_action.kind == ActionKind.INITIALIZE):
+            return 'initializing'
+
+        # 接客（开门中/已开门）
+        if car.door_state in (DoorState.OPENING, DoorState.OPEN):
+            return 'boarding'
+
+        # 移动中
+        if car.direction != Direction.IDLE:
+            if exe and exe.decel_state == 'decel':
+                return 'decelerating'
+            return 'running'
+
+        # 空闲
+        return 'idle'
 
     def _log_ui(self, msg: str) -> None:
         """记录 UI 事件到日志文件，终端受 _print_ui_events 控制"""
@@ -600,6 +655,11 @@ class App:
         building = self.config.get('building', {})
         main_floor = building.get('min_floor', 1)  # 主楼层，默认 L1
 
+        # ★ 防乒乓：如果移动的车本身就是被 auto_park 派去主楼层的，跳过
+        origins = self.pending_call_origin.get(moving_car_id, {})
+        if origins.get(main_floor) == 'auto_park':
+            return
+
         # 检查是否已有空闲车在主楼层
         has_idle_at_main = False
         candidates = []
@@ -783,6 +843,16 @@ class App:
             return False
 
         if kind == ActionKind.INITIALIZE:
+            # ★ 恢复紧急停止前保存的内呼（乘客已按下的轿厢按钮）
+            saved = self._saved_internal_calls.get(car_id, [])
+            if saved:
+                self._saved_internal_calls[car_id] = []
+                for f in saved:
+                    if f not in self.pending_calls[car_id]:
+                        self.pending_calls[car_id].append(f)
+                        self.pending_call_origin[car_id][f] = 'internal'
+                self._log_ui(
+                    f'[emergency] car{car_id} 恢复 {len(saved)} 个内呼: {saved}')
             target = last_action.floor
             if target is not None and target != self.cars[car_id].position:
                 self.cars[car_id].target_floor = target
@@ -810,6 +880,13 @@ class App:
 
     def _make_on_emergency_stop(self, car_id: int):
         async def on_emergency():
+            # ★ 保存内呼：紧急停止会清空 pending_calls，但轿厢内按钮是乘客
+            #  已经按下的真实意图，INITIALIZE 恢复后应继续服务。
+            origins = self.pending_call_origin.get(car_id, {})
+            self._saved_internal_calls[car_id] = [
+                f for f in self.pending_calls[car_id]
+                if origins.get(f) == 'internal'
+            ]
             self.pending_calls[car_id].clear()
             self.cars[car_id].target_floor = None
             self.manual_mode[car_id] = False

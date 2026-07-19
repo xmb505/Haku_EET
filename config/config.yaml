@@ -48,14 +48,22 @@ elevator:
   # 低速阶段叠加刹车档位（0=不叠加，1-7=部分刹车）
   # 切低速接触器时自动叠加，切高速时自动释放
   # /settings slow_brake <N> 可运行时修改并落盘
-  slow_brake: 3
+  slow_brake: 5
   # 门动作完成超时(秒):/door open/close 派发后,等 door_open_done/close_done 信号
   # 超过此时间视为 PLC 异常,cron 兜底自动释放 _door_busy + 打印警告。
   door_complete_timeout: 8
+  # 独立看门狗:CLOSING 超过此秒数 → 检查 door_close_done/car_door_lock → 强制完成
+  # 比 door_complete_timeout 短,专门救 VPLC 不再触发 rising edge 的死锁
+  door_watchdog_timeout: 5
+  # 看门狗轮询间隔(秒)
+  door_watchdog_interval: 1
   # 开门前稳定等待(毫秒):到站停车后等待此时间，再检查平层信号决定是否开门
   # 期间如果完美平层(↑1↓1)未失效 → 停稳，可以开门
   # 如果平层信号失效 → 站点吸附介入修正，修正完再开门
   door_open_settle_ms: 1500
+  # 站点吸附修正超时(秒):反冲电机运行超过此时间仍未恢复 ↑1↓1 → 判定漂了整层
+  # 停车 + 入队 INITIALIZE 重新定位（防止修正电机无限运行）
+  seek_drift_timeout_s: 3
   # 比赛模式初始化超时(秒):收到 auto_run=1 信号后,等待所有轿厢 READY 的最长时间
   # 比赛现场如果电梯距离基站较远,可调大该值(如 5 车太远可设 120 或 180)
   # 修改后执行 /reload 生效(下次 auto_run 触发时生效)

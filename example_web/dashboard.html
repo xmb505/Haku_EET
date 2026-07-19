@@ -6,7 +6,85 @@
     <title>EET 电梯控制系统 - 监控面板</title>
     <link rel="stylesheet" href="win95.css">
     <style>
+        @font-face {
+            font-family: 'FP8';
+            src: url('fusion-pixel-8px-proportional-latin.ttf') format('truetype');
+        }
+        @font-face {
+            font-family: 'FP8';
+            src: url('fusion-pixel-8px-proportional-zh_hans.ttf') format('truetype');
+            unicode-range: U+4E00-9FFF, U+3400-4DBF, U+FF00-FFEF, U+3000-303F;
+        }
+        @font-face {
+            font-family: 'FP10';
+            src: url('fusion-pixel-10px-proportional-latin.ttf') format('truetype');
+        }
+        @font-face {
+            font-family: 'FP10';
+            src: url('fusion-pixel-10px-proportional-zh_hans.ttf') format('truetype');
+            unicode-range: U+4E00-9FFF, U+3400-4DBF, U+FF00-FFEF, U+3000-303F;
+        }
+        @font-face {
+            font-family: 'FP12';
+            src: url('fusion-pixel-12px-proportional-latin.ttf') format('truetype');
+        }
+        @font-face {
+            font-family: 'FP12';
+            src: url('fusion-pixel-12px-proportional-zh_hans.ttf') format('truetype');
+            unicode-range: U+4E00-9FFF, U+3400-4DBF, U+FF00-FFEF, U+3000-303F;
+        }
+
+        * {
+            -webkit-font-smoothing: none;
+            -moz-osx-font-smoothing: unset;
+            font-smooth: never;
+            font-weight: normal !important;
+            font-family: 'FP12', monospace;
+        }
+
         body { background: #008080; }
+
+        button, .btn {
+            font-family: 'FP12', monospace;
+            font-size: 12px;
+            font-weight: normal;
+            -webkit-font-smoothing: none;
+        }
+
+        .title-btn {
+            height: 14px;
+            min-height: 14px;
+            align-self: center;
+            line-height: 1;
+            padding: 0 3px;
+        }
+
+        ::-webkit-scrollbar { width: 16px; height: 16px; }
+        ::-webkit-scrollbar-track {
+            background: repeating-conic-gradient(#c0c0c0 0% 25%, #fff 0% 50%) 0 0 / 2px 2px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #c0c0c0;
+            border: 2px solid;
+            border-color: #fff #404040 #404040 #fff;
+        }
+        ::-webkit-scrollbar-thumb:active {
+            border-color: #404040 #fff #fff #404040;
+        }
+        ::-webkit-scrollbar-button {
+            background: #c0c0c0;
+            border: 2px solid;
+            border-color: #fff #404040 #404040 #fff;
+            display: block;
+            height: 16px;
+            width: 16px;
+        }
+        ::-webkit-scrollbar-button:active {
+            border-color: #404040 #fff #fff #404040;
+        }
+        ::-webkit-scrollbar-corner { background: #c0c0c0; }
+
+        * { image-rendering: pixelated; }
 
         .main-window {
             position: fixed;
@@ -63,8 +141,8 @@
         .panel-title {
             background: var(--win-title);
             color: white;
-            font-size: 11px;
-            font-weight: bold;
+            font-size: 12px;
+            font-weight: normal;
             padding: 2px 6px;
             display: flex;
             align-items: center;
@@ -101,17 +179,17 @@
         }
 
         .car-card .car-id {
-            font-weight: bold;
-            font-size: 14px;
+            font-weight: normal;
+            font-size: 12px;
             width: 44px;
             text-align: center;
             flex-shrink: 0;
         }
 
         .car-card .car-floor-box {
-            font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
-            font-size: 22px;
-            font-weight: bold;
+            font-family: 'FP12', monospace;
+            font-size: 24px;
+            font-weight: normal;
             background: #000;
             color: #00ff00;
             padding: 2px 8px;
@@ -122,12 +200,16 @@
         }
         .car-card .car-floor-box.fault {
             color: #ffff00;
-            animation: blink 0.4s ease-in-out infinite alternate;
+            animation: text-blink 0.4s step-end infinite alternate;
+        }
+        .car-card .car-floor-box.initializing {
+            color: #00e5ff;
+            animation: text-blink 1s step-end infinite alternate;
         }
 
         .car-card .car-arrow {
-            font-size: 22px;
-            font-weight: bold;
+            font-size: 24px;
+            font-weight: normal;
             width: 24px;
             text-align: center;
             flex-shrink: 0;
@@ -139,7 +221,8 @@
 
         .car-card .car-info {
             flex: 1;
-            font-size: 11px;
+            font-family: 'FP10', monospace;
+            font-size: 10px;
             display: flex;
             flex-wrap: wrap;
             gap: 2px 12px;
@@ -155,8 +238,9 @@
 
         .door-badge {
             padding: 1px 6px;
+            font-family: 'FP10', monospace;
             font-size: 10px;
-            font-weight: bold;
+            font-weight: normal;
             border: 1px solid;
             display: inline-block;
         }
@@ -202,22 +286,23 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 9px;
-            font-weight: bold;
+            font-family: 'FP8', monospace;
+            font-size: 8px;
+            font-weight: normal;
             color: #000;
-            text-shadow: 0 0 2px #fff;
             line-height: 1;
         }
 
         /* 建筑视图 */
         .building-hint {
+            font-family: 'FP10', monospace;
             font-size: 10px;
             color: #000080;
             background: #ffffcc;
             border: 1px solid #cccc00;
             padding: 2px 6px;
             margin-bottom: 4px;
-            font-weight: bold;
+            font-weight: normal;
         }
 
         .building-scroll {
@@ -230,7 +315,8 @@
             align-items: center;
             height: 20px;
             border-bottom: 1px solid #ccc;
-            font-size: 9px;
+            font-family: 'FP8', monospace;
+            font-size: 8px;
         }
 
         .bldg-row .bldg-floor {
@@ -239,7 +325,8 @@
             padding-right: 6px;
             color: #666;
             flex-shrink: 0;
-            font-size: 10px;
+            font-family: 'FP8', monospace;
+            font-size: 8px;
         }
 
         .bldg-row .bldg-shaft {
@@ -267,24 +354,25 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 10px;
+            font-family: 'FP8', monospace;
+            font-size: 8px;
             color: white;
-            font-weight: bold;
+            font-weight: normal;
         }
         .bldg-shaft .shaft-cell .car-pos.open    { background: #00aa00; border: 1px solid #00cc00; }
         .bldg-shaft .shaft-cell .car-pos.opening { background: #cccc00; border: 1px solid #dddd00; }
         .bldg-shaft .shaft-cell .car-pos.closing { background: #cc6600; border: 1px solid #dd7700; }
         .bldg-shaft .shaft-cell .car-pos.closed  { background: #cc0000; border: 1px solid #f66; }
 
-        @keyframes blink {
-            from { box-shadow: 0 0 2px rgba(204,0,0,0.3); }
-            to { box-shadow: 0 0 10px rgba(204,0,0,0.9); }
+        @keyframes text-blink {
+            from { opacity: 1; }
+            to { opacity: 0; }
         }
 
         /* 日志 */
         .log-box {
-            font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
-            font-size: 11px;
+            font-family: 'FP12', monospace;
+            font-size: 12px;
             height: 100%;
             overflow-y: auto;
             padding: 2px 4px;
@@ -325,8 +413,9 @@
             border: 1px solid;
             border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
             background: #fff;
+            font-family: 'FP10', monospace;
             font-size: 10px;
-            font-weight: bold;
+            font-weight: normal;
             color: #000;
             white-space: nowrap;
         }
@@ -345,7 +434,8 @@
             display: flex;
             align-items: center;
             gap: 4px;
-            font-size: 11px;
+            font-family: 'FP10', monospace;
+            font-size: 10px;
             flex-wrap: wrap;
             justify-content: flex-end;
         }
@@ -386,7 +476,7 @@
         }
         .menu-dropdown-item.danger {
             color: #cc0000;
-            font-weight: bold;
+            font-weight: normal;
         }
         .menu-dropdown-item.danger:hover {
             background: #cc0000;
@@ -398,15 +488,15 @@
     <div class="main-window">
         <!-- 标题栏 -->
         <div class="title-bar">
-            <span class="title-bar-text">EET 电梯系统监控面板 — [ 已连接 ]</span>
+            <span class="title-bar-text">EET 电梯控制系统 — [ 监控面板 ]</span>
             <div class="title-bar-controls">
-                <button class="title-btn close" onclick="logout()">←</button>
+                <button class="title-btn close" onclick="logout()">x</button>
             </div>
         </div>
 
         <!-- 菜单栏 -->
         <div class="menu-bar">
-            <span class="menu-item" onclick="showAbout()">关于(A)</span>
+            <span class="menu-item" onclick="location.href='dashboard.html'">监控面板(D)</span>
             <span class="menu-item" onclick="location.href='control.html'">控制面板(C)</span>
             <div class="menu-item-wrap" onclick="toggleEmergencyMenu(event)">
                 <span class="menu-item">紧急动作(E)</span>
@@ -415,6 +505,7 @@
                 </div>
             </div>
             <span class="menu-item" onclick="forceRefresh()">刷新(R)</span>
+            <span class="menu-item" onclick="showAbout()">关于(A)</span>
             <span class="menu-item" onclick="logout()">注销(L)</span>
         </div>
 
@@ -423,7 +514,7 @@
             <div class="toolbar-left">
                 <button class="btn-sm" onclick="location.href='control.html'">控制面板</button>
                 <div class="separator"></div>
-                <span id="refreshStatus" style="font-size:11px;">就绪</span>
+                <span id="refreshStatus" style="font-size:12px;">就绪</span>
             </div>
             <div class="toolbar-right">
                 <span class="meta-badge" id="statusAlgorithm" title="调度算法">算法: --</span>
@@ -483,16 +574,16 @@
             <div class="title-bar">
                 <span class="title-bar-text">关于 EET 电梯控制系统</span>
                 <div class="title-bar-controls">
-                    <button class="title-btn close" onclick="closeDialog('aboutDialog')">✕</button>
+                    <button class="title-btn close" onclick="closeDialog('aboutDialog')">x</button>
                 </div>
             </div>
             <div class="dialog-body" style="align-items:center;">
                 <div style="font-size: 36px; text-align:center;">E</div>
                 <div style="text-align:center;">
-                    <b>EET 电梯控制系统 v1.0</b><br>
-                    <span style="color:#666;font-size:11px;">电梯控制 HMI 前端</span>
+                    EET 电梯控制系统 v1.0<br>
+                    <span style="color:#666;font-size:12px;">电梯控制 HMI 前端</span>
                 </div>
-                <div style="border-top:1px solid #ccc;padding-top:8px;font-size:11px;width:100%;">
+                <div style="border-top:1px solid #ccc;padding-top:8px;font-size:12px;width:100%;">
                     <div>GET /stattrak — 数据接口</div>
                     <div>POST /control — 控制接口</div>
                 </div>
@@ -509,12 +600,12 @@
             <div class="title-bar">
                 <span class="title-bar-text">确认</span>
                 <div class="title-bar-controls">
-                    <button class="title-btn close" onclick="closeDialog('confirmDialog')">✕</button>
+                    <button class="title-btn close" onclick="closeDialog('confirmDialog')">x</button>
                 </div>
             </div>
             <div class="dialog-body">
                 <div style="display:flex;align-items:center;gap:12px;">
-                    <span style="font-size:32px;">?</span>
+                    <span style="font-size:36px;">?</span>
                     <span id="confirmMessage">确认注销退出？</span>
                 </div>
             </div>
@@ -597,7 +688,7 @@
             if (status === 'connected') {
                 badgeEl.className = 'connection-badge connected';
                 badgeEl.textContent = '● 已连接';
-                statusEl.textContent = '实时推送中';
+                statusEl.textContent = '192.168.1.8 已连接';
             } else if (status === 'connecting') {
                 badgeEl.className = 'connection-badge connecting';
                 badgeEl.textContent = '● 连接中...';
@@ -659,6 +750,31 @@
 
                 case 'car_state':
                     Object.entries(data).forEach(([cid, car]) => {
+                        const prev = state.cars[cid];
+                        if (prev) {
+                            const ps = prev.operation_status, cs = car.operation_status;
+                            if (ps !== 'fault' && cs === 'fault') {
+                                addLogEntry(`car${cid} 故障 (FAULT)`, 'err');
+                            } else if (ps === 'fault' && cs === 'initializing') {
+                                addLogEntry(`car${cid} 故障恢复 → 重新初始化`, 'warn');
+                            } else if (ps !== 'initializing' && cs === 'initializing') {
+                                addLogEntry(`car${cid} 开始初始化定位`, 'warn');
+                            } else if (ps === 'initializing' && cs !== 'initializing' && cs !== 'fault') {
+                                addLogEntry(`car${cid} 初始化完成`, 'ok');
+                            }
+                            const pd = prev.door_state, cd = car.door_state;
+                            if (pd !== cd) {
+                                if (cd === 'open') addLogEntry(`car${cid} ${car.position ?? '?'}层 门已开`, 'ok');
+                                else if (cd === 'closed' && pd !== 'closing') addLogEntry(`car${cid} 门已关`, 'info');
+                            }
+                            const pdir = prev.direction, cdir = car.direction;
+                            if (pdir !== cdir) {
+                                if (cdir === 'up') addLogEntry(`car${cid} ${car.position ?? '?'}层 开始上行`, 'info');
+                                else if (cdir === 'down') addLogEntry(`car${cid} ${car.position ?? '?'}层 开始下行`, 'info');
+                                else if ((pdir === 'up' || pdir === 'down') && cdir === 'idle')
+                                    addLogEntry(`car${cid} 到达 ${car.position ?? '?'}层`, 'ok');
+                            }
+                        }
                         state.cars[cid] = car;
                         renderCarCard(cid, car);
                     });
@@ -678,11 +794,16 @@
                     break;
 
                 case 'weight_event':
-                    // 重量变化（后端未广播时由 car_state 覆盖，保留作未来扩展）
                     if (data.car_id && state.cars[data.car_id]) {
+                        const prevW = state.cars[data.car_id].weight_state;
                         state.cars[data.car_id].weight_state = data.state;
                         state.cars[data.car_id].weight_kg = data.weight_kg;
                         renderCarCard(data.car_id, state.cars[data.car_id]);
+                        if (data.state >= 2 && prevW < 2) {
+                            addLogEntry(`car${data.car_id} 超载! ${data.weight_kg}kg`, 'err');
+                        } else if (data.state < 2 && prevW >= 2) {
+                            addLogEntry(`car${data.car_id} 载重恢复正常 ${data.weight_kg}kg`, 'ok');
+                        }
                     }
                     break;
 
@@ -697,6 +818,9 @@
                     } else if (data.type === 'auto_run') {
                         addLogEntry(`[比赛] ${data.msg}`, 'ok');
                     }
+                    break;
+
+                case 'cabin_led':
                     break;
 
                 default:
@@ -728,9 +852,15 @@
         }
 
         function stateLabel(s) {
-            if (s === 'ready') return '就绪';
-            if (s === 'fault') return '故障';
-            return '未知';
+            const labels = {
+                'idle': '空闲',
+                'running': '运行',
+                'decelerating': '减速',
+                'boarding': '接客',
+                'fault': '故障',
+                'initializing': '定位',
+            };
+            return labels[s] || s || '未知';
         }
 
         function doorLabel(d) {
@@ -743,8 +873,9 @@
         function buildCarCard(car) {
             const pos = car.position != null ? car.position : 'N/A';
             const isFault = car.state === 'fault';
-            const floorDisplay = isFault ? '!' : pos;
-            const floorClass = isFault ? 'fault' : '';
+            const isInit = car.initializing === true;
+            const floorDisplay = isFault ? '!' : isInit ? '!' : pos;
+            const floorClass = isFault ? 'fault' : isInit ? 'initializing' : '';
             const dir = car.direction || 'idle';
             const dirChar = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '◆';
             const door = car.door_state || 'closed';
@@ -763,7 +894,7 @@
                     <div class="car-floor-box ${floorClass}">${floorDisplay}</div>
                     <div class="car-arrow ${dir}">${dirChar}</div>
                     <div class="car-info">
-                        <span><span class="label">状态</span> ${stateLabel(car.state)}</span>
+                        <span><span class="label">状态</span> ${stateLabel(car.operation_status || car.state)}</span>
                         <span><span class="label">目标</span> ${target === '-' ? '-' : target + 'F'}</span>
                         <span><span class="label">显示</span> ${car.display ?? '-'}</span>
                         <span>
@@ -803,12 +934,13 @@
                 return;
             }
 
-            // 楼层 + 故障闪烁
+            // 楼层 + 故障/定位闪烁
             const pos = car.position != null ? car.position : 'N/A';
             const isFault = car.state === 'fault';
+            const isInit = car.initializing === true;
             const floorBox = card.querySelector('.car-floor-box');
-            floorBox.textContent = isFault ? '!' : pos;
-            floorBox.className = 'car-floor-box' + (isFault ? ' fault' : '');
+            floorBox.textContent = (isFault || isInit) ? '!' : pos;
+            floorBox.className = 'car-floor-box' + (isFault ? ' fault' : isInit ? ' initializing' : '');
 
             // 方向箭头
             const dir = car.direction || 'idle';
@@ -822,7 +954,7 @@
             const spans = info.querySelectorAll(':scope > span');
             const door = car.door_state || 'closed';
             const target = car.target_floor !== undefined && car.target_floor !== null ? car.target_floor : '-';
-            if (spans[0]) spans[0].innerHTML = '<span class="label">状态</span> ' + stateLabel(car.state);
+            if (spans[0]) spans[0].innerHTML = '<span class="label">状态</span> ' + stateLabel(car.operation_status || car.state);
             if (spans[1]) spans[1].innerHTML = '<span class="label">目标</span> ' + (target === '-' ? '-' : target + 'F');
             if (spans[2]) spans[2].innerHTML = '<span class="label">显示</span> ' + (car.display ?? '-');
             if (spans[3]) spans[3].innerHTML = '<span class="label">门</span><span class="door-badge ' + door + '">' + doorLabel(door) + '</span>';
@@ -853,8 +985,8 @@
             const hint = document.createElement('div');
             hint.className = 'building-hint';
             hint.innerHTML = isSingle
-                ? `调度算法: <b>${algo}</b> — 外召由 PassengerManager 统一分配`
-                : `调度算法: <b>${algo}</b>`;
+                ? `调度算法: ${algo} — 外召由 PassengerManager 统一分配`
+                : `调度算法: ${algo}`;
             const bodyEl = document.getElementById('buildingView');
             panel.insertBefore(hint, bodyEl);
         }
@@ -875,7 +1007,8 @@
                 moving: c.direction !== 'idle' && c.direction !== undefined,
                 dir: c.direction || 'idle',
                 door: c.door_state || 'closed',
-                fault: c.fault
+                fault: c.fault,
+                initializing: c.initializing === true
             }));
 
             let html = '';

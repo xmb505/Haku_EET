@@ -166,6 +166,8 @@ class PassengerManager:
         self.ai_need_2_enabled: bool = False
         # 光幕 breach 重试计数器（每次成功关门后清零）
         self._breach_count: dict[int, int] = {}
+        # target=None 救援 tick 冷却（防算法拒绝派车时 500ms 空转）
+        self._rescue_tick_cooldown: dict[int, float] = {}
 
     def _log_event(self, msg: str) -> None:
         """事件级日志：始终写文件，终端受 ai_need_2_enabled 控制"""
@@ -928,15 +930,17 @@ class PassengerManager:
         # 先计算车的行驶方向（不依赖 pending hall calls，避免反方向混入）
         effective_dir = car.direction
         if effective_dir == Direction.IDLE:
-            if car.last_dispatch_direction != Direction.IDLE:
-                effective_dir = car.last_dispatch_direction
-            elif all_requests and car.position is not None:
+            # ★ 优先用实际请求推断方向，不用历史方向（防止去 L10 被历史 DOWN 拉去 L4）
+            if all_requests and car.position is not None:
                 above = any(f > car.position for f in all_requests)
                 below = any(f < car.position for f in all_requests)
                 if above and not below:
                     effective_dir = Direction.UP
                 elif below and not above:
                     effective_dir = Direction.DOWN
+            # 请求方向不明确（上下都有）或无请求 → 退回历史方向
+            if effective_dir == Direction.IDLE and car.last_dispatch_direction != Direction.IDLE:
+                effective_dir = car.last_dispatch_direction
 
         # 如果仍是 IDLE（无内召无历史方向），从 pending 外呼位置推断方向
         sweep_mode = False
@@ -1189,6 +1193,9 @@ class PassengerManager:
 
         async def _hp_timer_action():
             car = self._app.cars[car_id]
+            # ★ 到期复查：如果期间来了新内呼，不熄灯
+            if self._app.pending_calls.get(car_id):
+                return
             # 门关 + 无请求后等待 N 秒 → 确认无人
             # HP 1=确认有人(轿内按钮/光幕) / 0=可能有人 / -1=确认没人
             # 轿内按钮按下没真上车时 HP=1，这种情况下也要降级到 -1
@@ -1372,16 +1379,26 @@ class PassengerManager:
                     and car.direction == Direction.IDLE
                     and car.position is not None):
                 continue
-            # 1a. pending 非空 + target 卡在 pos → 直接完成到站逻辑
-            if pending and car.target_floor == car.position:
+            # 1a. pending 非空 + target 卡在 pos 或 target 为空 → 解锁
+            if pending and (car.target_floor is None or car.target_floor == car.position):
                 pos = car.position
-                self._app.pending_calls[cid] = [c for c in pending if c != pos]
-                origin = self._app.pending_call_origin[cid].pop(pos, 'internal')
-                car.target_floor = None
-                car.last_dispatch_direction = Direction.IDLE
-                if origin == 'hall':
-                    await self._app.action_queues[cid].put(Action(ActionKind.OPEN_DOOR))
-                self._log_stderr(f'[brain_tick] rescue car{cid}: stuck at L{pos}, resolved (origin={origin})')
+                if car.target_floor == pos:
+                    # 卡在 pos：清除当前层的 pending  + 开门（外召到站）
+                    self._app.pending_calls[cid] = [c for c in pending if c != pos]
+                    origin = self._app.pending_call_origin[cid].pop(pos, 'internal')
+                    car.target_floor = None
+                    car.last_dispatch_direction = Direction.IDLE
+                    if origin == 'hall':
+                        await self._app.action_queues[cid].put(Action(ActionKind.OPEN_DOOR))
+                    self._log_stderr(f'[brain_tick] rescue car{cid}: stuck at L{pos}, resolved (origin={origin})')
+                else:
+                    # target=None 但有 pending：直接 tick 让算法选路（5s 冷却防空转）
+                    now = time.monotonic()
+                    last = self._rescue_tick_cooldown.get(cid, 0.0)
+                    if now - last > 5.0:
+                        self._rescue_tick_cooldown[cid] = now
+                        self._log_stderr(f'[brain_tick] rescue car{cid}: target=None pending={pending}, tick')
+                        await self._app._tick(cid)
             # 1b. pending 空但有 button_cache → 强制调度
             if not pending and self._button_cache.get(cid):
                 cache = self._button_cache[cid]
@@ -1406,6 +1423,11 @@ class PassengerManager:
                     continue
                 # 孤儿条件：楼层不在 pending 中
                 if floor not in my_pending:
+                    # ★ 同层且门非关（开门中/已开门）→ 正在服务，不是孤儿
+                    # 防止 at-floor 派车（只推 OPEN_DOOR 不写 pending_calls）被误判孤儿
+                    # → 回收 → 重派 → 再推 OPEN_DOOR 的洪泛死循环
+                    if car.position == floor and car.door_state != DoorState.CLOSED:
+                        continue
                     self._pickup_active[cid].pop((floor, direction), None)
                     self._pending_hall_calls.add((floor, direction))
                     self._log_pickup('orphan', cid, floor, direction, 'brain_tick')

@@ -323,6 +323,21 @@ class IOClient:
         if self.debug and updated > 0:
             print(f'[io:ws] bitmap 更新 {updated} 位（总 {len(data) * 8} 位），'
                   f'dispatch {len(changed_events)} 个事件')
+        if updated > 0 and hasattr(self, 'lookup_signal_by_i'):
+            # 收集涉及的车号
+            cars_in_batch = set()
+            for ev in changed_events:
+                sig = self.lookup_signal_by_i(ev.i_addr)
+                if sig is not None:
+                    cid, _ = sig
+                    if cid != 0:
+                        cars_in_batch.add(cid)
+            if cars_in_batch:
+                if hasattr(sys.stderr, '_file'):
+                    sys.stderr._file.write(
+                        f'[bitmap] 处理 {len(changed_events)} 个变化, '
+                        f'涉及 car{",".join(str(c) for c in sorted(cars_in_batch))}\n')
+                    sys.stderr._file.flush()
         # 派发变化事件——串行 await，确保 listener 按 bitmap 位顺序处理
         # （1 限位 + 2 限位同时为 1 时，让 executor 先看见 2 限位再急停）
         for ev in changed_events:

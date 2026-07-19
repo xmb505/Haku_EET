@@ -276,6 +276,7 @@ class DoorController:
         name = sig[1]
 
         if name == 'door_open_done' and event.bit == 1:
+            self._log(f'car{self.car_id} _on_open_event: door_open_done=1, done')
             self._remove_listeners()
             if self._on_open_done is not None:
                 await self._on_open_done()
@@ -292,7 +293,10 @@ class DoorController:
             except ValueError:
                 return
             car_pos = self._car_pos
+            self._log(f'car{self.car_id} _on_open_event: floor_door_lock_{lock_floor}=0, '
+                      f'car_pos={car_pos}, {"OK" if car_pos == lock_floor else "WRONG"}')
             if car_pos is not None and lock_floor != car_pos:
+                self._log(f'car{self.car_id} _on_open_event: wrong_floor L{lock_floor}≠pos{car_pos}')
                 self._result = 'wrong_floor'
                 self._remove_listeners()
                 self._done.set()

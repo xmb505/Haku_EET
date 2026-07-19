@@ -15,6 +15,7 @@ import asyncio
 import dataclasses
 import os
 import sys
+import time
 from typing import Awaitable, Callable
 
 from .actions import Action, ActionKind, ActionQueue
@@ -135,6 +136,9 @@ class ActionExecutor:
         self._level_seek_skip_next: bool = False
         # 保持模式反冲中(防止重入)
         self._level_correct_in_progress: bool = False
+        # 反冲开始时间（用于超时判定：漂了整层）
+        self._level_correct_start_time: float = 0.0
+        self._level_correct_timeout: float = 3.0
         # 站点吸附修正完成后需要自动开门(OPEN_DOOR 被延迟)
         self._level_seek_pending_door_open: bool = False
         # Auto-seek 状态:active 时车在下跑找 (↑1↓1),找到了就停 + 激活 hold,
@@ -406,7 +410,6 @@ class ActionExecutor:
             reverse_dir = 'down' if was_up else 'up'
             await self.motor.release_brakes()  # 释放前一次停车时保持的全刹
             await self.motor.start(high_speed=False, direction=reverse_dir)
-            await self.motor.set_speed(high_speed=False)  # 立即应用 slow_brake
             await self.motor.set_direction_indicator(reverse_dir)
             self.car.position = self._init_base_floor  # 基站位（11 或 -1）
             self._init_reverse_mode = True
@@ -429,6 +432,12 @@ class ActionExecutor:
 
         # 3. 检测平层信号边沿
         if name in ('level_up', 'level_down'):
+            addr_up2 = self.mapper.addr_input('level_up', self.car_id)
+            addr_dn2 = self.mapper.addr_input('level_down', self.car_id)
+            self._log(f'[level] car{self.car_id} {name}={event.bit} cache(↑{self.io.get_input(addr_up2)}'
+                      f'↓{self.io.get_input(addr_dn2)}) '
+                      f'action={self.current_action.kind.value if self.current_action else "None"} '
+                      f'door={self.car.door_state.value} seek={self._level_correct_in_progress}')
             if name == 'level_up':
                 self._last_level_up = event.bit
             else:
@@ -581,7 +590,17 @@ class ActionExecutor:
         """
         await self.motor.hold_stop()
         self.car.direction = Direction.IDLE
-        await self.motor.set_direction_indicator(None)
+        # ★ 极端楼层方向欺骗：最底层显示↑、最高层显示↓，吸引乘客进梯
+        building = self._app.config.get('building', {}) if self._app else {}
+        min_f = building.get('min_floor', 1)
+        max_f = building.get('max_floor', 10)
+        pos = self.car.position
+        if pos is not None and pos <= min_f:
+            await self.motor.set_direction_indicator('up')
+        elif pos is not None and pos >= max_f:
+            await self.motor.set_direction_indicator('down')
+        else:
+            await self.motor.set_direction_indicator(None)
         # 注:此 sleep 违反"无 sleep/wait"哲学,但实测是 PLC 物理时序的必备
         # dead time(详见 project/brake-before-stop.md)。不允许改成 cron 或删除,
         # 除非实机复现过冲 bug 且有 PLC 反馈信号替换方案(详见 feedback/practicality-first.md)
@@ -595,12 +614,11 @@ class ActionExecutor:
         """INIT 反向减速曲线：基站段全程低速，客运段复用正常减速逻辑
 
         remaining = target - new_pos（正=还需上行，负=还需下行）
-        - 基站段（_init_base_segment_done=False）：全程低速
+        - 基站段（_init_base_segment_done=False）：纯低速接触器（不叠加 slow_brake）
           防"反冲第一层高速冲过平层区刹不住"
-        - 客运段：复用标准减速（≥2 层高速，=1 层低速）
+        - 客运段：复用标准减速（≥2 层高速，=1 层低速 + slow_brake）
         """
         if not self._init_base_segment_done:
-            await self.motor.set_speed(high_speed=False)
             return
         dist = abs(remaining)
         if dist >= 2:
@@ -636,6 +654,9 @@ class ActionExecutor:
 
         new_pos = self.car.position
         remaining = target - new_pos  # 还差几层（正数=还需上行，负数=还需下行）
+        act_kind = self.current_action.kind.value if self.current_action else '?'
+        self._log(f'[pos] car{self.car_id} L{new_pos}(↑:{old_pos}→{new_pos}) '
+                  f'act={act_kind} dist={abs(remaining) if target is not None else "?"}')
 
         # ★ 目标方向校验：target 在反方向（车 UP 但 target 在下方 / 车 DOWN 但 target 在上方）
         # 通常是 grab-hall-call 后 target 留在了反方向（grab 只缩短 target 不延长）
@@ -703,9 +724,15 @@ class ActionExecutor:
                     prev_brake_level = self.motor.slow_brake_level
                     self.motor.slow_brake_level = 6
                     await self.motor.set_speed(high_speed=False)
+                    self._log(f'[brake] car{self.car_id} dist=1 slow_brake={prev_brake_level}→6 '
+                              f'b1={self.io.get_input(self.mapper.addr_output("brake_1", self.car_id))} '
+                              f'b2={self.io.get_input(self.mapper.addr_output("brake_2", self.car_id))} '
+                              f'b3={self.io.get_input(self.mapper.addr_output("brake_3", self.car_id))}')
                     self.motor.slow_brake_level = prev_brake_level
                 else:
                     await self.motor.set_speed(high_speed=False)
+                    self._log(f'[brake] car{self.car_id} dist=1 slow_brake={self.motor.slow_brake_level} '
+                              f'b1=1 b2=1 b3=1')
                 self.decel_state = 'decel'
 
     async def _level_seek_check(self) -> None:
@@ -715,6 +742,8 @@ class ActionExecutor:
         - 上平层=0 → 车往下漂 → 释放刹车 + 慢速向上 → 等上平层=1 事件来了刹死
         - 下平层=0 → 车往上漂 → 释放刹车 + 慢速向下 → 等下平层=1 事件来了刹死
         - 修正中信号恢复(=1) → 立即刹死
+        - 修正中 ↑0↓0（两层之间）→ 判定漂了整层 → 停车 → INITIALIZE 重新定位
+        - 修正中超时（seek_drift_timeout_s）→ 同上
         """
         if self._level_up_i is None or self._level_down_i is None:
             return
@@ -746,6 +775,19 @@ class ActionExecutor:
                     if should_open and self.action_queue is not None:
                         self._log(f'[seek] car{self.car_id} 平层完成 → 推 OPEN_DOOR')
                         await self.action_queue.put(Action(ActionKind.OPEN_DOOR))
+                return
+
+            # ★ 漂移保护：↑0↓0 = 车已漂离平层区（两层之间），微调修不回来
+            if up == 0 and dn == 0:
+                self._log(f'[seek] car{self.car_id} 修正中 ↑0↓0 → 漂了整层,停车 → INITIALIZE')
+                await self._seek_abort_and_reinit()
+                return
+
+            # ★ 超时保护：修正电机运行超过 N 秒仍未恢复 → 判定漂了整层
+            if time.monotonic() - self._level_correct_start_time > self._level_correct_timeout:
+                self._log(f'[seek] car{self.car_id} 修正超时({self._level_correct_timeout}s) → 漂了整层,停车 → INITIALIZE')
+                await self._seek_abort_and_reinit()
+                return
             return
 
         # 未修正中：检测漂移
@@ -757,10 +799,34 @@ class ActionExecutor:
         # ↑1↓0(丢下平层)往下跑；↑0↓1(丢上平层)往上跑
         correct_dir = 'down' if dn == 0 else 'up'
         self._level_correct_in_progress = True
+        self._level_correct_start_time = time.monotonic()
+        self._level_correct_timeout = (
+            self._app.config.get('elevator', {}).get('seek_drift_timeout_s', 3.0)
+            if hasattr(self, '_app') and self._app is not None else 3.0)
         self._log(f'[seek] car{self.car_id} {correct_dir}反冲(↑{up}↓{dn})')
         await self.motor.release_brakes()
         await self.motor.start(high_speed=False, direction=correct_dir)
         await self.motor.set_speed(high_speed=False)  # 慢速必须带刹车，防止冲回站台
+
+    async def _seek_abort_and_reinit(self) -> None:
+        """站点吸附修正失败：停车 + 清状态 + 清队列 + 入队 INITIALIZE 重新定位"""
+        await self.motor.hold_stop()
+        self._level_correct_in_progress = False
+        self._level_seek_active = False
+        self._level_seek_pending_door_open = False
+        self._level_seek_skip_next = False
+        if self.action_queue is not None:
+            # 清掉残留 OPEN_DOOR 等 stale 动作，防止 settle_ms 串行累加延迟 INITIALIZE
+            while not self.action_queue.empty():
+                try:
+                    self.action_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            _, target_floor = (self._app._get_car_init_config(self.car_id)
+                               if hasattr(self, '_app') and self._app is not None
+                               else ('down', 1))
+            await self.action_queue.put(
+                Action(ActionKind.INITIALIZE, floor=target_floor))
 
     def _clear_seek_skip(self) -> None:
         """150ms 机械稳定窗口结束后清除跳过标志"""
@@ -806,6 +872,14 @@ class ActionExecutor:
 
     async def _start_action(self, action: Action) -> None:
         """展开 Action 为 IO 序列，设置等待传感器"""
+        # ★ 吸附修正中收到冗余 OPEN_DOOR → 跳过，不打断修正电机
+        # 修正完成后 _level_seek_pending_door_open 会自动推 OPEN_DOOR
+        if (action.kind == ActionKind.OPEN_DOOR
+                and self._level_correct_in_progress):
+            self._log(f'[exec] car{self.car_id} OPEN_DOOR skip: seek correction in progress')
+            self.current_action = None
+            self.waiting_sensor = None
+            return
         # 有新动作 → 退出保持模式,停止任何反冲电机
         # NOOP 不退出保持模式（算法在空闲时持续发 NOOP,每隔退出 hold 会让吸附永久不激活）
         if action.kind != ActionKind.NOOP:
@@ -886,6 +960,9 @@ class ActionExecutor:
                                       f' → 吸附修正后开门')
                             self.current_action = None
                             self.waiting_sensor = None
+                            # ★ 直接启动修正电机，不等 IO 事件
+                            # 静止车无 IO 事件 → _level_seek_check 永远不被调用 → 死循环
+                            await self._level_seek_check()
                             return
                 self.car.door_state = DoorState.OPENING
                 await self._log_door_trace('open_start')
@@ -947,6 +1024,15 @@ class ActionExecutor:
                     already_closed = False
                 if not already_closed and self.car.door_state == DoorState.CLOSED:
                     already_closed = True
+                # ★ car_door_lock=1 也说明门已物理关好（继电器失电后 door_close_done
+                # 复位为 0，但门锁仍锁 = 门确实关着，VPLC 不会再触发上升沿）
+                if not already_closed:
+                    try:
+                        lock_addr = self.mapper.addr_input('car_door_lock', self.car_id)
+                        if self.io.get_input(lock_addr) == 1:
+                            already_closed = True
+                    except KeyError:
+                        pass
                 if already_closed:
                     self._log(f'[exec] car{self.car_id} CLOSE_DOOR skip: door_close_done=1, silent discard (no callback)')
                     self.car.door_state = DoorState.CLOSED
@@ -1100,7 +1186,6 @@ class ActionExecutor:
             # 用低速启动基站段，与运行时触限位反冲行为一致
             await self.motor.release_brakes()
             await self.motor.start(high_speed=False, direction='down')
-            await self.motor.set_speed(high_speed=False)  # 立即应用 slow_brake
             if await self._try_complete_init_if_at_target():
                 return
             self._log(f'[exec] 初始化: 已在顶站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
@@ -1131,7 +1216,6 @@ class ActionExecutor:
             # 修复：上电时已在底限位的情况下启动电机+低速反向往上
             await self.motor.release_brakes()
             await self.motor.start(high_speed=False, direction='up')
-            await self.motor.set_speed(high_speed=False)  # 立即应用 slow_brake
             if await self._try_complete_init_if_at_target():
                 return
             self._log(f'[exec] 初始化: 已在底站，直接反向计数 base=L{self._init_base_floor} → target=L{self._init_target_floor}')
@@ -1211,6 +1295,7 @@ class ActionExecutor:
             case ActionKind.INITIALIZE:
                 # 反向逐层计数已在 on_io_event 中设置了正确 position
                 self.car.state = CarState.READY
+                self._emergency_stop_flag = False
                 # 初始化完成 → 清掉端站限位 fault 标志
                 # (到达基站是"成功定位"而不是"撞限位故障")
                 self.car.fault = dataclasses.replace(

@@ -6,6 +6,84 @@
     <title>EET 电梯控制系统 - 控制面板</title>
     <link rel="stylesheet" href="win95.css">
     <style>
+        @font-face {
+            font-family: 'FP8';
+            src: url('fusion-pixel-8px-proportional-latin.ttf') format('truetype');
+        }
+        @font-face {
+            font-family: 'FP8';
+            src: url('fusion-pixel-8px-proportional-zh_hans.ttf') format('truetype');
+            unicode-range: U+4E00-9FFF, U+3400-4DBF, U+FF00-FFEF, U+3000-303F;
+        }
+        @font-face {
+            font-family: 'FP10';
+            src: url('fusion-pixel-10px-proportional-latin.ttf') format('truetype');
+        }
+        @font-face {
+            font-family: 'FP10';
+            src: url('fusion-pixel-10px-proportional-zh_hans.ttf') format('truetype');
+            unicode-range: U+4E00-9FFF, U+3400-4DBF, U+FF00-FFEF, U+3000-303F;
+        }
+        @font-face {
+            font-family: 'FP12';
+            src: url('fusion-pixel-12px-proportional-latin.ttf') format('truetype');
+        }
+        @font-face {
+            font-family: 'FP12';
+            src: url('fusion-pixel-12px-proportional-zh_hans.ttf') format('truetype');
+            unicode-range: U+4E00-9FFF, U+3400-4DBF, U+FF00-FFEF, U+3000-303F;
+        }
+
+        * {
+            -webkit-font-smoothing: none;
+            -moz-osx-font-smoothing: unset;
+            font-smooth: never;
+            font-weight: normal !important;
+            font-family: 'FP12', monospace;
+        }
+
+        button, .btn {
+            font-family: 'FP12', monospace;
+            font-size: 12px;
+            font-weight: normal;
+            -webkit-font-smoothing: none;
+        }
+
+        .title-btn {
+            height: 14px;
+            min-height: 14px;
+            align-self: center;
+            line-height: 1;
+            padding: 0 3px;
+        }
+
+        ::-webkit-scrollbar { width: 16px; height: 16px; }
+        ::-webkit-scrollbar-track {
+            background: repeating-conic-gradient(#c0c0c0 0% 25%, #fff 0% 50%) 0 0 / 2px 2px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #c0c0c0;
+            border: 2px solid;
+            border-color: #fff #404040 #404040 #fff;
+        }
+        ::-webkit-scrollbar-thumb:active {
+            border-color: #404040 #fff #fff #404040;
+        }
+        ::-webkit-scrollbar-button {
+            background: #c0c0c0;
+            border: 2px solid;
+            border-color: #fff #404040 #404040 #fff;
+            display: block;
+            height: 16px;
+            width: 16px;
+        }
+        ::-webkit-scrollbar-button:active {
+            border-color: #404040 #fff #fff #404040;
+        }
+        ::-webkit-scrollbar-corner { background: #c0c0c0; }
+
+        * { image-rendering: pixelated; }
+
         body { background: #008080; }
 
         .main-window {
@@ -44,8 +122,8 @@
         .ctrl-panel .panel-head {
             background: var(--win-title);
             color: white;
-            font-size: 11px;
-            font-weight: bold;
+            font-family: 'FP12', monospace;
+            font-size: 12px;
             padding: 2px 6px;
             display: flex;
             align-items: center;
@@ -105,7 +183,6 @@
         }
         .menu-dropdown-item.danger {
             color: #cc0000;
-            font-weight: bold;
         }
         .menu-dropdown-item.danger:hover {
             background: #cc0000;
@@ -113,7 +190,7 @@
         }
 
         #carStatus {
-            font-size: 11px;
+            font-size: 12px;
             color: #666;
             flex: 1;
         }
@@ -129,8 +206,7 @@
             flex: 1;
             min-width: 0;
             height: 42px;
-            font-size: 13px;
-            font-weight: bold;
+            font-size: 12px;
             min-width: unset;
             padding: 0;
             display: flex;
@@ -176,7 +252,7 @@
             display: flex;
             align-items: center;
             gap: 8px;
-            font-size: 11px;
+            font-size: 12px;
         }
 
         .module-label {
@@ -208,8 +284,8 @@
             background: #fff;
             border: 2px solid;
             border-color: var(--win-shadow) var(--win-light) var(--win-light) var(--win-shadow);
-            font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
-            font-size: 11px;
+            font-family: 'FP12', monospace;
+            font-size: 12px;
             padding: 4px;
             height: 80px;
             overflow-y: auto;
@@ -231,7 +307,7 @@
             font-size: 10px;
             padding: 1px 4px;
             border-bottom: 1px solid #eee;
-            font-family: 'Fusion Pixel', 'Consolas', 'Courier New', monospace;
+            font-family: 'FP10', monospace;
         }
 
         .history-item .h-time { color: #999; }
@@ -244,31 +320,32 @@
     <div class="main-window">
         <!-- 标题栏 -->
         <div class="title-bar">
-            <span class="title-bar-text">EET 电梯控制面板 — [ 手动操控 ]</span>
+            <span class="title-bar-text">EET 电梯控制系统 — [ 控制面板 ]</span>
             <div class="title-bar-controls">
-                <button class="title-btn close" onclick="location.href='dashboard.html'">←</button>
+                <button class="title-btn close" onclick="location.href='dashboard.html'">x</button>
             </div>
         </div>
 
         <!-- 菜单栏 -->
         <div class="menu-bar">
-            <span class="menu-item" onclick="showCtrlHelp()">操作说明(H)</span>
             <span class="menu-item" onclick="location.href='dashboard.html'">监控面板(D)</span>
+            <span class="menu-item" onclick="location.href='control.html'">控制面板(C)</span>
             <div class="menu-item-wrap" onclick="toggleEmergencyMenu(event)">
                 <span class="menu-item">紧急动作(E)</span>
                 <div class="menu-dropdown" id="emergencyMenu">
                     <div class="menu-dropdown-item danger" onclick="sendEscapeCmd(); closeEmergencyMenu();">! 火灾逃生模式（系统级）</div>
                 </div>
             </div>
-            <span class="menu-item" onclick="clearHistory()">清除历史(C)</span>
             <span class="menu-item" onclick="quickTest()">自检(T)</span>
+            <span class="menu-item" onclick="showCtrlHelp()">操作说明(H)</span>
+            <span class="menu-item" onclick="logout()">注销(L)</span>
         </div>
 
         <!-- 工具栏 -->
         <div class="toolbar">
             <span id="ctrlConnection" class="connection-badge disconnected">● 未连接</span>
             <div class="separator"></div>
-            <span style="font-size:11px;" id="ctrlStatusText">就绪</span>
+            <span style="font-size:12px;" id="ctrlStatusText">就绪</span>
         </div>
 
         <!-- 主体 -->
@@ -301,7 +378,7 @@
                         <div class="car-call-grid" id="carCallGrid">
                             <!-- 由 JS 生成 -->
                         </div>
-                        <div style="font-size:10px;color:#888;margin-top:4px;">
+                        <div style="font-size:10px;font-family:'FP10',monospace;color:#888;margin-top:4px;">
                             黄灯亮 = 该楼层已召唤待服务 | 点击按钮发送内召
                         </div>
                     </div>
@@ -319,7 +396,7 @@
                                 <button class="cmd-btn" onclick="sendDoorCmd('close')">关门</button>
                             </div>
                         </div>
-                        <div style="font-size:10px;color:#888;margin-top:4px;">
+                        <div style="font-size:10px;font-family:'FP10',monospace;color:#888;margin-top:4px;">
                             司机模式下仅关门按钮生效
                         </div>
                     </div>
@@ -329,7 +406,7 @@
                     <div class="panel-head"> 电梯命令</div>
                     <div class="panel-body">
                         <div class="ctrl-row">
-                            <label style="font-size:11px;display:flex;align-items:center;gap:6px;">
+                            <label style="font-size:12px;display:flex;align-items:center;gap:6px;">
                                 司机模式
                                 <select id="modDriverMode" onchange="sendDriverCmd(this.value)" style="min-width:80px;">
                                     <option value="false">关</option>
@@ -338,7 +415,7 @@
                             </label>
                             <button class="cmd-btn" onclick="sendEmergencyStop()" style="background:#cc0000;color:#fff;">! 急停</button>
                         </div>
-                        <div style="font-size:10px;color:#888;margin-top:4px;">
+                        <div style="font-size:10px;font-family:'FP10',monospace;color:#888;margin-top:4px;">
                             司机模式: 忽略外呼，不自动关门 | 急停: 作用于当前选中电梯
                         </div>
                     </div>
@@ -385,7 +462,7 @@
                             </select>
                         </label>
                     </div>
-                    <div style="font-size:10px;color:#888;margin-top:4px;">
+                    <div style="font-size:10px;font-family:'FP10',monospace;color:#888;margin-top:4px;">
                         对应 REPL: /usermode | /module station_seek | /module queue | /settings slow_brake
                     </div>
                 </div>
@@ -401,7 +478,7 @@
                         </div>
                     </div>
                     <div style="margin-top:4px;">
-                        <span style="font-size:11px; font-weight:bold;">历史记录</span>
+                        <span style="font-size:12px;">历史记录</span>
                         <button class="btn-sm" style="float:right;" onclick="clearResponse()">清空</button>
                     </div>
                     <div class="command-history" id="cmdHistory"></div>
@@ -642,7 +719,8 @@
             const carId = getSelectedCar();
             const payload = {
                 elevator_id: carId,
-                command: 'car_call',
+                command: 'car',
+                action: 'call',
                 floor: floor
             };
 
@@ -661,8 +739,9 @@
             }
             const payload = {
                 elevator_id: carId,
-                command: 'door',
-                action: action
+                command: 'car',
+                action: 'door',
+                state: action
             };
             const actionNames = { open: '开门', close: '关门' };
             addResponse(`>> 门控制: 电梯 #${carId} ${actionNames[action]}`, 'r-info');
@@ -835,6 +914,11 @@
             addResponse('历史记录已清除', 'r-info');
         }
 
+        function logout() {
+            sessionStorage.clear();
+            window.location.href = 'index.html';
+        }
+
         // ============================================================
         //  状态统计
         // ============================================================
@@ -856,12 +940,12 @@
             <div class="title-bar">
                 <span class="title-bar-text">确认急停</span>
                 <div class="title-bar-controls">
-                    <button class="title-btn close" onclick="cancelStop()">✕</button>
+                    <button class="title-btn close" onclick="cancelStop()">x</button>
                 </div>
             </div>
             <div class="dialog-body">
                 <div style="display:flex;align-items:center;gap:12px;">
-                    <span style="font-size:32px;color:#cc0000;font-weight:bold;">!</span>
+                    <span style="font-size:36px;color:#cc0000;">!</span>
                     <span id="stopConfirmText">将对电梯 #? 执行急停。此操作不可撤销。</span>
                 </div>
             </div>
@@ -878,12 +962,12 @@
             <div class="title-bar">
                 <span class="title-bar-text">确认火灾逃生</span>
                 <div class="title-bar-controls">
-                    <button class="title-btn close" onclick="cancelEscape()">✕</button>
+                    <button class="title-btn close" onclick="cancelEscape()">x</button>
                 </div>
             </div>
             <div class="dialog-body">
                 <div style="display:flex;align-items:center;gap:12px;">
-                    <span style="font-size:32px;color:#cc0000;font-weight:bold;">!</span>
+                    <span style="font-size:36px;color:#cc0000;">!</span>
                     <span>将对所有电梯触发火灾逃生模式：就近停车、点亮故障灯、开门。退出后所有轿厢需重新初始化。</span>
                 </div>
             </div>
@@ -900,12 +984,12 @@
             <div class="title-bar">
                 <span class="title-bar-text">操作说明</span>
                 <div class="title-bar-controls">
-                    <button class="title-btn close" onclick="closeDialog('helpDialog')">✕</button>
+                    <button class="title-btn close" onclick="closeDialog('helpDialog')">x</button>
                 </div>
             </div>
             <div class="dialog-body">
                 <div style="border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:8px;">
-                    <b>EET 电梯控制面板 — 操作说明</b>
+                    EET 电梯控制面板 — 操作说明
                 </div>
                 <div style="font-size:12px;line-height:1.8;">
                     <div>1. 内召：点击楼层按钮发送召唤，灯亮表示该楼层待服务</div>
@@ -914,7 +998,7 @@
                     <div>4. 紧急动作（菜单栏）：火灾逃生模式（系统级，需确认）</div>
                     <div>5. 模块调试：用户模式 / 站点吸附 / 队列模式 / 刹车档位</div>
                 </div>
-                <div style="border-top:1px solid #ccc;padding-top:8px;margin-top:8px;font-size:11px;color:#666;">
+                <div style="border-top:1px solid #ccc;padding-top:8px;margin-top:8px;font-size:12px;color:#666;">
                     <div>POST /control — 控制接口</div>
                     <div>GET /stattrak — 数据接口</div>
                 </div>
