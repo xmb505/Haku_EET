@@ -50,7 +50,7 @@ async def _setup_cars_at_l1(app):
 async def test_dispatch_failure_prints_reason_state(app, capsys):
     """dispatch 返回 None 时,pm.on_hall_call 应打印每部车被过滤的原因"""
     # 让所有车都保持 UNKNOWN
-    result = app._dispatch_hall_call(1, 'up')
+    result = app.pm._select_car_for_hall_call(1, 'up')
     assert result is None
 
     # 让 _log_stderr 也输出到 capsys 捕获的 stderr
@@ -74,7 +74,7 @@ async def test_dispatch_failure_prints_reason_door(app, capsys):
     app.cars[1].position = 1
     app.cars[1].door_state = DoorState.OPEN
 
-    result = app._dispatch_hall_call(1, 'up')
+    result = app.pm._select_car_for_hall_call(1, 'up')
     assert result is None
 
     # 让 _log_stderr 也输出到 capsys 捕获的 stderr

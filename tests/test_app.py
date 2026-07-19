@@ -697,7 +697,7 @@ async def test_usermode_status_snapshot(app: App):
 async def test_dispatch_no_cars_ready(app: App):
     """所有车未初始化 → 无车可派"""
     # 默认所有车 UNKNOWN, position=None
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     assert result is None
 
 
@@ -706,7 +706,7 @@ async def test_dispatch_single_idle(app: App):
     """只有 1 部 READY 空闲车 → 派给它"""
     app.cars[1].state = CarState.READY
     app.cars[1].position = 3
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     assert result == 1
 
 
@@ -720,7 +720,7 @@ async def test_dispatch_idle_closest_wins(app: App):
     app.cars[3].state = CarState.READY
     app.cars[3].position = 4  # 离 floor=5 最近
 
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     assert result == 3
 
 
@@ -736,7 +736,7 @@ async def test_dispatch_same_dir_passing_priority(app: App):
     app.cars[2].position = 5  # 离 floor=5 最近（距离 0）
     app.cars[2].direction = Direction.IDLE
 
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     # car1 顺向经过 → priority 0，胜出（即使距离更远）
     assert result == 1
 
@@ -754,7 +754,7 @@ async def test_dispatch_skip_opposite_direction(app: App):
     app.cars[2].direction = Direction.IDLE
 
     # hall_call_up_5：car1 方向不顺向不空闲 → 跳过；car2 空闲 → 派给它
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     assert result == 2
 
 
@@ -771,7 +771,7 @@ async def test_dispatch_skip_same_dir_past_target(app: App):
     app.cars[2].direction = Direction.IDLE
 
     # hall_call_up_5：car1 不会经过 5（pos > floor），跳过
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     assert result == 2
 
 
@@ -783,7 +783,7 @@ async def test_dispatch_skip_fault_car(app: App):
     app.cars[2].state = CarState.READY
     app.cars[2].position = 7
 
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     assert result == 2
 
 
@@ -796,7 +796,7 @@ async def test_dispatch_skip_manual_mode(app: App):
     app.cars[2].state = CarState.READY
     app.cars[2].position = 7
 
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     assert result == 2
 
 
@@ -813,7 +813,7 @@ async def test_dispatch_down_direction(app: App):
     app.cars[2].direction = Direction.IDLE
 
     # hall_call_down_5：car1 顺向经过（8 > 5 >= 2）→ 胜出
-    result = app._dispatch_hall_call(5, 'down')
+    result = app.pm._select_car_for_hall_call(5, 'down')
     assert result == 1
 
 
@@ -827,7 +827,7 @@ async def test_dispatch_same_distance_lowest_cid(app: App):
     app.cars[2].position = 7  # 距离 floor=5 都是 2
     app.cars[2].direction = Direction.IDLE
 
-    result = app._dispatch_hall_call(5, 'up')
+    result = app.pm._select_car_for_hall_call(5, 'up')
     assert result == 1
 
 

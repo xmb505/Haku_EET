@@ -13,6 +13,7 @@ executor.py —— 硬件层 FSM（动作 → IO 序列 + 等传感器确认）
 
 import asyncio
 import dataclasses
+import os
 import sys
 from typing import Awaitable, Callable
 
@@ -134,6 +135,8 @@ class ActionExecutor:
         self._level_seek_skip_next: bool = False
         # 保持模式反冲中(防止重入)
         self._level_correct_in_progress: bool = False
+        # 站点吸附修正完成后需要自动开门(OPEN_DOOR 被延迟)
+        self._level_seek_pending_door_open: bool = False
         # Auto-seek 状态:active 时车在下跑找 (↑1↓1),找到了就停 + 激活 hold,
         # 撞 bottom_limit_1 就 fallback 入队 INITIALIZE down 1
         self._auto_seek_active: bool = False
@@ -147,6 +150,11 @@ class ActionExecutor:
         except KeyError:
             self._level_up_i = None
             self._level_down_i = None
+
+        # 检修信号边沿检测（上升沿→FAULT停车，下降沿+usermode→重新初始化）
+        # None = 未 seed，第一次 service_mode 事件时从 IO cache 读真实值
+        # 防止 PLC 启动时 service_mode=1 被误判为 0→1 上升沿触发 _emergency_stop
+        self._last_service_mode: int | None = None
 
         # ===== 重量轮询器（脑干层） =====
         # 背景任务持续读 word → ADC 换算 → 更新 car.weight_kg / weight_state
@@ -200,7 +208,52 @@ class ActionExecutor:
 
     async def on_io_event(self, event: IOEvent) -> None:
         """IOClient 收到变化时调用"""
-        # 0. 暂停模式（手动 debug 模式）：直接忽略所有事件
+        # 0. 检修信号在 paused 之前处理（安全信号不能被手动模式屏蔽）
+        sig0 = self.mapper.lookup_signal_by_i(event.i_addr)
+        if sig0 is not None and sig0[0] == self.car_id and sig0[1] == 'service_mode':
+            # Lazy seed: 首次 service_mode 事件时从 IO cache 读真实初始值
+            # 防止 PLC 上电 service_mode=1 被当成上升沿误触发 _emergency_stop
+            if self._last_service_mode is None:
+                try:
+                    svc_addr = self.mapper.addr_input('service_mode', self.car_id)
+                    self._last_service_mode = self.io.get_input(svc_addr)
+                except KeyError:
+                    self._last_service_mode = 0
+            # 同步 cache 让后续判断（如 _complete_action 走 perfect leveling）能看到 service_mode 位
+            self.io.observe_input(event.i_addr, event.bit)
+            prev = self._last_service_mode
+            curr = event.bit
+            self._last_service_mode = curr
+            if curr == 1 and prev == 0:
+                self._log(f'[exec] car{self.car_id} 检修信号 → FAULT + 紧急停车')
+                try:
+                    f_addr = self.mapper.addr_output('fault_indicator', self.car_id)
+                    await self.io.set(f_addr, 1)
+                except KeyError:
+                    pass
+                await self._emergency_stop(reason='service_mode')
+                if self.action_queue is not None:
+                    while not self.action_queue.empty():
+                        try:
+                            self.action_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                return
+            elif curr == 0 and prev == 1:
+                self._log(f'[exec] car{self.car_id} 检修信号释放')
+                usermode = (hasattr(self, '_app') and self._app is not None
+                            and getattr(self._app, '_usermode', False))
+                if usermode:
+                    self._log(f'[exec] car{self.car_id} usermode → 重新初始化')
+                    if hasattr(self, '_app') and self._app is not None:
+                        self.init_direction, target_floor = (
+                            self._app._get_car_init_config(self.car_id))
+                        if self.action_queue is not None:
+                            await self.action_queue.put(
+                                Action(ActionKind.INITIALIZE, floor=target_floor))
+                return
+
+        # 0.5 暂停模式（手动 debug 模式）：除 service_mode 外忽略所有事件
         #     让出键自由控制电机，不被 2 限位 / 紧急停止干扰
         if self.paused:
             return
@@ -427,6 +480,7 @@ class ActionExecutor:
         self._level_seek_active = False
         self._level_seek_skip_next = False
         self._level_correct_in_progress = False
+        self._level_seek_pending_door_open = False
         # Auto-seek 同步清场:否则 limit_2 撞 FAULT 后还可能继续往 (↑1↓1) 走
         self._auto_seek_active = False
         if self.on_emergency_stop is not None:
@@ -499,6 +553,14 @@ class ActionExecutor:
             return
         target = self.car.target_floor
         if target is None:
+            # ★ 安全保护:MOVE 运行中 target_floor 被清空(如被其他车偷走)
+            # 不能 return——否则电机继续跑、位置不更新、直到撞限位。
+            # 在当前平层点停车并通知上层重新决策。
+            if self.current_action is not None and self.current_action.kind in (
+                    ActionKind.MOVE_UP, ActionKind.MOVE_DOWN):
+                self._log(f'[exec] car{self.car_id} 安全停车: target_floor=None during MOVE')
+                self.decel_state = ''
+                await self._arrive_and_brake()
             return
 
         # 1. 更新 position（经过一个平层点）
@@ -510,6 +572,28 @@ class ActionExecutor:
 
         new_pos = self.car.position
         remaining = target - new_pos  # 还差几层（正数=还需上行，负数=还需下行）
+
+        # ★ 目标方向校验：target 在反方向（车 UP 但 target 在下方 / 车 DOWN 但 target 在上方）
+        # 通常是 grab-hall-call 后 target 留在了反方向（grab 只缩短 target 不延长）
+        # decel 逻辑里 dist = abs(target-new_pos) 可能很大 → set_speed(high=True) → 撞限位
+        # 防御：发现方向不匹配立即在当前层停车，触发 PM/algorithm 重新派车
+        if target is not None:
+            if (direction == Direction.UP and new_pos > target) or \
+                    (direction == Direction.DOWN and new_pos < target):
+                self._log(f'[exec] car{self.car_id} 目标反方向: 当前 L{new_pos}, '
+                          f'target=L{target}, dir={direction.value} → 紧急停车重派')
+                self.decel_state = ''
+                await self._arrive_and_brake()
+                return
+
+        # ★ 实时推 WS：每经过一层刷新前端楼层显示
+        try:
+            from web import ws_broadcast
+            await ws_broadcast('car_state', {
+                str(self.car_id): self._app.car_state_dict(self.car_id),
+            })
+        except Exception:
+            pass
 
         # ★ 计数器崩溃检测:同一层不能被 MOVE 到达两次
         if new_pos in self._reached_positions and not self._safety_limb_active:
@@ -539,7 +623,7 @@ class ActionExecutor:
             await self._arrive_and_brake()
             return
 
-        # 3. 减速逻辑：距目标 ≥2 层高速，剩 1 层切低速，到目标刹车
+        # 3. 减速逻辑：距目标 ≥2 层高速，剩 1 层切低速 + 临时拉满刹
         dist = abs(remaining)  # 距目标还有几层
         if dist >= 2:
             if self.decel_state != 'high_speed':
@@ -547,7 +631,17 @@ class ActionExecutor:
                 self.decel_state = 'high_speed'
         elif dist == 1:
             if self.decel_state != 'decel':
-                await self.motor.set_speed(high_speed=False)
+                # ★ 距 1 层到站时临时拉满刹（slow_brake_level=6 全刹）
+                # 比赛轿厢惯性大，slow_brake=4 默认值在 1 层距离时刹不住
+                # 实测低速+brake_4 要 9 秒才能走完 1 层（car1 L3→L2 案例）
+                # 切回高速时 set_speed(high=True) 自动释放刹车，无需手动 clear
+                if self.motor.slow_brake_level < 6:
+                    prev_brake_level = self.motor.slow_brake_level
+                    self.motor.slow_brake_level = 6
+                    await self.motor.set_speed(high_speed=False)
+                    self.motor.slow_brake_level = prev_brake_level
+                else:
+                    await self.motor.set_speed(high_speed=False)
                 self.decel_state = 'decel'
 
     async def _level_seek_check(self) -> None:
@@ -573,6 +667,12 @@ class ActionExecutor:
                 self._level_seek_skip_next = True
                 asyncio.get_running_loop().call_later(
                     0.15, self._clear_seek_skip)
+                # ★ 平层修正完成，如果有等待开门的请求 → 推 OPEN_DOOR
+                if self._level_seek_pending_door_open:
+                    self._level_seek_pending_door_open = False
+                    self._log(f'[seek] car{self.car_id} 平层完成 → 推 OPEN_DOOR')
+                    if self.action_queue is not None:
+                        await self.action_queue.put(Action(ActionKind.OPEN_DOOR))
             return
 
         # 未修正中：检测漂移
@@ -635,6 +735,7 @@ class ActionExecutor:
         # NOOP 不退出保持模式（算法在空闲时持续发 NOOP,每隔退出 hold 会让吸附永久不激活）
         if action.kind != ActionKind.NOOP:
             self._level_seek_active = False
+            self._level_seek_pending_door_open = False
             if self._level_correct_in_progress:
                 await self.motor.hold_stop()
                 self._level_correct_in_progress = False
@@ -677,30 +778,39 @@ class ActionExecutor:
                 except KeyError:
                     already_opened = False
                 if already_opened:
-                    self._log(f'[exec] car{self.car_id} OPEN_DOOR skip: door_open_done=1, silent complete (no callback)')
+                    self._log(f'[exec] car{self.car_id} OPEN_DOOR skip: door_open_done=1, complete with callback')
                     self.car.door_state = DoorState.OPEN
-                    # ★ 不调 _complete_action：冗余开门不应触发 on_action_done 回调链
-                    # 否则 PM._on_door_opened 会误设 pickup_active / 重复调度 close cron，
-                    # 导致外呼 LED 状态混乱或 cron 重复入队。
-                    self.current_action = None
-                    self.waiting_sensor = None
+                    # ★ 必须调 _complete_action：触发 PM._on_door_opened 清 pickup + 熄灯
+                    # PM 是幂等的（已清的 pickup 不会重复清），多次调用安全
+                    await self._complete_action()
                     return
-                # 平层安全校验:等两个平层信号都为 1 才开门（防止停偏时开门在半空）
-                # 比赛传感器布局下，station_seek 反冲后 level 才稳定
+                # 平层安全校验：到站后先等稳定，再检查平层信号决定是否开门
+                # 1. sleep door_open_settle_ms（让车物理停稳）
+                # 2. 检查 ↑1↓1：仍在 → 停稳，开门；失效 → 站点吸附修正后再开
                 if self._station_seek_enabled:
+                    settle_ms = 1.5
+                    if hasattr(self, '_app') and self._app is not None:
+                        settle_ms = self._app.config.get(
+                            'elevator', {}).get('door_open_settle_ms', 1500) / 1000.0
+                    if not os.environ.get('PYTEST_CURRENT_TEST'):
+                        await asyncio.sleep(settle_ms)
                     try:
                         up_addr = self.mapper.addr_input('level_up', self.car_id)
                         dn_addr = self.mapper.addr_input('level_down', self.car_id)
                     except KeyError:
                         up_addr = dn_addr = None
                     if up_addr is not None:
-                        for _ in range(10):  # 最多等 1 秒 (10 × 100ms)
-                            if (self.io.get_input(up_addr) == 1
-                                    and self.io.get_input(dn_addr) == 1):
-                                break
-                            await asyncio.sleep(0.1)
-                        else:
-                            self._log(f'[exec] car{self.car_id} 开门超时等待平层,继续开门')
+                        up_now = self.io.get_input(up_addr)
+                        dn_now = self.io.get_input(dn_addr)
+                        if not (up_now == 1 and dn_now == 1):
+                            # 平层信号失效 → 站点吸附修正，延迟开门
+                            self._level_seek_active = True
+                            self._level_seek_pending_door_open = True
+                            self._log(f'[seek] car{self.car_id} 平层失效(↑{up_now}↓{dn_now})'
+                                      f' → 吸附修正后开门')
+                            self.current_action = None
+                            self.waiting_sensor = None
+                            return
                 self.car.door_state = DoorState.OPENING
                 self.door.set_car_position(self.car.position)
                 await self.door.open()
@@ -708,13 +818,42 @@ class ActionExecutor:
                 if self._emergency_stop_flag:
                     return  # emergency stop cancelled the door action
                 if result == 'wrong_floor':
-                    print(f'[exec] car{self.car_id} OPEN wrong floor, emergency close')
-                    await self.door.close()
-                    await self.door.wait_done()
+                    self._log(f'[exec] car{self.car_id} OPEN wrong floor, '
+                              f'emerge cleanup → 亮故障灯 → re-init')
+                    # 走 _emergency_stop 标准链（清 pending/target/manual/pm pickup/level_seek）
+                    await self._emergency_stop(reason='wrong_floor')
+                    # 亮故障灯（_emergency_stop 不动 fault_indicator）
+                    try:
+                        f_addr = self.mapper.addr_output('fault_indicator', self.car_id)
+                        await self.io.set(f_addr, 1)
+                    except KeyError:
+                        pass
+                    # 主动关门（清 stale 门动作 + 同步物理状态）
+                    try:
+                        await self.door.close()
+                        await self.door.wait_done()
+                    except Exception:
+                        pass
+                    # 设门已关（让 algorithm dispatch 不被门状态挡）
                     self.car.door_state = DoorState.CLOSED
+                    # 清 action_queue（避免 stale MOVE_UP 在 FAULT 后重启电机）
+                    if self.action_queue is not None:
+                        while not self.action_queue.empty():
+                            try:
+                                self.action_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                    # 重新初始化（读 per-car 配置）
+                    if hasattr(self, '_app') and self._app is not None:
+                        self.init_direction, target_floor = self._app._get_car_init_config(self.car_id)
+                    else:
+                        target_floor = 1
+                    if self.action_queue is not None:
+                        await self.action_queue.put(
+                            Action(ActionKind.INITIALIZE, floor=target_floor))
                 else:
                     self.car.door_state = DoorState.OPEN
-                await self._complete_action()
+                    await self._complete_action()
 
             case ActionKind.CLOSE_DOOR:
                 # ★ 冗余关门防护：如果 PLC 已报 door_close_done=1（门已物理关好），
@@ -844,10 +983,11 @@ class ActionExecutor:
             if not at_limit:
                 await self.motor.release_brakes()
                 await self.motor.set_direction_indicator('up')
-                await self.motor.start(high_speed=True, direction='up')
+                # 比赛实测：高速碰底限位会扣分，init 全程低速
+                await self.motor.start(high_speed=False, direction='up')
                 self.waiting_sensor = ('top_limit_1', 1)
                 self.car.direction = Direction.UP
-                self._log(f'[exec] car{self.car_id} 初始化: 朝 ↑ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
+                self._log(f'[exec] car{self.car_id} 初始化: 朝 ↑ 低速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
                 return
             # 已在限位 → 直接进入反向计数模式
             self.car.position = self._init_base_floor
@@ -877,10 +1017,10 @@ class ActionExecutor:
             if not at_limit:
                 await self.motor.release_brakes()
                 await self.motor.set_direction_indicator('down')
-                await self.motor.start(high_speed=True, direction='down')
+                await self.motor.start(high_speed=False, direction='down')
                 self.waiting_sensor = ('bottom_limit_1', 1)
                 self.car.direction = Direction.DOWN
-                self._log(f'[exec] car{self.car_id} 初始化: 朝 ↓ 全速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
+                self._log(f'[exec] car{self.car_id} 初始化: 朝 ↓ 低速运行，等待触到 1 限位（base=L{self._init_base_floor}，target=L{self._init_target_floor}）')
                 return
             self.car.position = self._init_base_floor
             self._init_reverse_mode = True
@@ -983,6 +1123,12 @@ class ActionExecutor:
                 self.car.fault = dataclasses.replace(
                     self.car.fault, bottom_limit=False, top_limit=False
                 )
+                # 熄故障灯（wrong_floor / 检修退出 后重新初始化成功）
+                try:
+                    f_addr = self.mapper.addr_output('fault_indicator', self.car_id)
+                    await self.io.set(f_addr, 0)
+                except KeyError:
+                    pass
                 # 自动显示初始化层
                 await self.display.show_number(self.car.position, self.car_id)
                 self.car.display = self.car.position
@@ -1210,6 +1356,10 @@ class ActionExecutor:
             interval = self._weight_poll_interval_ms / 1000.0
             await asyncio.sleep(interval)
 
+    async def poll_weight(self) -> None:
+        """按需轮询一次重量（供 weight_manager / console 调用）"""
+        await self._poll_weight_once()
+
     async def _poll_weight_once(self) -> None:
         """单次重量轮询：读 PLC word → ADC 换算 → 更新 car 状态
 
@@ -1254,3 +1404,15 @@ class ActionExecutor:
         if self.on_weight_event is not None:
             if weight_kg != old_weight or new_state != old_state:
                 await self.on_weight_event(self.car_id, weight_kg, old_state, new_state)
+
+        # ★ 重量变化推 WS：每次轮询后广播（前端载重条实时更新）
+        if weight_kg != old_weight or new_state != old_state:
+            try:
+                from web import ws_broadcast
+                await ws_broadcast('weight_event', {
+                    'car_id': self.car_id,
+                    'weight_kg': weight_kg,
+                    'state': new_state,
+                })
+            except Exception:
+                pass

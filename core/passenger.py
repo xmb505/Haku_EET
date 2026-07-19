@@ -199,6 +199,116 @@ class PassengerManager:
         extra = f' ({reason})' if reason else ''
         self._log_event(f'[pickup] {op} car{car_id} ({floor},{direction}){extra} | {sorted(items)}')
 
+    async def reconcile_hall_indicators(self) -> None:
+        """外呼灯一致性校验：灯亮必须有对应的活跃呼叫，且没有车在接客
+
+        灯灭条件（满足任一即灭）：
+          1. 无 pickup_active + 不在 pending + 按钮没按
+          2. 有电梯在该层开门接客（乘客直接上车，不需要灯继续亮）
+        """
+        building = self._app.config.get('building', {})
+        min_f = building.get('min_floor', 1)
+        max_f = building.get('max_floor', 10)
+
+        # 收集所有正在开门接客的车：楼层 → 可服务的方向集合
+        serving: dict[int, set[str]] = {}
+        for cid in self._app.car_ids:
+            car = self._app.cars[cid]
+            if (car.door_state in (DoorState.OPEN, DoorState.OPENING)
+                    and car.position is not None):
+                floor = car.position
+                # 判断车的方向：只灭对应方向的外呼灯
+                dirs: set[str] = set()
+                if car.direction == Direction.UP:
+                    dirs.add('up')
+                elif car.direction == Direction.DOWN:
+                    dirs.add('down')
+                else:
+                    # IDLE：依次从 target_floor / last_dispatch_direction 推断
+                    target = car.target_floor
+                    if target is not None and car.position is not None:
+                        if target > car.position:
+                            dirs.add('up')
+                        elif target < car.position:
+                            dirs.add('down')
+                    if not dirs:
+                        ldd = car.last_dispatch_direction
+                        if ldd == Direction.UP:
+                            dirs.add('up')
+                        elif ldd == Direction.DOWN:
+                            dirs.add('down')
+                    # 完全无方向信息 → 不灭灯，等乘客按内呼推导方向
+                serving.setdefault(floor, set()).update(dirs)
+
+        # 收集所有活跃的 pickup
+        active_keys: set[tuple[int, str]] = set()
+        for cid in self._app.car_ids:
+            for (floor, direction), active in self._pickup_active[cid].items():
+                if active:
+                    active_keys.add((floor, direction))
+        # 加入 pending
+        active_keys.update(self._pending_hall_calls)
+
+        for floor in range(min_f, max_f + 1):
+            for direction in ('up', 'down'):
+                key = (floor, direction)
+                # ★ 有车在该层开门且方向匹配 → 乘客可上车，灭灯
+                if direction in serving.get(floor, set()):
+                    if self._app.hall_indicator_state(floor, direction):
+                        await self._app.set_hall_indicator(floor, direction, False)
+                    # 清掉相关的 pickup 和 pending
+                    if key in active_keys:
+                        active_keys.discard(key)
+                        self._pending_hall_calls.discard(key)
+                        for cid in self._app.car_ids:
+                            self._pickup_active[cid].pop(key, None)
+                    continue
+                if key in active_keys:
+                    continue  # 有活跃呼叫，灯该亮
+                # 检查物理按钮
+                if self._app.is_hall_button_held(floor, direction):
+                    continue  # 按钮按住，灯该亮
+                # 无活跃呼叫且按钮没按 → 熄灯
+                if self._app.hall_indicator_state(floor, direction):
+                    await self._app.set_hall_indicator(floor, direction, False)
+
+    def _has_nearby_moving_car(self, floor: int, direction: str) -> bool:
+        """检查是否有行驶中、方向匹配的车在附近（距外呼楼层 ≤2 层）。
+
+        用于抢客算法的前置判断：如果附近有车正朝这个方向驶来，
+        就把外呼留在 _pending_hall_calls 等 grab 捡，不急于 dispatch。
+        """
+        for cid in self._app.car_ids:
+            car = self._app.cars[cid]
+            executor = self._app.executors[cid]
+            if executor.current_action is None:
+                continue
+            if car.position is None:
+                continue
+            # 必须 READY 才能参与调度——INITIALIZE/FAULT 状态车不响应外呼
+            if car.state != CarState.READY:
+                continue
+            # 手动模式 / 超重车不会自动响应外呼
+            if getattr(car, 'weight_state', 0) >= 1:
+                continue
+            if self._app.manual_mode.get(cid, False):
+                continue
+            if getattr(car, 'driver_mode', False):
+                continue
+            car_dir = car.direction
+            if direction == 'up' and car_dir != Direction.UP:
+                continue
+            if direction == 'down' and car_dir != Direction.DOWN:
+                continue
+            # 车已经过了这个楼层 → 不可能顺路
+            if direction == 'up' and car.position >= floor:
+                continue
+            if direction == 'down' and car.position <= floor:
+                continue
+            if abs(car.position - floor) <= 2:
+                return True
+        return False
+
     def _reload_ui_config(self) -> None:
         try:
             with self._ui_config_path.open('r', encoding='utf-8') as f:
@@ -294,7 +404,7 @@ class PassengerManager:
             for cid in self._app.car_ids:
                 if self._pickup_active.get(cid, {}).get((floor, direction), False):
                     return
-            target_cid = self._app._dispatch_hall_call(floor, direction)
+            target_cid = self._select_car_for_hall_call(floor, direction)
             if target_cid is None:
                 self._log_stderr(f'[hall_call] {direction}@L{floor} no available car, keeping LED + pending')
                 # 仍然亮起外召指示灯
@@ -364,11 +474,34 @@ class PassengerManager:
                         self._app.pending_calls[target_cid].append(old_target)
                     self._log_stderr(f'[hall_call] {direction}@L{floor} → car{target_cid} (顺路改道)')
                 else:
-                    # 距离不够或不顺路，加入 pending_calls 等返回
-                    await self._app.call_internal(floor, car_id=target_cid, origin='hall')
-                    # 派车成功 → 通过小脑立即亮起预测方向（不等 MOVE 动作启动）
-                    await self._app.set_predicted_direction_indicator(target_cid, floor)
-                    self._log_stderr(f'[hall_call] {direction}@L{floor} → car{target_cid}')
+                    # 距离不够或不顺路 → 移除此车的 pickup，放回 pending
+                    self._pickup_active[target_cid].pop((floor, direction), None)
+                    self._log_pickup('recall', target_cid, floor, direction, 'rejected')
+                    self._pending_hall_calls.add((floor, direction))
+                    self._log_pending('add', floor, direction, 'rejected_reassign')
+                    # 亮灯保持（在设为 pending 之后）
+                    await self._app.set_hall_indicator(floor, direction, True)
+                    # ★ 抢客窗口：如果有行驶中的车正朝此楼层驶来且 ≤2 层，留给 grab
+                    if self._has_nearby_moving_car(floor, direction):
+                        self._log_stderr(
+                            f'[hall_call] {direction}@L{floor} change_internal rejected'
+                            f' → kept in pending (nearby moving car will grab)')
+                    else:
+                        # 没有附近的车 → 立即尝试用空闲车重新派
+                        reassigned = False
+                        for cid in self._app.car_ids:
+                            car = self._app.cars[cid]
+                            if (car.state == CarState.READY
+                                    and car.direction == Direction.IDLE
+                                    and car.door_state == DoorState.CLOSED
+                                    and car.position is not None):
+                                await self._try_dispatch_pending_hall_calls(cid)
+                                reassigned = True
+                                break
+                        if reassigned:
+                            self._log_stderr(f'[hall_call] {direction}@L{floor} change_internal rejected → reassigned to idle car')
+                        else:
+                            self._log_stderr(f'[hall_call] {direction}@L{floor} change_internal rejected → kept in pending (no idle car)')
         else:
             # bit=0: 按钮松开 → 判断车是否已到站
             for cid in self._app.car_ids:
@@ -798,7 +931,9 @@ class PassengerManager:
                 pass
 
         # 将顺路 pending 外召也编入路线
-        if effective_dir != Direction.IDLE:
+        # ★ 如果车有内召请求，不合并外召——先送内召乘客
+        has_internal_request = bool(self._button_cache[car_id]) or bool(pq)
+        if effective_dir != Direction.IDLE and not has_internal_request:
             if sweep_mode:
                 # 扫路模式：只编入最远站，中间站保留等回程
                 candidates = [(f, d) for f, d in self._pending_hall_calls
@@ -808,6 +943,7 @@ class PassengerManager:
                     floor, direction = key
                     all_requests.add(floor)
                     self._pending_hall_calls.discard((floor, direction))
+                    self._app.pending_call_origin[car_id][floor] = 'hall'
                     self._log_pending('discard', floor, direction, 'merged_waypoint')
                     self._log_pickup('set', car_id, floor, direction, 'merged_waypoint')
                     self._pickup_active[car_id][(floor, direction)] = True
@@ -820,6 +956,7 @@ class PassengerManager:
                         self._log_pickup('set', car_id, floor, direction, 'merged_route')
                         all_requests.add(floor)
                         self._pending_hall_calls.discard((floor, direction))
+                        self._app.pending_call_origin[car_id][floor] = 'hall'
                         self._pickup_active[car_id][(floor, direction)] = True
         self._log_event(f'[door_closed] car{car_id} cache={sorted(self._button_cache[car_id])}, pq={pq.items}, merged={sorted(all_requests)}, dir={effective_dir.value}')
         pq.compile(
@@ -839,6 +976,13 @@ class PassengerManager:
             first = pq.next_target()
             if first is not None:
                 self._log_event(f'[door_closed] car{car_id} dispatching → L{first}')
+                # ★ 如果有 pickup_active，说明是外召 → 预填 origin='hall'
+                # 否则 call_internal 默认 origin='internal'，到站不开门
+                is_hall = any(
+                    self._pickup_active[car_id].get((first, d), False)
+                    for d in ('up', 'down'))
+                if is_hall:
+                    self._app.pending_call_origin[car_id].setdefault(first, 'hall')
                 added = await self._app.call_internal(first, car_id=car_id)
                 if not added:
                     # call_internal 拒绝（如 floor 已在 pending_calls）
@@ -857,8 +1001,46 @@ class PassengerManager:
             self._log_event(f'[door_closed] car{car_id} empty, human_presence timer')
             await self._start_human_presence_timer(car_id)
 
-        # 尝试处理待派的外召请求（之前无空闲车的）
-        await self._try_dispatch_pending_hall_calls(car_id)
+        # ★ 孤儿 pickup 回收 + 空闲车派 pending 外召
+        # 先回收孤儿（pickup 在但楼层不在 pending 里），再逐车派
+        for cid in self._app.car_ids:
+            car = self._app.cars[cid]
+            if car.state != CarState.READY:
+                continue
+            my_pending = self._app.pending_calls.get(cid, [])
+            for (floor, direction), active in list(
+                    self._pickup_active[cid].items()):
+                if not active:
+                    continue
+                if floor not in my_pending:
+                    self._pickup_active[cid].pop((floor, direction), None)
+                    self._pending_hall_calls.add((floor, direction))
+                    self._log_pickup('orphan', cid, floor, direction, 'recycled')
+                    self._log_pending('add', floor, direction, 'orphan_recycled')
+                    await self._app.set_hall_indicator(floor, direction, True)
+
+        if self._pending_hall_calls:
+            for cid in self._app.car_ids:
+                if not self._pending_hall_calls:
+                    break
+                car = self._app.cars[cid]
+                if (car.state == CarState.READY
+                        and car.direction == Direction.IDLE
+                        and car.door_state == DoorState.CLOSED
+                        and car.position is not None
+                        and self._app.executors[cid].current_action is None
+                        and not self._app.manual_mode.get(cid, False)):
+                    # ★ 跳过有内召的车
+                    origins = self._app.pending_call_origin.get(cid, {})
+                    has_internal = any(
+                        origins.get(f) == 'internal'
+                        for f in self._app.pending_calls.get(cid, []))
+                    if has_internal:
+                        continue
+                    # ★ 跳过临界/超重车
+                    if getattr(car, 'weight_state', 0) >= 1:
+                        continue
+                    await self._try_dispatch_pending_hall_calls(cid)
 
     async def _try_dispatch_pending_hall_calls(self, car_id: int) -> None:
         """检查待派外召集合，尝试用当前空闲车派车"""
@@ -875,7 +1057,7 @@ class PassengerManager:
         dispatched: list[tuple[int, str]] = []
         for (floor, direction) in list(self._pending_hall_calls):
             # 尝试派这辆车
-            target_cid = self._app._dispatch_hall_call(floor, direction)
+            target_cid = self._select_car_for_hall_call(floor, direction)
             if target_cid is not None:
                 self._pickup_active[target_cid][(floor, direction)] = True
                 self._log_pickup('set', target_cid, floor, direction, 'try_dispatch')
@@ -1050,6 +1232,165 @@ class PassengerManager:
                               self._pickup_active.get(car_id, {}).items() if v],
             'human_presence': car.human_presence,
         }
+
+    # ===== 派车算法（大脑—多车调度） =====
+
+    def _select_car_for_hall_call(
+            self, floor: int, direction: str) -> int | None:
+        """派车算法：顺向优先 + 空闲最近
+
+        优先级：
+            0. 顺向经过（car moving dir == call dir，且 position → target_floor 之间会经过 floor）
+            1. 空闲（direction == IDLE，无当前任务）
+            其他：跳过（方向相反 / 同向但 target 已过 floor / 在忙）
+
+        同优先级按距离升序；距离相同取小 car_id。
+        """
+        candidates: list[tuple[int, int, int]] = []  # (priority, distance, car_id)
+
+        for cid in self._app.car_ids:
+            car = self._app.cars[cid]
+
+            if car.state != CarState.READY or car.position is None:
+                continue
+            if car.driver_mode:
+                continue
+            if self._app.manual_mode.get(cid, False):
+                continue
+            # 门状态过滤
+            if car.door_state == DoorState.CLOSED:
+                pass
+            elif car.door_state == DoorState.CLOSING:
+                try:
+                    close_done_addr = self._app.mapper.addr_input('door_close_done', cid)
+                    if self._app.io.get_input(close_done_addr) != 1:
+                        continue
+                except KeyError:
+                    continue
+            else:
+                continue
+            # 该车已在服务此 (floor, direction) pickup → 跳过
+            if self._pickup_active.get(cid, {}).get((floor, direction), False):
+                continue
+            # 该车已在服务同层反方向 pickup → 跳过
+            opposite = 'down' if direction == 'up' else 'up'
+            if self._pickup_active.get(cid, {}).get((floor, opposite), False):
+                continue
+            # 载重过滤
+            if car.max_weight > 0:
+                if car.weight_state >= 1:
+                    continue
+            elif car.fault.overload:
+                continue
+
+            pos = car.position
+            moving_dir = car.direction
+            target = car.target_floor
+
+            # 顺向且会经过该层
+            same_dir_pass = False
+            if direction == 'up' and moving_dir == Direction.UP and target is not None:
+                if pos < floor <= target:
+                    same_dir_pass = True
+            elif direction == 'down' and moving_dir == Direction.DOWN and target is not None:
+                if pos > floor >= target:
+                    same_dir_pass = True
+
+            if same_dir_pass:
+                candidates.append((0, abs(floor - pos), cid))
+            elif moving_dir == Direction.IDLE:
+                candidates.append((1, abs(floor - pos), cid))
+            elif target is not None and target == floor:
+                # 车已在去该层的路上（目标就是该层），但还要花时间赶路
+                candidates.append((2, abs(floor - pos), cid))
+
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][2]
+
+    # ===== 大脑心跳（周期性扫描 pending 外呼） =====
+
+    def start_brain_tick(self, interval_ms: int = 500) -> None:
+        """启动周期性心跳：每 interval_ms 扫描一次，
+        如果有 idle 车 + 待派外呼，尝试派车。
+
+        解决纯事件驱动的"计划赶不上变化"问题：
+        —— 车赶到的时候外呼灯亮着，车闲着不接客。"""
+        async def _loop():
+            while True:
+                await asyncio.sleep(interval_ms / 1000.0)
+                await self._try_brain_tick()
+
+        self._brain_tick_task: asyncio.Task = asyncio.get_running_loop().create_task(
+            _loop(), name='pm_brain_tick')
+
+    def stop_brain_tick(self) -> None:
+        """停止大脑心跳"""
+        if hasattr(self, '_brain_tick_task') and self._brain_tick_task is not None:
+            self._brain_tick_task.cancel()
+            self._brain_tick_task = None
+
+    async def _try_brain_tick(self) -> None:
+        """心跳：扫描 pending 外呼 + 空闲车，尝试补派"""
+        if not self._pending_hall_calls:
+            return
+        # 找到所有空闲车（IDLE + READY + CLOSED）
+        idle_cars: list[int] = []
+        for cid in self._app.car_ids:
+            car = self._app.cars[cid]
+            if (car.state == CarState.READY
+                    and car.direction == Direction.IDLE
+                    and car.door_state == DoorState.CLOSED
+                    and car.position is not None):
+                # 不被重量/司机/手动拦
+                if car.driver_mode or self._app.manual_mode.get(cid, False):
+                    continue
+                if car.max_weight > 0 and car.weight_state >= 1:
+                    continue
+                idle_cars.append(cid)
+        if not idle_cars:
+            return
+        # 尝试用空闲车消化 pending
+        dispatched = []
+        for (floor, direction) in list(self._pending_hall_calls):
+            for cid in idle_cars:
+                car = self._app.cars[cid]
+                # 车已在服务同楼层同方向 → 跳过
+                if self._pickup_active.get(cid, {}).get((floor, direction), False):
+                    continue
+                # 同层请求：车在就去开门
+                if car.position == floor:
+                    self._pickup_active[cid][(floor, direction)] = True
+                    self._log_pickup('brain_tick', cid, floor, direction, 'at_floor')
+                    self._app.cars[cid].last_dispatch_direction = (
+                        Direction.UP if direction == 'up' else Direction.DOWN)
+                    await self._ensure_lights_on(cid)
+                    await self._app.set_hall_indicator(floor, direction, True)
+                    await self._app.action_queues[cid].put(
+                        Action(ActionKind.OPEN_DOOR))
+                    self._log_stderr(f'[brain_tick] {direction}@L{floor} → car{cid} at floor')
+                    dispatched.append((floor, direction))
+                    break
+                # 派车：用 _select_car_for_hall_call 选车
+                target_cid = self._select_car_for_hall_call(floor, direction)
+                if target_cid is not None:
+                    self._pickup_active[target_cid][(floor, direction)] = True
+                    self._log_pickup('brain_tick', target_cid, floor, direction, 'dispatched')
+                    self._app.cars[target_cid].last_dispatch_direction = (
+                        Direction.UP if direction == 'up' else Direction.DOWN)
+                    await self._ensure_lights_on(target_cid)
+                    await self._app.set_hall_indicator(floor, direction, True)
+                    added = await self._app.call_internal(
+                        floor, car_id=target_cid, origin='hall')
+                    if added:
+                        self._log_stderr(f'[brain_tick] {direction}@L{floor} → car{target_cid}')
+                        dispatched.append((floor, direction))
+                    break
+
+        for item in dispatched:
+            self._log_pending('discard', item[0], item[1], 'brain_tick')
+            self._pending_hall_calls.discard(item)
 
     # ===== 重置 / 紧急停止 =====
 

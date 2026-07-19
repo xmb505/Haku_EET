@@ -171,6 +171,7 @@ class App:
                 closing_timeout_seconds=self.config.get('passenger', {}).get(
                     'closing_timeout_seconds', 10),
             )
+            self.executors[cid]._app = self
 
         # 日志:替换 sys.stderr 为 TeeStderr → 所有模块 stderr 输出自动进文件+终端
         # executor._log 用纯文件 _log_file（始终写文件,终端受 exec_log_enabled 控制）
@@ -210,7 +211,7 @@ class App:
         # 重量 IO 读 + ADC 换算已下沉到 executor._poll_weight_once()（脑干层）。
         # weight_manager 只负责状态变化时的副作用动作（开门/亮灯/关门）。
         self.weight_manager = WeightManager(self)
-        weight_poll_ms = self.config.get('weight_poll_interval_ms', 500)
+        weight_poll_ms = self.config.get('elevator', {}).get('weight_poll_interval_ms', 500)
         for cid in self.car_ids:
             exe = self.executors[cid]
             # H1: 关门重量检查（读 car.weight_state 缓存）
@@ -337,10 +338,25 @@ class App:
             print(f'[vplc] 已启动 {len(self.car_ids)} 部虚拟 PLC')
 
         # 启动每部电梯的重量后台轮询器（脑干层）
-        for cid in self.car_ids:
-            self.executors[cid].start_weight_poller()
+        # 重量改为按需轮询（关门时 / status 命令时），不再后台持续跑
+        # for cid in self.car_ids:
+        #     self.executors[cid].start_weight_poller()
+
+        # ===== HMI Web 服务（测试模式下跳过，避免端口冲突）=====
+        if not os.environ.get('PYTEST_CURRENT_TEST'):
+            web_port = self.config.get('web', {}).get('port', 10010)
+            try:
+                from web import start_web_server
+                self._web_runner = await start_web_server(self, web_port)
+            except ImportError:
+                pass
+            except Exception as e:
+                print(f'[web] 启动失败: {e}')
 
     async def stop(self) -> None:
+        # 停止 Web 服务
+        if hasattr(self, '_web_runner'):
+            await self._web_runner.cleanup()
         # 停止站点吸附（清标志 + 停反冲电机）
         for cid in self.car_ids:
             exe = self.executors[cid]
@@ -368,6 +384,26 @@ class App:
 
     # ===== IO 事件路由（按 car_id） =====
 
+    def car_state_dict(self, car_id: int) -> dict:
+        """Car 状态 → JSON-safe dict（供 HMI / WebSocket 用）"""
+        car = self.cars[car_id]
+        per_car_w = self.config.get('elevator', {}).get('per_car_weight', {}).get(str(car_id), {})
+        return {
+            'car_id': car_id,
+            'state': car.state.value if car.state else 'unknown',
+            'position': car.position,
+            'target_floor': car.target_floor,
+            'direction': car.direction.value if car.direction else 'idle',
+            'door_state': car.door_state.value if car.door_state else 'closed',
+            'display': car.display,
+            'fault': car.fault.any_active(),
+            'weight_state': getattr(car, 'weight_state', 0),
+            'weight_kg': getattr(car, 'weight_kg', 0),
+            'max_weight': per_car_w.get('max_weight', 0),
+            'driver_mode': getattr(car, 'driver_mode', False),
+            'pending_calls': list(self.pending_calls.get(car_id, [])),
+        }
+
     def _log_ui(self, msg: str) -> None:
         """记录 UI 事件到日志文件，终端受 _print_ui_events 控制"""
         if hasattr(self, '_log_file') and hasattr(self._log_file, 'write'):
@@ -393,106 +429,15 @@ class App:
     # ===== 重量查询（给 REPL /car status 用） =====
 
     async def _read_car_weight(self, car_id: int) -> int | None:
-        """返回 car.weight_kg（executor 轮询器持续更新，无需额外 IO 读）
+        """按需轮询一次重量再返回（供 /car status 用）
 
         返回 None = 当前 profile 无 weight_word 配置
         """
-        car = self.cars[car_id]
         exe = self.executors[car_id]
         if not exe._weight_enabled:
             return None
-        return car.weight_kg
-
-    def _dispatch_hall_call(self, floor: int, direction: str) -> int | None:
-        """派车算法：顺向优先 + 空闲最近
-
-        优先级：
-            0. 顺向经过（car moving dir == call dir，且 position → target_floor 之间会经过 floor）
-            1. 空闲（direction == IDLE，无当前任务）
-            其他：跳过（方向相反 / 同向但 target 已过 floor / 在忙）
-
-        同优先级按距离升序；距离相同取小 car_id。
-
-        门状态策略：
-            - CLOSED：一定可用
-            - CLOSING：允许派车，但必须 door_close_done == 1（PLC 已确认关好）
-              → 此时车在等关门完成，call_internal 会把目标排到队列，等关门动作
-                 完成后由 _on_action_done 推 MOVE 启动，不会"关着门就发车"
-            - OPEN / OPENING：禁止派车（乘客还在上下车，强制启动会撞人）
-
-        Returns:
-            选中的 car_id，或 None（无可用轿厢）
-        """
-        candidates: list[tuple[int, int, int]] = []  # (priority, distance, car_id)
-
-        for cid in self.car_ids:
-            car = self.cars[cid]
-
-            if car.state != CarState.READY or car.position is None:
-                continue
-            if car.driver_mode:
-                continue  # 司机模式:不接受外呼
-            if self.manual_mode.get(cid, False):
-                continue
-            # 门状态过滤:CLOSED 直接通过;CLOSING 仅在 PLC 报告 door_close_done=1 时通过
-            if car.door_state == DoorState.CLOSED:
-                pass
-            elif car.door_state == DoorState.CLOSING:
-                try:
-                    close_done_addr = self.mapper.addr_input(
-                        'door_close_done', cid)
-                    if self.io.get_input(close_done_addr) != 1:
-                        continue  # PLC 还没确认关好,关门动作还在路上
-                except KeyError:
-                    continue
-            else:
-                # OPEN / OPENING → 拒绝派车,避免乘客还在上下时车跑掉
-                continue
-            # 第二层防线：该车已在服务此 (floor, direction) pickup → 跳过
-            if (self.pm is not None
-                    and self.pm._pickup_active.get(cid, {}).get(
-                        (floor, direction), False)):
-                continue
-            # 第三层防线：该车已在服务同层反方向的 pickup → 跳过
-            # 避免一部车同时接上下行两个方向的同楼层呼梯
-            if (self.pm is not None):
-                opposite = 'down' if direction == 'up' else 'up'
-                if self.pm._pickup_active.get(cid, {}).get((floor, opposite), False):
-                    continue
-
-            # 载重过滤:有 weight_word 配置用三态机,否则用 overload 布尔
-            if car.max_weight > 0:
-                # 比赛/带重量模式:忽略 overload,用三态机
-                if car.weight_state >= 1:
-                    continue  # state=1 临界 / state=2 超重 → 不响应外呼
-            else:
-                # 本地练习模式:无 word,用 overload 布尔信号
-                if car.fault.overload:
-                    continue
-
-            pos = car.position
-            moving_dir = car.direction
-            target = car.target_floor
-
-            # 顺向且会经过该层
-            same_dir_pass = False
-            if direction == 'up' and moving_dir == Direction.UP and target is not None:
-                if pos < floor <= target:
-                    same_dir_pass = True
-            elif direction == 'down' and moving_dir == Direction.DOWN and target is not None:
-                if pos > floor >= target:
-                    same_dir_pass = True
-
-            if same_dir_pass:
-                candidates.append((0, abs(floor - pos), cid))
-            elif moving_dir == Direction.IDLE:
-                candidates.append((1, abs(floor - pos), cid))
-
-        if not candidates:
-            return None
-
-        candidates.sort()
-        return candidates[0][2]
+        await exe.poll_weight()
+        return self.cars[car_id].weight_kg
 
     def is_floor_door_open(self, car_id: int, floor: int) -> bool:
         """检查楼层门锁是否已开（floor_door_lock_{floor} == 0）"""
@@ -706,21 +651,57 @@ class App:
             except Exception as e:
                 print(f'[app] car{car_id} PM.on_action_done 异常: {e!r}')
 
+        # ★ 孤儿 pickup 回收：pickup 还在但楼层已不在 pending_calls 里
+        # 场景：偷客/改道后 pickup 残留，车不再去那个楼层，灯永远亮。
+        # 回收进 _pending_hall_calls → 空闲车重新派过去。
+        if self.pm is not None:
+            for cid in self.car_ids:
+                car = self.cars[cid]
+                if car.state != CarState.READY:
+                    continue
+                my_pending = self.pending_calls.get(cid, [])
+                for (floor, direction), active in list(
+                        self.pm._pickup_active[cid].items()):
+                    if not active:
+                        continue
+                    if floor not in my_pending:
+                        # 孤儿：回收
+                        self.pm._pickup_active[cid].pop((floor, direction), None)
+                        self.pm._pending_hall_calls.add((floor, direction))
+                        self.pm._log_pickup('orphan', cid, floor, direction, 'recycled')
+                        self.pm._log_pending('add', floor, direction, 'orphan_recycled')
+                        await self.set_hall_indicator(floor, direction, True)
+
+        # ★ 车变空闲时：扫描所有空闲车派 pending 外召
+        if self.pm is not None and self.pm._pending_hall_calls:
+            for cid in self.car_ids:
+                if not self.pm._pending_hall_calls:
+                    break
+                car = self.cars[cid]
+                if (car.state == CarState.READY
+                        and car.direction == Direction.IDLE
+                        and car.door_state == DoorState.CLOSED
+                        and car.position is not None
+                        and self.executors[cid].current_action is None
+                        and not self.manual_mode.get(cid, False)):
+                    # ★ 跳过有内召的车：车内有乘客要去某层，先送达再说
+                    origins = self.pending_call_origin.get(cid, {})
+                    has_internal = any(
+                        origins.get(f) == 'internal'
+                        for f in self.pending_calls.get(cid, []))
+                    if has_internal:
+                        continue
+                    # ★ 跳过临界/超重车：weight_state>=1 不响应外呼
+                    if getattr(car, 'weight_state', 0) >= 1:
+                        continue
+                    await self.pm._try_dispatch_pending_hall_calls(cid)
+
         if not advanced:
             # CLOSE_DOOR → PM._on_door_closed 已通过 call_internal → _tick 派车
             # OPEN_DOOR → PM._on_door_opened 只调度 cron，不派车，仍需 _tick
             # 避免双重 _tick 导致重复 MOVE 入队（第二个 MOVE 到站开门后静默失败）
             if last_action.kind != ActionKind.CLOSE_DOOR:
                 await self._tick(car_id)
-
-        # ★ 车变空闲时尝试派 pending 外召
-        # 防止外召卡在 _pending_hall_calls 里：所有车都忙时外召被加入 pending，
-        # 但车完成后再无 door_close 事件触发重试，外召永远无人响应。
-        if (self.pm is not None
-                and self.pm._pending_hall_calls
-                and self.executors[car_id].current_action is None
-                and self.cars[car_id].door_state == DoorState.CLOSED):
-            await self.pm._try_dispatch_pending_hall_calls(car_id)
 
         # ★ 兜底：车变空闲且门关着 + 无请求 → 启动 HP timer
         # 场景：origin=internal 到站不开门 / _on_door_closed 因 pending 非空没调度 HP
@@ -740,6 +721,23 @@ class App:
                 if not scheduled:
                     await self.pm._start_human_presence_timer(car_id)
                     self._log_ui(f'[hp_fallback] car{car_id} 没收到 door_close,主动启动 HP timer')
+
+        # ★ 外呼灯一致性校验：确保灯亮 = 有活跃外呼
+        if self.pm is not None:
+            try:
+                await self.pm.reconcile_hall_indicators()
+            except Exception:
+                pass
+
+        # WebSocket 广播：每次 action 完成推一次全车状态
+        try:
+            from web import ws_broadcast
+            await ws_broadcast('car_state', {
+                str(car_id): self.car_state_dict(car_id)
+                for car_id in self.car_ids
+            })
+        except Exception:
+            pass  # Web 服务未启动或客户端断开，静默忽略
 
     async def _handle_algorithm_state_change(
         self, car_id: int, last_action: Action
@@ -863,7 +861,7 @@ class App:
                             origin: str = 'internal') -> bool:
         cid = car_id if car_id is not None else self.current_car_id
         # ★ 发车前再次校验门状态:必须是 CLOSED 或 (CLOSING + door_close_done=1)
-        # 防止 _dispatch_hall_call 选中后状态在间隙内变化导致"关门未完就发车"
+        # 防止 PM._select_car_for_hall_call 选中后状态在间隙内变化导致"关门未完就发车"
         car = self.cars[cid]
         if car.door_state == DoorState.CLOSED:
             pass
@@ -1257,6 +1255,10 @@ class App:
             if not ready:
                 return result  # 没有任何就绪车,拒绝
             self._usermode = True
+            if self.pm is not None:
+                if (not hasattr(self.pm, '_brain_tick_task')
+                        or self.pm._brain_tick_task is None):
+                    self.pm.start_brain_tick()
             try:
                 ready_addr = self.mapper.addr_output('ready', 0)
                 await self.io.set(ready_addr, 1)
@@ -1269,6 +1271,17 @@ class App:
                 await self.io.set(ready_addr, 0)
             except KeyError:
                 pass
+
+        # WS 推送：usermode 变化（前端 meta 栏实时更新）
+        try:
+            from web import ws_broadcast
+            await ws_broadcast('system_event', {
+                'type': 'usermode',
+                'enabled': self._usermode,
+                'cars': list(self._usermode_active_cars) if hasattr(self, '_usermode_active_cars') else [],
+            })
+        except Exception:
+            pass
 
         return result
 

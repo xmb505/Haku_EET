@@ -76,9 +76,9 @@ async def test_initialize_down_triggers_bottom_limit(setup):
     await queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.02)
 
-    # 全速下行
+    # 低速下行
     assert io.get_output(mapper.addr_output('down_contactor', 1)) == 1
-    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 1
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
 
@@ -647,9 +647,9 @@ async def test_initialize_down_triggers_bottom_limit(setup):
     await queue.put(Action(ActionKind.INITIALIZE, floor=1))
     await asyncio.sleep(0.02)
 
-    # 全速下行
+    # 低速下行
     assert io.get_output(mapper.addr_output('down_contactor', 1)) == 1
-    assert io.get_output(mapper.addr_output('high_speed_contactor', 1)) == 1
+    assert io.get_output(mapper.addr_output('low_speed_contactor', 1)) == 1
     assert io.get_output(mapper.addr_output('motor_start', 1)) == 1
     assert io.get_output(mapper.addr_output('up_contactor', 1)) == 0
 
