@@ -1903,7 +1903,8 @@ class Console:
             return
         if event.bit == 1:
             # 判断是否已经触发过第一轮
-            if self._competition_task is None or self._competition_task.done():
+            first_run = self._competition_task is None or self._competition_task.done()
+            if first_run:
                 print('[competition] 收到第一次自动运行信号(auto_run=1)，启动首次流程')
                 self._competition_task = asyncio.create_task(
                     self._run_competition_flow())
@@ -1911,6 +1912,16 @@ class Console:
                 print('[competition] 收到第二次自动运行信号(auto_run=1)，启动重新初始化流程')
                 self._competition_task = asyncio.create_task(
                     self._run_recompetition_flow())
+            # WS 推送：auto_run 信号（前端系统日志）
+            try:
+                from web import ws_broadcast
+                await ws_broadcast('system_event', {
+                    'type': 'auto_run',
+                    'first': first_run,
+                    'msg': f'收到{"第一次" if first_run else "第二次"}自动运行信号',
+                })
+            except Exception:
+                pass
 
     async def _run_competition_flow(self) -> None:
         """比赛流程：初始化所有轿厢 → 等待就绪 → 启用用户模式"""

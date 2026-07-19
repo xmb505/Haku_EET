@@ -117,9 +117,12 @@
             padding: 2px 8px;
             min-width: 44px;
             text-align: center;
-            text-shadow: 0 0 4px #00ff00;
             border: 1px solid var(--win-shadow);
             flex-shrink: 0;
+        }
+        .car-card .car-floor-box.fault {
+            color: #ffff00;
+            animation: blink 0.4s ease-in-out infinite alternate;
         }
 
         .car-card .car-arrow {
@@ -187,7 +190,7 @@
             display: block;
             height: 100%;
             background: #00aa00;
-            transition: width 0.3s;
+            transition: width 0.5s ease, background-color 0.3s ease;
         }
 
         .weight-bar.w-warn .weight-fill { background: #cccc00; }
@@ -225,9 +228,9 @@
         .bldg-row {
             display: flex;
             align-items: center;
-            height: 26px;
+            height: 20px;
             border-bottom: 1px solid #ccc;
-            font-size: 10px;
+            font-size: 9px;
         }
 
         .bldg-row .bldg-floor {
@@ -243,13 +246,13 @@
             flex: 1;
             display: flex;
             gap: 1px;
-            height: 24px;
+            height: 18px;
             align-items: center;
         }
 
         .bldg-shaft .shaft-cell {
             flex: 1;
-            height: 22px;
+            height: 18px;
             border: 1px solid #ddd;
             display: flex;
             align-items: center;
@@ -260,22 +263,18 @@
 
         .bldg-shaft .shaft-cell .car-pos {
             width: 18px;
-            height: 18px;
-            background: #c00;
-            border: 1px solid #f66;
-            border-radius: 2px;
+            height: 16px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 8px;
+            font-size: 10px;
             color: white;
             font-weight: bold;
-            box-shadow: 0 0 6px rgba(204,0,0,0.6);
         }
-
-        .bldg-shaft .shaft-cell .car-pos.mv {
-            animation: blink 0.6s ease-in-out infinite alternate;
-        }
+        .bldg-shaft .shaft-cell .car-pos.open    { background: #00aa00; border: 1px solid #00cc00; }
+        .bldg-shaft .shaft-cell .car-pos.opening { background: #cccc00; border: 1px solid #dddd00; }
+        .bldg-shaft .shaft-cell .car-pos.closing { background: #cc6600; border: 1px solid #dd7700; }
+        .bldg-shaft .shaft-cell .car-pos.closed  { background: #cc0000; border: 1px solid #f66; }
 
         @keyframes blink {
             from { box-shadow: 0 0 2px rgba(204,0,0,0.3); }
@@ -451,13 +450,13 @@
 
                 <!-- 右：建筑视图 + 日志 -->
                 <div class="dash-right">
-                    <div class="panel-frame" style="flex:1; min-height: 140px;">
+                    <div class="panel-frame" style="flex:0 0 auto;">
                         <div class="panel-title"> 楼层分布图</div>
-                        <div class="panel-body" id="buildingView" style="padding: 2px;">
+                        <div class="panel-body" id="buildingView" style="padding: 1px; padding-right: 14px; overflow: hidden;">
                             <div class="loading">加载中...</div>
                         </div>
                     </div>
-                    <div class="panel-frame" style="flex:1; min-height: 80px;">
+                    <div class="panel-frame" style="flex:1; min-height: 40px;">
                         <div class="panel-title"> 系统日志</div>
                         <div class="panel-body" style="padding: 2px;">
                             <div class="log-box" id="logBox">
@@ -528,12 +527,27 @@
 
     <script>
         // ============================================================
-        //  全局状态
+        //  全局状态（事件驱动，无轮询）
         // ============================================================
         const API_BASE = '';
-        let refreshTimer = null;
-        let isRefreshing = false;
-        let lastData = null;
+        const WS_URL = `ws://${location.host}/ws`;
+
+        // 当前缓存状态（增量更新）
+        const state = {
+            cars: {},          // car_id → {position, direction, door_state, ...}
+            hall_leds: {},     // floor → {direction: bool}
+            meta: {
+                algorithm: 'simple_internal_call',
+                usermode: false,
+                simulate: true,
+                init_direction: 'down',
+            },
+            connected: false,
+            last_event: null,
+        };
+
+        let ws = null;
+        let wsReconnectTimer = null;
 
         const FLOOR_NAMES = {
             0: '下基站', 1: '1F', 2: '2F', 3: '3F', 4: '4F',
@@ -571,195 +585,308 @@
             entry.innerHTML = `<span class="t">[${time}]</span> <span class="${type}">${message}</span>`;
             box.appendChild(entry);
             box.scrollTop = box.scrollHeight;
-            // 保留最近100条
             while (box.children.length > 100) box.removeChild(box.firstChild);
         }
 
         // ============================================================
-        //  从 /stattrak 获取数据
+        //  OPC UA 连接
         // ============================================================
-        async function fetchStattrak() {
-            if (isRefreshing) return;
-            isRefreshing = true;
-
-            const statusEl = document.getElementById('refreshStatus');
+        function setConnectionBadge(status) {
             const badgeEl = document.getElementById('connectionBadge');
-            statusEl.textContent = '刷新中...';
-
-            try {
-                const resp = await fetch(`${API_BASE}/stattrak`, {
-                    method: 'GET',
-                    headers: { 'Accept': 'application/json' },
-                    signal: AbortSignal.timeout(5000)
-                });
-
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-                const data = await resp.json();
-                lastData = data;
+            const statusEl = document.getElementById('refreshStatus');
+            if (status === 'connected') {
                 badgeEl.className = 'connection-badge connected';
                 badgeEl.textContent = '● 已连接';
-                statusEl.textContent = `已更新 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
-                addLogEntry('数据刷新成功', 'ok');
-                renderDashboard(data);
-                updateStatusBar(data);
-            } catch (err) {
+                statusEl.textContent = '实时推送中';
+            } else if (status === 'connecting') {
+                badgeEl.className = 'connection-badge connecting';
+                badgeEl.textContent = '● 连接中...';
+                statusEl.textContent = '连接中...';
+            } else {
                 badgeEl.className = 'connection-badge disconnected';
-                badgeEl.textContent = '● 未连接';
-                statusEl.textContent = '获取失败: ' + err.message;
-                addLogEntry('数据刷新失败: ' + err.message, 'err');
+                badgeEl.textContent = '● 已断开';
+                statusEl.textContent = '重连中...';
+            }
+        }
 
-                // 如果从未成功过，显示模拟数据
-                if (!lastData) {
-                    renderMockData();
-                }
-            } finally {
-                isRefreshing = false;
+        function connectWS() {
+            setConnectionBadge('connecting');
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                state.connected = true;
+                setConnectionBadge('connected');
+                addLogEntry('OPC UA 已连接', 'ok');
+            };
+
+            ws.onmessage = (ev) => {
+                let msg;
+                try { msg = JSON.parse(ev.data); } catch { return; }
+                handleWSEvent(msg.event, msg.data);
+            };
+
+            ws.onerror = () => {
+                addLogEntry('OPC UA 错误', 'err');
+            };
+
+            ws.onclose = () => {
+                state.connected = false;
+                setConnectionBadge('disconnected');
+                addLogEntry('OPC UA 已断开，3秒后重连...', 'warn');
+                clearTimeout(wsReconnectTimer);
+                wsReconnectTimer = setTimeout(connectWS, 3000);
+            };
+        }
+
+        // ============================================================
+        //  OPC UA 事件分发
+        // ============================================================
+        function handleWSEvent(event, data) {
+            state.last_event = new Date();
+            switch (event) {
+                case 'init_state':
+                    state.cars = data.cars || {};
+                    state.hall_leds = data.hall_leds || {};
+                    state.meta = {
+                        algorithm: data.algorithm || 'simple_internal_call',
+                        usermode: !!data.usermode,
+                        simulate: !!data.simulate,
+                        init_direction: data.init_direction || 'down',
+                    };
+                    renderAll();
+                    addLogEntry(`init_state: ${Object.keys(state.cars).length} 部车`, 'info');
+                    break;
+
+                case 'car_state':
+                    Object.entries(data).forEach(([cid, car]) => {
+                        state.cars[cid] = car;
+                        renderCarCard(cid, car);
+                    });
+                    renderBuildingView();
+                    updateStatusBar();
+                    break;
+
+                case 'hall_led':
+                    if (data.on) {
+                        (state.hall_leds[data.floor] = state.hall_leds[data.floor] || {})[data.direction] = true;
+                    } else {
+                        if (state.hall_leds[data.floor]) {
+                            delete state.hall_leds[data.floor][data.direction];
+                        }
+                    }
+                    renderBuildingView();
+                    break;
+
+                case 'weight_event':
+                    // 重量变化（后端未广播时由 car_state 覆盖，保留作未来扩展）
+                    if (data.car_id && state.cars[data.car_id]) {
+                        state.cars[data.car_id].weight_state = data.state;
+                        state.cars[data.car_id].weight_kg = data.weight_kg;
+                        renderCarCard(data.car_id, state.cars[data.car_id]);
+                    }
+                    break;
+
+                case 'pong':
+                    break;
+
+                case 'system_event':
+                    if (data.type === 'usermode') {
+                        state.meta.usermode = !!data.enabled;
+                        updateMetaBar();
+                        addLogEntry(`usermode → ${data.enabled ? '开' : '关'}`, 'ok');
+                    } else if (data.type === 'auto_run') {
+                        addLogEntry(`[比赛] ${data.msg}`, 'ok');
+                    }
+                    break;
+
+                default:
+                    addLogEntry(`未处理事件: ${event}`, 'warn');
             }
         }
 
         // ============================================================
-        //  渲染 - 电梯列表
+        //  渲染
         // ============================================================
-        function renderDashboard(data) {
-            renderElevatorCards(data);
-            renderBuildingView(data);
-            renderBuildingHint(data);
-            updateMetaBar(data);
+        function renderAll() {
+            renderElevatorCards();
+            renderBuildingView();
+            updateMetaBar();
+            renderBuildingHint();
+            updateStatusBar();
         }
 
-        // ============================================================
-        //  元数据栏（顶部 toolbar 右侧）
-        // ============================================================
-        function updateMetaBar(data) {
-            const algoEl = document.getElementById('statusAlgorithm');
+        function updateMetaBar() {
+            const { algorithm, usermode, simulate, init_direction } = state.meta;
+            document.getElementById('statusAlgorithm').textContent = `算法: ${algorithm}`;
             const userEl = document.getElementById('statusUsermode');
-            const simEl = document.getElementById('statusSimulate');
-            const initEl = document.getElementById('statusInitDir');
-
-            algoEl.textContent = `算法: ${data.algorithm || 'unknown'}`;
-
-            const usermode = !!data.usermode;
             userEl.textContent = `用户模式: ${usermode ? '开' : '关'}`;
             userEl.className = 'meta-badge ' + (usermode ? 'on' : 'off');
-
-            const sim = !!data.simulate;
-            simEl.textContent = `模式: ${sim ? '模拟' : '实机'}`;
-            simEl.className = 'meta-badge ' + (sim ? 'on' : 'off');
-
-            initEl.textContent = `初始化: ${data.init_direction || 'down'}`;
+            const simEl = document.getElementById('statusSimulate');
+            simEl.textContent = `模式: ${simulate ? '模拟' : '实机'}`;
+            simEl.className = 'meta-badge ' + (simulate ? 'on' : 'off');
+            document.getElementById('statusInitDir').textContent = `初始化: ${init_direction}`;
         }
 
-        function renderElevatorCards(data) {
-            const container = document.getElementById('elevatorList');
-            const cars = data.cars || [];
+        function stateLabel(s) {
+            if (s === 'ready') return '就绪';
+            if (s === 'fault') return '故障';
+            return '未知';
+        }
 
+        function doorLabel(d) {
+            if (d === 'open') return '开门';
+            if (d === 'opening') return '开门中';
+            if (d === 'closing') return '关门中';
+            return '关门';
+        }
+
+        function buildCarCard(car) {
+            const pos = car.position != null ? car.position : 'N/A';
+            const isFault = car.state === 'fault';
+            const floorDisplay = isFault ? '!' : pos;
+            const floorClass = isFault ? 'fault' : '';
+            const dir = car.direction || 'idle';
+            const dirChar = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '◆';
+            const door = car.door_state || 'closed';
+            const target = car.target_floor !== undefined && car.target_floor !== null ? car.target_floor : '-';
+            const weightKg = car.weight_kg || 0;
+            const maxW = car.max_weight || 0;
+            const wState = car.weight_state || 0;
+            const wPercent = maxW > 0 ? Math.min(100, Math.round(weightKg / maxW * 100)) : 0;
+            let wClass = 'w-normal', wLabel = '正常';
+            if (wState === 1) { wClass = 'w-warn'; wLabel = '临界'; }
+            else if (wState === 2) { wClass = 'w-over'; wLabel = '超重'; }
+
+            return `
+                <div class="car-card" id="car-card-${car.car_id}" onclick="location.href='control.html?car=${car.car_id}'">
+                    <div class="car-id">#${car.car_id}</div>
+                    <div class="car-floor-box ${floorClass}">${floorDisplay}</div>
+                    <div class="car-arrow ${dir}">${dirChar}</div>
+                    <div class="car-info">
+                        <span><span class="label">状态</span> ${stateLabel(car.state)}</span>
+                        <span><span class="label">目标</span> ${target === '-' ? '-' : target + 'F'}</span>
+                        <span><span class="label">显示</span> ${car.display ?? '-'}</span>
+                        <span>
+                            <span class="label">门</span>
+                            <span class="door-badge ${door}">${doorLabel(door)}</span>
+                        </span>
+                        <span class="weight-row">
+                            <span class="label">载重</span>
+                            <span class="weight-bar ${wClass}" title="${wLabel}">
+                                <span class="weight-fill" style="width:${wPercent}%"></span>
+                                <span class="weight-text">${weightKg}/${maxW}kg</span>
+                            </span>
+                        </span>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderElevatorCards() {
+            const container = document.getElementById('elevatorList');
+            const cars = Object.values(state.cars);
             if (cars.length === 0) {
-                container.innerHTML = '<div style="text-align:center;padding:20px;color:#888;">暂无电梯数据</div>';
+                container.innerHTML = '<div style="text-align:center;padding:20px;color:#888;">等待数据...</div>';
+                return;
+            }
+            container.innerHTML = '<div class="elevator-cards">' +
+                cars.map(buildCarCard).join('') + '</div>';
+        }
+
+        // 单车卡片增量更新（保留 DOM 使 transition 生效）
+        function renderCarCard(cid, car) {
+            const cardId = `car-card-${cid}`;
+            let card = document.getElementById(cardId);
+            if (!card) {
+                // 还没建过：重建整个列表
+                renderElevatorCards();
                 return;
             }
 
-            function stateLabel(s) {
-                if (s === 'ready') return '就绪';
-                if (s === 'fault') return '故障';
-                return '未知';
-            }
+            // 楼层 + 故障闪烁
+            const pos = car.position != null ? car.position : 'N/A';
+            const isFault = car.state === 'fault';
+            const floorBox = card.querySelector('.car-floor-box');
+            floorBox.textContent = isFault ? '!' : pos;
+            floorBox.className = 'car-floor-box' + (isFault ? ' fault' : '');
 
-            let html = '<div class="elevator-cards">';
-            cars.forEach(car => {
-                const pos = car.position !== undefined ? car.position : '?';
-                const dir = car.direction || 'idle';
-                const dirChar = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '◆';
-                const door = car.door_state || 'closed';
-                const doorLabel = door === 'open' ? '开门' : door === 'opening' ? '开门中' : door === 'closing' ? '关门中' : '关门';
-                const target = car.target_floor !== undefined && car.target_floor !== null ? car.target_floor : '-';
+            // 方向箭头
+            const dir = car.direction || 'idle';
+            const dirChar = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '◆';
+            const arrow = card.querySelector('.car-arrow');
+            arrow.textContent = dirChar;
+            arrow.className = 'car-arrow ' + dir;
 
-                // 载重三态机（weight_kg / max_weight / weight_state）
-                const weightKg = car.weight_kg || 0;
-                const maxW = car.max_weight || 0;
-                const wState = car.weight_state || 0;
-                const wPercent = maxW > 0 ? Math.min(100, Math.round(weightKg / maxW * 100)) : 0;
-                let wClass = 'w-normal';
-                let wLabel = '正常';
-                if (wState === 1) { wClass = 'w-warn'; wLabel = '临界'; }
-                else if (wState === 2) { wClass = 'w-over'; wLabel = '超重'; }
+            // 信息行（状态、目标、显示、门）
+            const info = card.querySelector('.car-info');
+            const spans = info.querySelectorAll(':scope > span');
+            const door = car.door_state || 'closed';
+            const target = car.target_floor !== undefined && car.target_floor !== null ? car.target_floor : '-';
+            if (spans[0]) spans[0].innerHTML = '<span class="label">状态</span> ' + stateLabel(car.state);
+            if (spans[1]) spans[1].innerHTML = '<span class="label">目标</span> ' + (target === '-' ? '-' : target + 'F');
+            if (spans[2]) spans[2].innerHTML = '<span class="label">显示</span> ' + (car.display ?? '-');
+            if (spans[3]) spans[3].innerHTML = '<span class="label">门</span><span class="door-badge ' + door + '">' + doorLabel(door) + '</span>';
 
-                html += `
-                    <div class="car-card" onclick="location.href='control.html?car=${car.car_id}'">
-                        <div class="car-id">#${car.car_id}</div>
-                        <div class="car-floor-box">${pos}</div>
-                        <div class="car-arrow ${dir}">${dirChar}</div>
-                        <div class="car-info">
-                            <span><span class="label">状态</span> ${stateLabel(car.state)}</span>
-                            <span><span class="label">目标</span> ${target === '-' ? '-' : target + 'F'}</span>
-                            <span><span class="label">显示</span> ${car.display ?? '-'}</span>
-                            <span>
-                                <span class="label">门</span>
-                                <span class="door-badge ${door}">${doorLabel}</span>
-                            </span>
-                            <span class="weight-row">
-                                <span class="label">载重</span>
-                                <span class="weight-bar ${wClass}" title="${wLabel}">
-                                    <span class="weight-fill" style="width:${wPercent}%"></span>
-                                    <span class="weight-text">${weightKg}/${maxW}kg</span>
-                                </span>
-                            </span>
-                        </div>
-                    </div>
-                `;
-            });
-            html += '</div>';
-            container.innerHTML = html;
+            // 载重条——保持 DOM 不销毁，transition 生效
+            const weightKg = car.weight_kg || 0;
+            const maxW = car.max_weight || 0;
+            const wState = car.weight_state || 0;
+            const wPercent = maxW > 0 ? Math.min(100, Math.round(weightKg / maxW * 100)) : 0;
+            var wClass = 'w-normal';
+            if (wState === 1) wClass = 'w-warn';
+            else if (wState === 2) wClass = 'w-over';
+
+            var weightBar = card.querySelector('.weight-bar');
+            var weightFill = card.querySelector('.weight-fill');
+            var weightText = card.querySelector('.weight-text');
+            if (weightBar) weightBar.className = 'weight-bar ' + wClass;
+            if (weightFill) weightFill.style.width = wPercent + '%';
+            if (weightText) weightText.textContent = weightKg + '/' + maxW + 'kg';
         }
 
-        // ============================================================
-        //  渲染 - 建筑楼层图（顶部加 simple_internal_call 提示）
-        // ============================================================
-        function renderBuildingHint(data) {
+        function renderBuildingHint() {
             const panel = document.querySelector('#buildingView').parentElement;
-            // 移除旧提示（防重复）
             const oldHint = panel.querySelector('.building-hint');
             if (oldHint) oldHint.remove();
-
-            // 拿不到 data 时不画提示（避免覆盖 loading 文案）
-            if (!data) return;
-
-            const algo = data.algorithm || 'simple_internal_call';
+            const algo = state.meta.algorithm || 'simple_internal_call';
             const isSingle = algo === 'simple_internal_call';
             const hint = document.createElement('div');
             hint.className = 'building-hint';
             hint.innerHTML = isSingle
-                ? `调度算法: <b>${algo}</b> — 单车独立调度，外召需 PassengerManager 分配`
+                ? `调度算法: <b>${algo}</b> — 外召由 PassengerManager 统一分配`
                 : `调度算法: <b>${algo}</b>`;
-            // 插入到 panel-body (#buildingView) 之前，而非 title-bar 之前
             const bodyEl = document.getElementById('buildingView');
             panel.insertBefore(hint, bodyEl);
         }
 
-        function renderBuildingView(data) {
+        function renderBuildingView() {
             const container = document.getElementById('buildingView');
-            const cars = data.cars || [];
-            const maxFloor = 11;
-            const minFloor = 0;
+            const cars = Object.values(state.cars);
+            const maxFloor = 11, minFloor = 0;
 
             if (cars.length === 0) {
                 container.innerHTML = '<div style="text-align:center;padding:10px;color:#888;">暂无数据</div>';
                 return;
             }
 
-            // 计算每部车的楼层位置
             const positions = cars.map(c => ({
                 id: c.car_id,
                 floor: c.position,
                 moving: c.direction !== 'idle' && c.direction !== undefined,
-                dir: c.direction || 'idle'
+                dir: c.direction || 'idle',
+                door: c.door_state || 'closed',
+                fault: c.fault
             }));
 
-            let html = '<div class="building-scroll">';
+            let html = '';
             for (let f = maxFloor; f >= minFloor; f--) {
                 const floorName = FLOOR_NAMES[f] || f + 'F';
+                // 标记该楼层是否有外召灯亮
+                const leds = state.hall_leds[f] || {};
+                const ledBadge = (leds.up ? '<span style="color:#00aa00;">▲</span>' : '') +
+                                  (leds.down ? '<span style="color:#cc0000;">▼</span>' : '');
                 html += `<div class="bldg-row">
-                    <div class="bldg-floor">${floorName}</div>
+                    <div class="bldg-floor">${floorName}${ledBadge}</div>
                     <div class="bldg-shaft">`;
 
                 positions.forEach(car => {
@@ -767,112 +894,66 @@
                     html += '<div class="shaft-cell">';
                     if (hasCar) {
                         const mvClass = car.moving ? 'mv' : '';
-                        html += `<div class="car-pos ${mvClass}">${car.id}</div>`;
+                        const doorClass = car.door;
+                        const arrow = car.dir === 'up' ? '▲' : car.dir === 'down' ? '▼' : '◆';
+                        html += `<div class="car-pos ${mvClass} ${doorClass}">${arrow}</div>`;
                     }
                     html += '</div>';
                 });
 
                 html += '</div></div>';
             }
-            html += '</div>';
             container.innerHTML = html;
         }
 
-        // ============================================================
-        //  状态栏更新
-        // ============================================================
-        function updateStatusBar(data) {
-            const cars = data.cars || [];
+        function updateStatusBar() {
+            const cars = Object.values(state.cars);
             document.getElementById('statusElevatorCount').textContent = `电梯: ${cars.length} 部`;
-            document.getElementById('statusLastUpdate').textContent =
-                `最后更新: ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+            if (state.last_event) {
+                document.getElementById('statusLastUpdate').textContent =
+                    `最后事件: ${state.last_event.toLocaleTimeString('zh-CN', { hour12: false })}`;
+            }
             document.getElementById('statusDataSize').textContent =
-                `数据: ${JSON.stringify(data).length} bytes`;
+                `事件: ${Object.keys(state.cars).length}车 + ${Object.keys(state.hall_leds).length}灯`;
         }
 
         // ============================================================
-        //  模拟数据（后端不存在时演示用）
-        // ============================================================
-        function renderMockData() {
-            const mock = {
-                algorithm: 'simple_internal_call',
-                usermode: false,
-                simulate: true,
-                init_direction: 'down',
-                cars: [
-                    { car_id: 1, state: 'ready', position: 5, direction: 'up', door_state: 'closed', target_floor: 8, display: 5, human_presence: 0, weight_kg: 200, max_weight: 1000, weight_state: 0 },
-                    { car_id: 2, state: 'ready', position: 3, direction: 'down', door_state: 'opening', target_floor: 1, display: 3, human_presence: 1, weight_kg: 970, max_weight: 1000, weight_state: 1 },
-                    { car_id: 3, state: 'ready', position: 9, direction: 'idle', door_state: 'open', target_floor: 9, display: 9, human_presence: -1, weight_kg: 0, max_weight: 1000, weight_state: 0 },
-                    { car_id: 4, state: 'ready', position: 1, direction: 'up', door_state: 'closed', target_floor: 6, display: 1, human_presence: 0, weight_kg: 100, max_weight: 1000, weight_state: 0 },
-                    { car_id: 5, state: 'ready', position: 7, direction: 'down', door_state: 'closed', target_floor: 4, display: 7, human_presence: 0, weight_kg: 300, max_weight: 1000, weight_state: 0 },
-                    { car_id: 6, state: 'fault', position: 2, direction: 'idle', door_state: 'closed', target_floor: null, display: 2, human_presence: -1, weight_kg: 0, max_weight: 1000, weight_state: 0 },
-                ],
-                hall_calls: [
-                    { floor: 3, direction: 'up', active: true },
-                    { floor: 7, direction: 'down', active: false }
-                ],
-                system_time: Date.now() / 1000,
-                connected: true
-            };
-
-            document.getElementById('connectionBadge').className = 'connection-badge connecting';
-            document.getElementById('connectionBadge').textContent = '● 模拟数据';
-            document.getElementById('refreshStatus').textContent = '演示模式（模拟数据）';
-            addLogEntry('使用模拟数据展示（后端未连接）', 'warn');
-
-            renderDashboard(mock);
-            updateStatusBar(mock);
-        }
-
-        // ============================================================
-        //  工具栏操作
+        //  工具栏 / 对话框
         // ============================================================
         function forceRefresh() {
-            fetchStattrak();
+            // 事件驱动模式下"刷新" = 重新连接 OPC UA 拿 init_state
+            if (ws) ws.close();
+            setTimeout(connectWS, 100);
         }
 
-        function minimizeWindow() {
-        }
-
-        function maximizeWindow() {
-        }
-
-        function showAbout() {
-            showDialog('aboutDialog');
-        }
+        function showAbout() { showDialog('aboutDialog'); }
 
         function logout() {
-            showConfirm('确认注销退出？', function() {
+            showConfirm('确认注销退出？', () => {
                 sessionStorage.clear();
                 window.location.href = 'index.html';
             });
         }
 
-        /* ---- Win95 风格对话框 ---- */
         function showDialog(id) {
             document.getElementById(id).classList.remove('hidden');
         }
-
         function closeDialog(id) {
             document.getElementById(id).classList.add('hidden');
         }
-
         let _confirmCb = null;
-        function showConfirm(msg, callback) {
+        function showConfirm(msg, cb) {
             document.getElementById('confirmMessage').textContent = msg;
-            _confirmCb = callback;
+            _confirmCb = cb;
             document.getElementById('confirmDialog').classList.remove('hidden');
         }
-
         function confirmYes() {
             closeDialog('confirmDialog');
             if (_confirmCb) _confirmCb();
             _confirmCb = null;
         }
 
-        // ============================================================
-        //  菜单栏紧急动作下拉
-        // ============================================================
+        // 紧急动作菜单
         function toggleEmergencyMenu(e) {
             e.stopPropagation();
             document.getElementById('emergencyMenu').classList.toggle('show');
@@ -880,47 +961,27 @@
         function closeEmergencyMenu() {
             document.getElementById('emergencyMenu').classList.remove('show');
         }
-        document.addEventListener('click', function(e) {
+        document.addEventListener('click', (e) => {
             if (!e.target.closest('.menu-item-wrap')) closeEmergencyMenu();
         });
 
-        // ============================================================
-        //  火灾逃生（系统级：/escape true，所有电梯就近停车开门）
-        // ============================================================
         function sendEscapeCmd() {
-            showConfirm('确认触发火灾逃生模式？将对所有电梯执行就近停车、点亮故障灯、开门。退出后需重新初始化。', function() {
-                addLogEntry('火灾逃生已触发（系统级）', 'err');
+            showConfirm('确认触发火灾逃生？所有电梯就近停车开门，退出后需重新初始化。', () => {
+                addLogEntry('火灾逃生已触发', 'err');
                 fetch(`${API_BASE}/control`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ command: 'system', action: 'escape', value: true }),
                     signal: AbortSignal.timeout(5000)
-                }).catch(err => addLogEntry('火灾逃生发送失败: ' + err.message, 'err'));
+                }).catch(err => addLogEntry('逃生发送失败: ' + err.message, 'err'));
             });
         }
 
         // ============================================================
-        //  自动刷新
+        //  启动：建立 OPC UA（无任何轮询）
         // ============================================================
-        function startAutoRefresh() {
-            fetchStattrak();
-            refreshTimer = setInterval(fetchStattrak, 3000);
-        }
-
-        // 页面可见时自动刷新，不可见时暂停
-        document.addEventListener('visibilitychange', () => {
-            if (document.hidden) {
-                clearInterval(refreshTimer);
-            } else {
-                startAutoRefresh();
-            }
-        });
-
-        // ============================================================
-        //  启动
-        // ============================================================
-        startAutoRefresh();
-        addLogEntry('监控面板启动，等待后端数据...', 'info');
+        connectWS();
+        addLogEntry('监控面板启动，连接 OPC UA...', 'info');
     </script>
 </body>
 </html>

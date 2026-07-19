@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from typing import Iterable
 
 from .actions import Action, ActionKind
-from .player import Car, CarState, DoorState
+from .player import Car, CarState, Direction, DoorState
 
 
 class ElevatorAlgorithm(ABC):
@@ -73,11 +73,30 @@ class SimpleInternalCall(ElevatorAlgorithm):
         # 用 target_floor 而非 pending[0] 是关键——call 命令刚下时
         # 算法不能挑 pending[0]（之前未完成的）而忽略 call 设的 target。
         target = car.target_floor
+        calls = list(pending_calls)
         if target is None:
-            calls = list(pending_calls)
             if not calls:
                 return []
             target = calls[0]
+
+        # ★ 顺路多站停靠：在 pending 中找最近的顺路站作为实际目标
+        # 车从 L1 出发 pending=[9, 3, 4] → 先到 L3 再到 L4 最后到 L9
+        pos = car.position
+        if pos is not None and calls:
+            if car.direction == Direction.UP or (car.direction == Direction.IDLE and target > pos):
+                # 上行或即将上行：找当前位置之上最近的站
+                above = sorted([f for f in calls if f > pos])
+                if above:
+                    target = above[0]
+            elif car.direction == Direction.DOWN or (car.direction == Direction.IDLE and target < pos):
+                # 下行或即将下行：找当前位置之下最近的站
+                below = sorted([f for f in calls if f < pos], reverse=True)
+                if below:
+                    target = below[0]
+            # 回写 target_floor：executor 用 car.target_floor 判断何时刹车，
+            # 不回写会导致车跳过中间站直奔原始远端目标
+            if car.target_floor != target:
+                car.target_floor = target
 
         # 已到达目标层：空（让 _on_action_done 在 MOVE 完成时清掉 pending + target_floor）
         if car.position == target:

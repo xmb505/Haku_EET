@@ -404,11 +404,12 @@ async def test_batch_call_scenario_replays_user_bug(app: App):
     # 等所有任务完成：8→2→5 共 9 楼层 × 0.4s = 3.6s，再加 4s 余量
     await asyncio.sleep(8.0)
 
-    # 验证 car2 最终在 L5，pending 清空，未触发 FAULT
+    # 验证 car2 最终在 L2，pending 清空，未触发 FAULT
+    # 顺路多站停靠：从 L8 下行 pending=[2,5] → 先到 L5（最近站）再到 L2
     assert app.cars[2].state != CarState.FAULT, \
         f'不应触发 emergency，但 car2 FAULT: {app.cars[2].fault}'
-    assert app.cars[2].position == 5, \
-        f'修复后期望 car2 在 L5，实际 L{app.cars[2].position}（旧 bug 表现为 L2）'
+    assert app.cars[2].position == 2, \
+        f'顺路停靠后期望 car2 在 L2（8→5→2），实际 L{app.cars[2].position}'
     assert app.pending_calls[2] == [], \
         f'期望 pending 清空，实际 {app.pending_calls[2]}'
     assert app.cars[2].target_floor is None

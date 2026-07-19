@@ -27,11 +27,11 @@ class WeightManager:
     # ===== 三个事件钩子（只读缓存，不触发 IO） =====
 
     async def on_close_door_starting(self, car_id: int) -> bool:
-        """H1: 关门动作开始时触发（executor 收到 CLOSE_DOOR 前）
+        """H1: 关门动作开始时触发，按需轮询一次重量
 
-        car.weight_state 由 executor 轮询器持续更新，这里只读缓存。
         返回 True=跳过关门（state=2），False=正常关门。
         """
+        await self._app.executors[car_id].poll_weight()
         car = self._app.cars[car_id]
         if car.weight_state == 2:
             await self._handle_overweight(car_id)
@@ -39,12 +39,11 @@ class WeightManager:
         return False
 
     async def on_close_door_completed(self, car_id: int) -> None:
-        """H2: 关门动作完成时触发
+        """H2: 关门动作完成时触发，再查一次重量防漏
 
-        car.weight_state 已由 executor 轮询器保持最新。
-        若关门期间重量飙升到 state=2（轮询器已触发 overweight 回调），
-        此处兜底检查。
+        关门期间重量可能飙升到 state=2，此处兜底。
         """
+        await self._app.executors[car_id].poll_weight()
         car = self._app.cars[car_id]
         if car.weight_state == 2:
             await self._handle_overweight(car_id)
@@ -65,8 +64,10 @@ class WeightManager:
         await self._handle_overweight(car_id)
 
     async def on_normalized(self, car_id: int) -> None:
-        """executor 轮询器检测到 state 从 2 降回 1/0 时调用"""
+        """executor 检测到 state 从 2 降回 1/0 时调用"""
         car = self._app.cars[car_id]
+        # 停止超重应急轮询
+        self._app.executors[car_id].stop_weight_poller()
         # 熄满载灯
         try:
             await self._app.ui[car_id].set_full_load(False)
@@ -88,8 +89,10 @@ class WeightManager:
     # ===== 状态 2 紧急开门（内部） =====
 
     async def _handle_overweight(self, car_id: int) -> None:
-        """状态 2 紧急开门：复用 cancel_for_reopen 流程"""
+        """状态 2 紧急开门 + 启动应急轮询直到重量回落"""
         car = self._app.cars[car_id]
+        # 启动应急轮询：持续监控重量直到 normalization 回调停止
+        self._app.executors[car_id].start_weight_poller()
         # 只有门关着/正在关时才需要开
         if car.door_state in (DoorState.CLOSING, DoorState.CLOSED):
             self._app.executors[car_id].door.cancel_for_reopen()

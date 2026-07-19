@@ -496,6 +496,39 @@
         // ============================================================
         //  后端状态检测
         // ============================================================
+        let cabinLedState = {};       // {floor: true/false}
+        let lastFetchedData = null;   // 缓存上次 polling 数据供 updateLamps 用
+
+        // WS 监听内召灯态推送
+        let cabinWs = null;
+        function connectCabinWS() {
+            cabinWs = new WebSocket('ws://' + location.host + '/ws');
+            cabinWs.onmessage = (ev) => {
+                let msg;
+                try { msg = JSON.parse(ev.data); } catch { return; }
+                if (msg.event === 'cabin_led') {
+                    cabinLedState[msg.data.floor] = msg.data.on;
+                    updateLamps();
+                }
+            };
+            cabinWs.onclose = () => setTimeout(connectCabinWS, 3000);
+        }
+        connectCabinWS();
+
+        function updateLamps() {
+            const carId = getSelectedCar();
+            const data = lastFetchedData || {};
+            const cars = data.cars || [];
+            const car = cars.find(c => c.car_id === carId);
+            const pending = car ? (car.pending_calls || data.pending_calls || []) : [];
+
+            document.querySelectorAll('.car-call-grid .lamp').forEach(lamp => {
+                const floor = parseInt(lamp.dataset.floor);
+                lamp.classList.toggle('lit',
+                    pending.includes(floor) || cabinLedState[floor] === true);
+            });
+        }
+
         async function checkBackend() {
             try {
                 const resp = await fetch(`${API_BASE}/stattrak`, {
@@ -535,6 +568,7 @@
         }
 
         function syncCarCalls(data) {
+            lastFetchedData = data;
             const cars = data.cars || [];
             const carId = getSelectedCar();
             const car = cars.find(c => c.car_id === carId);
@@ -546,19 +580,8 @@
                 const doorLabel = door === 'open' ? '开门' : door === 'opening' ? '开门中' : door === 'closing' ? '关门中' : '关门';
                 document.getElementById('carStatus').textContent =
                     `当前位置: ${pos}F | 方向: ${dirChar} | 门: ${doorLabel}`;
-
-                // 同步内召指示灯（pending_calls = 待服务楼层列表）
-                const pending = car.pending_calls || data.pending_calls || [];
-                document.querySelectorAll('.car-call-grid .lamp').forEach(lamp => {
-                    const floor = parseInt(lamp.dataset.floor);
-                    lamp.classList.toggle('lit', pending.includes(floor));
-                });
-            } else {
-                // 无数据时熄灭所有灯
-                document.querySelectorAll('.car-call-grid .lamp').forEach(lamp => {
-                    lamp.classList.remove('lit');
-                });
             }
+            updateLamps();
         }
 
         // ============================================================

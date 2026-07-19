@@ -39,6 +39,7 @@ class FaultFlags:
     light_curtain: bool = False     # 光幕触发（防夹）
     top_limit: bool = False         # 上端站限位
     bottom_limit: bool = False      # 下端站限位
+    door: bool = False              # 关门超时/异常
 
     def any_active(self) -> bool:
         return any((
@@ -47,6 +48,7 @@ class FaultFlags:
             self.light_curtain,
             self.top_limit,
             self.bottom_limit,
+            self.door,
         ))
 
 

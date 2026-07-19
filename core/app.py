@@ -168,8 +168,8 @@ class App:
                 on_open_done=self._make_on_open_done_fault_off(cid),
                 station_seek_enabled=self.config['elevator'].get('station_seek', False),
                 action_queue=self.action_queues[cid],
-                closing_timeout_seconds=self.config.get('passenger', {}).get(
-                    'closing_timeout_seconds', 10),
+                closing_timeout_seconds=self.config.get('elevator', {}).get(
+                    'door_complete_timeout', 8),
             )
             self.executors[cid]._app = self
 
@@ -519,6 +519,11 @@ class App:
             self.cars[cid].human_presence = 1
             await self.cron.cancel(self.pm._human_presence_job_name(cid))
             await self.ui[cid].set_cabin_button_led(floor, True)
+            try:
+                from web import ws_broadcast
+                await ws_broadcast('cabin_led', {'car_id': cid, 'floor': floor, 'on': True})
+            except Exception:
+                pass
             await self.pm.on_cabin_button(cid, floor)
         else:
             self._log_ui(f'[io] car{cid} 轿内按钮 L{floor} 松开')
@@ -527,6 +532,11 @@ class App:
             car = self.cars[cid]
             if car.position == floor:
                 await self.ui[cid].set_cabin_button_led(floor, False)
+                try:
+                    from web import ws_broadcast
+                    await ws_broadcast('cabin_led', {'car_id': cid, 'floor': floor, 'on': False})
+                except Exception:
+                    pass
 
     async def _on_door_button_event(self, event: IOEvent) -> None:
         if not self._usermode or self.pm is None:
@@ -1258,7 +1268,9 @@ class App:
             if self.pm is not None:
                 if (not hasattr(self.pm, '_brain_tick_task')
                         or self.pm._brain_tick_task is None):
-                    self.pm.start_brain_tick()
+                    interval = self.config.get('elevator', {}).get(
+                        'brain_tick_interval_ms', 2000)
+                    self.pm.start_brain_tick(interval_ms=interval)
             try:
                 ready_addr = self.mapper.addr_output('ready', 0)
                 await self.io.set(ready_addr, 1)

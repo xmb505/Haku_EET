@@ -204,6 +204,20 @@ class ActionExecutor:
             self._log_term.write(msg + '\n')
             self._log_term.flush()
 
+    async def _log_door_trace(self, src: str) -> None:
+        """门态转换诊断：只写日志文件，不进终端"""
+        act = self.current_action.kind.value if self.current_action else 'None'
+        pending = []
+        target = '?'
+        if hasattr(self, '_app') and self._app is not None:
+            pending = self._app.pending_calls.get(self.car_id, [])
+            target = self._app.cars[self.car_id].target_floor
+        if hasattr(self._log_stream, 'write'):
+            self._log_stream.write(
+                f'[door_trace] car{self.car_id} door={self.car.door_state.value} '
+                f'src={src} action={act} pending={pending} target={target}\n')
+            self._log_stream.flush()
+
     # ===== IO 事件入口 =====
 
     async def on_io_event(self, event: IOEvent) -> None:
@@ -263,6 +277,23 @@ class ActionExecutor:
 
         # 1. 更新 Car 的故障标志
         await self._update_fault_flags(event)
+
+        # 1.5 关门超时自愈：door_close_done/car_door_lock 晚到时恢复
+        if self.car.fault.door and self.car.door_state == DoorState.CLOSING:
+            sig1 = self.mapper.lookup_signal_by_i(event.i_addr)
+            if sig1 is not None and sig1[0] == self.car_id:
+                if sig1[1] in ('door_close_done', 'car_door_lock') and event.bit == 1:
+                    self._log(f'[exec] car{self.car_id} 关门超时晚到自愈: {sig1[1]}=1')
+                    self.car.door_state = DoorState.CLOSED
+                    self.car.fault = dataclasses.replace(self.car.fault, door=False)
+                    try:
+                        f_addr = self.mapper.addr_output('fault_indicator', self.car_id)
+                        await self.io.set(f_addr, 0)
+                    except KeyError:
+                        pass
+                    # 完成残留的关门动作
+                    if self.current_action is not None and self.current_action.kind == ActionKind.CLOSE_DOOR:
+                        await self._complete_action()
 
         # 2. 推进当前动作
         if self.current_action is None:
@@ -324,6 +355,39 @@ class ActionExecutor:
                     return
             except KeyError:
                 pass
+
+        # 2.55 MOVE 期间碰 1 限位 → 立即停车 + 重新初始化（重置楼层计数器）
+        # 运行中撞 1 限位说明计数器已漂移，继续跑只会撞 2 限位丢分
+        # 策略：停车 → 清队列 → 入队 INITIALIZE（复用已有反向计数逻辑）
+        if (name in ('bottom_limit_1', 'top_limit_1')
+                and event.bit == 1
+                and self.current_action.kind in (ActionKind.MOVE_UP, ActionKind.MOVE_DOWN)):
+            self._log(f'[exec] car{self.car_id} MOVE 期间碰 {name} → 停车 + 重新初始化')
+            await self.motor.hold_stop()
+            self.car.direction = Direction.IDLE
+            self.decel_state = ''
+            self._move_perfect_leveling_active = False
+            # 根据碰到的限位设置初始化方向
+            if name == 'top_limit_1':
+                self.init_direction = 'up'
+            else:
+                self.init_direction = 'down'
+            # 读配置获取目标楼层
+            if hasattr(self, '_app') and self._app is not None:
+                _, target_floor = self._app._get_car_init_config(self.car_id)
+            else:
+                target_floor = 1
+            # 清队列防止 stale MOVE 在重新初始化后继续执行
+            if self.action_queue is not None:
+                while not self.action_queue.empty():
+                    try:
+                        self.action_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                await self.action_queue.put(Action(ActionKind.INITIALIZE, floor=target_floor))
+            self.current_action = None
+            self.waiting_sensor = None
+            return
 
         # 2.6 INITIALIZE 流程：触到 1 限位 → 立即反向，逐层计数完美平层到目标
         if (self.current_action.kind == ActionKind.INITIALIZE
@@ -670,8 +734,17 @@ class ActionExecutor:
                 # ★ 平层修正完成，如果有等待开门的请求 → 推 OPEN_DOOR
                 if self._level_seek_pending_door_open:
                     self._level_seek_pending_door_open = False
-                    self._log(f'[seek] car{self.car_id} 平层完成 → 推 OPEN_DOOR')
-                    if self.action_queue is not None:
+                    # 校验收件楼层：修正后车可能漂到了不同楼层，不强行开门
+                    should_open = True
+                    if hasattr(self, '_app') and self._app is not None:
+                        pending = self._app.pending_calls.get(self.car_id, [])
+                        if self.car.position not in pending:
+                            should_open = False
+                            self._log(f'[seek] car{self.car_id} 修正后 L{self.car.position}'
+                                      f'不在 pending={pending} 中,让大脑重派')
+                            await self._app._tick(self.car_id)
+                    if should_open and self.action_queue is not None:
+                        self._log(f'[seek] car{self.car_id} 平层完成 → 推 OPEN_DOOR')
                         await self.action_queue.put(Action(ActionKind.OPEN_DOOR))
             return
 
@@ -681,11 +754,13 @@ class ActionExecutor:
         if up == 0 and dn == 0:
             return  # 两层之间，不修正
         # 缺哪个信号就往哪个方向反冲
-        correct_dir = 'up' if up == 0 else 'down'
+        # ↑1↓0(丢下平层)往下跑；↑0↓1(丢上平层)往上跑
+        correct_dir = 'down' if dn == 0 else 'up'
         self._level_correct_in_progress = True
         self._log(f'[seek] car{self.car_id} {correct_dir}反冲(↑{up}↓{dn})')
         await self.motor.release_brakes()
         await self.motor.start(high_speed=False, direction=correct_dir)
+        await self.motor.set_speed(high_speed=False)  # 慢速必须带刹车，防止冲回站台
 
     def _clear_seek_skip(self) -> None:
         """150ms 机械稳定窗口结束后清除跳过标志"""
@@ -766,6 +841,7 @@ class ActionExecutor:
                 await self._start_move_down()
 
             case ActionKind.OPEN_DOOR:
+                await self._log_door_trace('action_queued:OPEN_DOOR')
                 # ★ 冗余开门防护：如果 PLC 已报 door_open_done=1（门已物理开到位），
                 # 跳过物理开门，直接标记 OPEN。
                 # 原因：MOVE 完成时外召回调 (_handle_algorithm_state_change) 与
@@ -812,6 +888,7 @@ class ActionExecutor:
                             self.waiting_sensor = None
                             return
                 self.car.door_state = DoorState.OPENING
+                await self._log_door_trace('open_start')
                 self.door.set_car_position(self.car.position)
                 await self.door.open()
                 result = await self.door.wait_done()
@@ -856,16 +933,20 @@ class ActionExecutor:
                     await self._complete_action()
 
             case ActionKind.CLOSE_DOOR:
+                await self._log_door_trace('action_queued:CLOSE_DOOR')
                 # ★ 冗余关门防护：如果 PLC 已报 door_close_done=1（门已物理关好），
-                # 跳过物理关门，直接标记 CLOSED。
+                # 或 door_state 已标记 CLOSED，跳过物理关门。
                 # 原因：cron / hall_call 松手等多路径可能向队列推入冗余 CLOSE_DOOR，
-                # 此时 PLC 的 door_close_done 已是 1，再发 door_close_relay=1 不会
-                # 产生上升沿事件，wait_done() 将永久阻塞导致车卡死在 CLOSING 状态。
+                # 此时 PLC 的 door_close_done 可能已复位为 0（继电器失电），但门确实
+                # 已关好。仅靠 IO 判断不够，需同时检查 door_state 防止重复关门导致
+                # wait_done() 永久阻塞（PLC 不会对已关的门再触发 door_close_done）。
                 try:
                     close_done_addr = self.mapper.addr_input('door_close_done', self.car_id)
                     already_closed = self.io.get_input(close_done_addr) == 1
                 except KeyError:
                     already_closed = False
+                if not already_closed and self.car.door_state == DoorState.CLOSED:
+                    already_closed = True
                 if already_closed:
                     self._log(f'[exec] car{self.car_id} CLOSE_DOOR skip: door_close_done=1, silent discard (no callback)')
                     self.car.door_state = DoorState.CLOSED
@@ -876,6 +957,7 @@ class ActionExecutor:
                     self.waiting_sensor = None
                 else:
                     self.car.door_state = DoorState.CLOSING
+                    await self._log_door_trace('close_start')
                     self._log(f'[exec] car{self.car_id} CLOSE_DOOR start: door_close_done=0, closing')
                     await self.door.close()
                     # ★ CLOSING 超时保护：如果超过配置时间未收到 door_close_done，主动查 IO
@@ -886,23 +968,32 @@ class ActionExecutor:
                             await asyncio.wait_for(
                                 self.door.wait_done(), timeout=self.closing_timeout_seconds)
                         except asyncio.TimeoutError:
-                            # 超时：主动查 IO 状态
+                            # 超时：主动查 IO 状态（多信号交叉确认）
                             try:
                                 close_done_addr = self.mapper.addr_input(
                                     'door_close_done', self.car_id)
                                 current_state = self.io.get_input(close_done_addr)
                             except KeyError:
                                 current_state = 0
+                            # door_close_done 可能在继电器失电后复位为 0，
+                            # 但 car_door_lock（门锁）仍为 1 = 门确实关好
+                            if current_state != 1:
+                                try:
+                                    lock_addr = self.mapper.addr_input(
+                                        'car_door_lock', self.car_id)
+                                    if self.io.get_input(lock_addr) == 1:
+                                        current_state = 1
+                                except KeyError:
+                                    pass
                             if current_state == 1:
-                                # IO 已确认关好，正常完成
                                 self._log(f'[exec] car{self.car_id} CLOSE_DOOR timeout but IO confirmed closed')
                                 self.car.door_state = DoorState.CLOSED
-                                self.door.cancel()  # 清理 wait_done 的内部 event
+                                await self._log_door_trace('close_timeout_recovered')
+                                self.door.cancel()
                                 await self._complete_action()
                                 return
                             else:
-                                # IO 仍为 0：亮故障灯，保持 CLOSING 状态，停止调度
-                                self._log(f'[exec] car{self.car_id} CLOSE_DOOR timeout: door_close_done still 0, fault!')
+                                self._log(f'[exec] car{self.car_id} CLOSE_DOOR timeout: door_close_done=0, car_door_lock=0, fault!')
                                 await self.io.set(
                                     self.mapper.addr_output('fault_indicator', self.car_id), 1)
                                 self.car.fault = dataclasses.replace(
@@ -916,9 +1007,11 @@ class ActionExecutor:
                         pass
                     elif result == 'breach':
                         self.car.door_state = DoorState.OPEN
+                        await self._log_door_trace('close_breach')
                         self.current_action = Action(ActionKind.OPEN_DOOR)
                     else:
                         self.car.door_state = DoorState.CLOSED
+                        await self._log_door_trace('close_done')
                     await self._complete_action()
 
             case ActionKind.SET_DISPLAY:
