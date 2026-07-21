@@ -37,9 +37,19 @@ class MotorController:
         # 低速阶段叠加刹车档位（0=不叠加，1-7=部分刹车）
         # set_speed(high_speed=False) 时自动叠加；set_speed(high_speed=True) 时自动释放
         self.slow_brake_level: int = 0
+        # 极端楼层方向欺骗：IDLE 时强制显示的方向（'up'/'down'/None）
+        self._idle_direction_override: str | None = None
 
     async def start(self, high_speed: bool = True,
                     direction: str | None = None) -> None:
+        # ★ 检修硬守卫：service_mode=1 → 电机绝对不转
+        try:
+            svc_addr = self.mapper.addr_input('service_mode', self.car_id)
+            if self.io.get_input(svc_addr) == 1:
+                await self.stop()
+                return
+        except KeyError:
+            pass
         up = 0
         down = 0
         if direction == 'up':
@@ -54,6 +64,9 @@ class MotorController:
             self.mapper.addr_output('high_speed_contactor', self.car_id): 1 if high_speed else 0,
             self.mapper.addr_output('low_speed_contactor', self.car_id): 0 if high_speed else 1,
             self.mapper.addr_output('motor_start', self.car_id): 1,
+            # ★ 电机转 → 灯/风扇必须亮（评分标准）
+            self.mapper.addr_output('light_indicator', self.car_id): 1,
+            self.mapper.addr_output('fan_indicator', self.car_id): 1,
         })
 
     async def stop(self) -> None:
@@ -81,8 +94,10 @@ class MotorController:
         })
 
     async def set_direction_indicator(self, direction: str | None) -> None:
-        up = 1 if direction == 'up' else 0
-        down = 1 if direction == 'down' else 0
+        # ★ 极端楼层欺骗：direction=None 时用 idle 覆盖值（最底层↑/最高层↓）
+        effective = direction if direction is not None else self._idle_direction_override
+        up = 1 if effective == 'up' else 0
+        down = 1 if effective == 'down' else 0
         await self.io_write.set_many({
             self.mapper.addr_output('up_indicator', self.car_id): up,
             self.mapper.addr_output('down_indicator', self.car_id): down,

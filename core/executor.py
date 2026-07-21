@@ -229,14 +229,11 @@ class ActionExecutor:
         # 0. 检修信号在 paused 之前处理（安全信号不能被手动模式屏蔽）
         sig0 = self.mapper.lookup_signal_by_i(event.i_addr)
         if sig0 is not None and sig0[0] == self.car_id and sig0[1] == 'service_mode':
-            # Lazy seed: 首次 service_mode 事件时从 IO cache 读真实初始值
-            # 防止 PLC 上电 service_mode=1 被当成上升沿误触发 _emergency_stop
+            # Lazy seed: 首次 service_mode 事件默认 prev=0
+            # 不读 IO cache——IO client 先更新 cache 再派发事件，读到的已是新值，
+            # 会导致 prev=1,curr=1 吞掉上升沿。上电就是 1 也该触发紧急停止。
             if self._last_service_mode is None:
-                try:
-                    svc_addr = self.mapper.addr_input('service_mode', self.car_id)
-                    self._last_service_mode = self.io.get_input(svc_addr)
-                except KeyError:
-                    self._last_service_mode = 0
+                self._last_service_mode = 0
             # 同步 cache 让后续判断（如 _complete_action 走 perfect leveling）能看到 service_mode 位
             self.io.observe_input(event.i_addr, event.bit)
             prev = self._last_service_mode
@@ -261,14 +258,12 @@ class ActionExecutor:
                 self._log(f'[exec] car{self.car_id} 检修信号释放')
                 usermode = (hasattr(self, '_app') and self._app is not None
                             and getattr(self._app, '_usermode', False))
-                if usermode:
-                    self._log(f'[exec] car{self.car_id} usermode → 重新初始化')
-                    if hasattr(self, '_app') and self._app is not None:
-                        self.init_direction, target_floor = (
-                            self._app._get_car_init_config(self.car_id))
-                        if self.action_queue is not None:
-                            await self.action_queue.put(
-                                Action(ActionKind.INITIALIZE, floor=target_floor))
+                if usermode and self._app is not None:
+                    self._log(f'[exec] car{self.car_id} usermode → reset + 重新初始化')
+                    init_dir, target_floor = self._app._get_car_init_config(self.car_id)
+                    await self._app.reset(
+                        direction=init_dir, target_floor=target_floor,
+                        car_id=self.car_id)
                 return
 
         # 0.5 暂停模式（手动 debug 模式）：除 service_mode 外忽略所有事件
@@ -591,16 +586,18 @@ class ActionExecutor:
         await self.motor.hold_stop()
         self.car.direction = Direction.IDLE
         # ★ 极端楼层方向欺骗：最底层显示↑、最高层显示↓，吸引乘客进梯
-        building = self._app.config.get('building', {}) if self._app else {}
+        _app = getattr(self, '_app', None)
+        building = _app.config.get('building', {}) if _app else {}
         min_f = building.get('min_floor', 1)
         max_f = building.get('max_floor', 10)
         pos = self.car.position
         if pos is not None and pos <= min_f:
-            await self.motor.set_direction_indicator('up')
+            self.motor._idle_direction_override = 'up'
         elif pos is not None and pos >= max_f:
-            await self.motor.set_direction_indicator('down')
+            self.motor._idle_direction_override = 'down'
         else:
-            await self.motor.set_direction_indicator(None)
+            self.motor._idle_direction_override = None
+        await self.motor.set_direction_indicator(None)
         # 注:此 sleep 违反"无 sleep/wait"哲学,但实测是 PLC 物理时序的必备
         # dead time(详见 project/brake-before-stop.md)。不允许改成 cron 或删除,
         # 除非实机复现过冲 bug 且有 PLC 反馈信号替换方案(详见 feedback/practicality-first.md)
@@ -716,23 +713,8 @@ class ActionExecutor:
                 self.decel_state = 'high_speed'
         elif dist == 1:
             if self.decel_state != 'decel':
-                # ★ 距 1 层到站时临时拉满刹（slow_brake_level=6 全刹）
-                # 比赛轿厢惯性大，slow_brake=4 默认值在 1 层距离时刹不住
-                # 实测低速+brake_4 要 9 秒才能走完 1 层（car1 L3→L2 案例）
-                # 切回高速时 set_speed(high=True) 自动释放刹车，无需手动 clear
-                if self.motor.slow_brake_level < 6:
-                    prev_brake_level = self.motor.slow_brake_level
-                    self.motor.slow_brake_level = 6
-                    await self.motor.set_speed(high_speed=False)
-                    self._log(f'[brake] car{self.car_id} dist=1 slow_brake={prev_brake_level}→6 '
-                              f'b1={self.io.get_input(self.mapper.addr_output("brake_1", self.car_id))} '
-                              f'b2={self.io.get_input(self.mapper.addr_output("brake_2", self.car_id))} '
-                              f'b3={self.io.get_input(self.mapper.addr_output("brake_3", self.car_id))}')
-                    self.motor.slow_brake_level = prev_brake_level
-                else:
-                    await self.motor.set_speed(high_speed=False)
-                    self._log(f'[brake] car{self.car_id} dist=1 slow_brake={self.motor.slow_brake_level} '
-                              f'b1=1 b2=1 b3=1')
+                await self.motor.set_speed(high_speed=False)
+                self._log(f'[brake] car{self.car_id} dist=1 slow_brake={self.motor.slow_brake_level}')
                 self.decel_state = 'decel'
 
     async def _level_seek_check(self) -> None:
@@ -872,6 +854,18 @@ class ActionExecutor:
 
     async def _start_action(self, action: Action) -> None:
         """展开 Action 为 IO 序列，设置等待传感器"""
+        # ★ 检修硬守卫：service_mode=1 时电机绝对不允许转
+        if self._last_service_mode == 1 and action.kind in (
+                ActionKind.MOVE_UP, ActionKind.MOVE_DOWN, ActionKind.INITIALIZE):
+            self._log(f'[exec] car{self.car_id} {action.kind.value} BLOCKED: service_mode=1')
+            try:
+                f_addr = self.mapper.addr_output('fault_indicator', self.car_id)
+                await self.io.set(f_addr, 1)
+            except KeyError:
+                pass
+            self.current_action = None
+            self.waiting_sensor = None
+            return
         # ★ 吸附修正中收到冗余 OPEN_DOOR → 跳过，不打断修正电机
         # 修正完成后 _level_seek_pending_door_open 会自动推 OPEN_DOOR
         if (action.kind == ActionKind.OPEN_DOOR

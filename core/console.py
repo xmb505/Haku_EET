@@ -1669,28 +1669,59 @@ class Console:
         """设置与调试参数
 
         用法:
-          /settings                        显示 slow_brake 当前值
-          /settings slow_brake            显示 slow_brake 当前值
-          /settings slow_brake <0-6>      设置低速阶段叠加刹车档位(所有轿厢)
+          /settings                        显示所有车的 slow_brake 值
+          /settings slow_brake            显示所有车的 slow_brake 值
+          /settings slow_brake <0-6>      设置所有轿厢
+          /settings slow_brake <car> <0-6> 设置单个轿厢
         """
         if not args or args[0] == 'slow_brake':
             if not args or len(args) < 2:
-                lv = self.app.executors[self.current_car_id].motor.slow_brake_level
-                print(f'slow_brake = {lv}')
+                # 显示所有车的值
+                for cid in self.app.car_ids:
+                    lv = self.app.executors[cid].motor.slow_brake_level
+                    print(f'  car{cid}: slow_brake = {lv}')
                 return
-            try:
-                level = int(args[1])
-            except ValueError:
-                print('slow_brake 必须是 0-6 的整数')
-                return
-            if not (0 <= level <= 6):
-                print('slow_brake 必须是 0-6 的整数')
-                return
-            for cid in self.app.car_ids:
-                self.app.executors[cid].motor.slow_brake_level = level
-            # 落盘：写回 config.yaml 并同步内存 config
-            self.app._save_elevator_config('slow_brake', level)
-            print(f'[settings] slow_brake = {level}（所有轿厢，已落盘）')
+            if len(args) == 2:
+                # /settings slow_brake <0-6> → 全部车
+                try:
+                    level = int(args[1])
+                except ValueError:
+                    print('slow_brake 必须是 0-6 的整数')
+                    return
+                if not (0 <= level <= 6):
+                    print('slow_brake 必须是 0-6 的整数')
+                    return
+                for cid in self.app.car_ids:
+                    self.app.executors[cid].motor.slow_brake_level = level
+                self.app._save_elevator_config('slow_brake', level)
+                print(f'[settings] slow_brake = {level}（所有轿厢，已落盘）')
+            else:
+                # /settings slow_brake <car_id> <0-6> → 单车
+                try:
+                    target_cid = int(args[1])
+                    level = int(args[2])
+                except ValueError:
+                    print('用法: /settings slow_brake <car_id> <0-6>')
+                    return
+                if target_cid not in self.app.car_ids:
+                    print(f'car{target_cid} 不存在，可用: {self.app.car_ids}')
+                    return
+                if not (0 <= level <= 6):
+                    print('slow_brake 必须是 0-6 的整数')
+                    return
+                self.app.executors[target_cid].motor.slow_brake_level = level
+                # ★ 立刻生效：如果车正在低速跑，重写刹车档位
+                exe = self.app.executors[target_cid]
+                if exe.decel_state == 'decel':
+                    await exe.motor.set_speed(high_speed=False)
+                # 落盘：读现有配置，合并为 dict
+                cfg = self.app.config['elevator'].get('slow_brake', 0)
+                if not isinstance(cfg, dict):
+                    cfg = {cid: cfg for cid in self.app.car_ids}
+                cfg[target_cid] = level
+                self.app.config['elevator']['slow_brake'] = cfg
+                self.app._save_elevator_config('slow_brake', cfg)
+                print(f'[settings] car{target_cid} slow_brake = {level}（已落盘）')
         else:
             print(f'未知设置: {args[0]}')
 
@@ -1928,11 +1959,21 @@ class Console:
         from .player import CarState
         print('[competition] === 比赛自动流程开始 ===')
 
-        car_ids = self.app.car_ids
-        print(f'[competition] 初始化 {len(car_ids)} 部轿厢: {car_ids}')
+        # ★ 跳过检修车：service_mode=1 的车不初始化、不等待、不启用
+        active_ids = []
+        skipped_ids = []
+        for cid in self.app.car_ids:
+            exe = self.app.executors[cid]
+            if exe._last_service_mode == 1:
+                skipped_ids.append(cid)
+            else:
+                active_ids.append(cid)
+        if skipped_ids:
+            print(f'[competition] 跳过检修车: {skipped_ids}')
+        print(f'[competition] 初始化 {len(active_ids)} 部轿厢: {active_ids}')
 
         # 1. 初始化所有轿厢（异步入队，不阻塞），每部车独立配置
-        for cid in car_ids:
+        for cid in active_ids:
             init_dir, init_target = self.app._get_car_init_config(cid)
             print(f'[competition]  car{cid}: direction={init_dir}, target={init_target}')
             await self.app.reset(direction=init_dir, target_floor=init_target, car_id=cid)
@@ -1944,10 +1985,10 @@ class Console:
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             if asyncio.get_running_loop().time() > deadline:
-                ready_cars = [cid for cid in car_ids
+                ready_cars = [cid for cid in active_ids
                               if self.app.cars[cid].state == CarState.READY
                               and self.app.cars[cid].position is not None]
-                failed = [cid for cid in car_ids if cid not in ready_cars]
+                failed = [cid for cid in active_ids if cid not in ready_cars]
                 print(f'[competition] ⚠️  初始化超时({timeout}s)，已就绪: {ready_cars}，失败: {failed}')
                 if not ready_cars:
                     print('[competition] 无任何轿厢就绪，放弃 usermode')
@@ -1962,16 +2003,16 @@ class Console:
             all_ready = all(
                 self.app.cars[cid].state == CarState.READY
                 and self.app.cars[cid].position is not None
-                for cid in car_ids
+                for cid in active_ids
             )
             if all_ready:
                 break
             await asyncio.sleep(0.1)
 
-        print(f'[competition] 所有 {len(car_ids)} 部轿厢初始化完成')
+        print(f'[competition] 所有 {len(active_ids)} 部轿厢初始化完成')
 
         # 3. 启用用户模式
-        result = await self.app.set_usermode(True)
+        result = await self.app.set_usermode(True, cars=active_ids)
         blocked = result.get('blocked', [])
         enabled_cars = result.get('enabled_cars', [])
         if blocked:

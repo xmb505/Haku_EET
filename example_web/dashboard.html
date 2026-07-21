@@ -206,6 +206,10 @@
             color: #00e5ff;
             animation: text-blink 1s step-end infinite alternate;
         }
+        .car-card .car-floor-box.service {
+            color: #ff8800;
+            animation: text-blink 1s step-end infinite alternate;
+        }
 
         .car-card .car-arrow {
             font-size: 24px;
@@ -753,7 +757,11 @@
                         const prev = state.cars[cid];
                         if (prev) {
                             const ps = prev.operation_status, cs = car.operation_status;
-                            if (ps !== 'fault' && cs === 'fault') {
+                            if (ps !== 'service' && cs === 'service') {
+                                addLogEntry(`car${cid} 进入检修模式`, 'warn');
+                            } else if (ps === 'service' && cs !== 'service') {
+                                addLogEntry(`car${cid} 退出检修模式`, 'ok');
+                            } else if (ps !== 'fault' && cs === 'fault') {
                                 addLogEntry(`car${cid} 故障 (FAULT)`, 'err');
                             } else if (ps === 'fault' && cs === 'initializing') {
                                 addLogEntry(`car${cid} 故障恢复 → 重新初始化`, 'warn');
@@ -853,6 +861,7 @@
 
         function stateLabel(s) {
             const labels = {
+                'service': '检修',
                 'idle': '空闲',
                 'running': '运行',
                 'decelerating': '减速',
@@ -871,11 +880,12 @@
         }
 
         function buildCarCard(car) {
-            const pos = car.position != null ? car.position : 'N/A';
+            const pos = car.position != null ? car.position : '?';
             const isFault = car.state === 'fault';
             const isInit = car.initializing === true;
-            const floorDisplay = isFault ? '!' : isInit ? '!' : pos;
-            const floorClass = isFault ? 'fault' : isInit ? 'initializing' : '';
+            const isService = car.operation_status === 'service';
+            const floorDisplay = isFault ? '!' : isService ? 'S' : isInit ? '!' : pos;
+            const floorClass = isFault ? 'fault' : isService ? 'service' : isInit ? 'initializing' : '';
             const dir = car.direction || 'idle';
             const dirChar = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '◆';
             const door = car.door_state || 'closed';
@@ -934,13 +944,14 @@
                 return;
             }
 
-            // 楼层 + 故障/定位闪烁
-            const pos = car.position != null ? car.position : 'N/A';
+            // 楼层 + 故障/定位/检修闪烁
+            const pos = car.position != null ? car.position : '?';
             const isFault = car.state === 'fault';
             const isInit = car.initializing === true;
+            const isService = car.operation_status === 'service';
             const floorBox = card.querySelector('.car-floor-box');
-            floorBox.textContent = (isFault || isInit) ? '!' : pos;
-            floorBox.className = 'car-floor-box' + (isFault ? ' fault' : isInit ? ' initializing' : '');
+            floorBox.textContent = isFault ? '!' : isService ? 'S' : isInit ? '!' : pos;
+            floorBox.className = 'car-floor-box' + (isFault ? ' fault' : isService ? ' service' : isInit ? ' initializing' : '');
 
             // 方向箭头
             const dir = car.direction || 'idle';

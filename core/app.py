@@ -189,9 +189,14 @@ class App:
                 self.executors[cid].door._log_file = self._log_file
 
         # 应用 slow_brake 配置（低速阶段叠加刹车档位）
-        _slow_brake = self.config['elevator'].get('slow_brake', 0)
+        # 支持 per-car: slow_brake: {1: 1, 2: 2, ...} 或统一值: slow_brake: 4
+        _slow_brake_cfg = self.config['elevator'].get('slow_brake', 0)
         for cid in self.car_ids:
-            self.executors[cid].motor.slow_brake_level = _slow_brake
+            if isinstance(_slow_brake_cfg, dict):
+                level = _slow_brake_cfg.get(cid, _slow_brake_cfg.get(str(cid), 0))
+            else:
+                level = _slow_brake_cfg
+            self.executors[cid].motor.slow_brake_level = level
 
         # 装配 per-car UiController(与 executors 平级,游戏 entity-component 模式)
         # UI 是电梯实体的属性,通过 app.ui[cid].set_xxx() 写,car.ui.xxx 读
@@ -418,6 +423,7 @@ class App:
             'door_state': car.door_state.value if car.door_state else 'closed',
             'display': car.display,
             'fault': car.fault.any_active(),
+            'service_mode': car.fault.service_mode,
             'initializing': initializing,
             'weight_state': getattr(car, 'weight_state', 0),
             'weight_kg': getattr(car, 'weight_kg', 0),
@@ -430,13 +436,21 @@ class App:
     def _compute_operation_status(self, car_id: int) -> str:
         """计算轿厢的操作状态（供 HMI 显示）
 
-        优先级: fault > initializing > boarding > decelerating > running > idle
+        优先级: service > fault > initializing > boarding > decelerating > running > idle
         """
         car = self.cars[car_id]
 
-        # 故障优先
+        # 检修模式最高优先
+        if car.fault.service_mode:
+            return 'service'
+
+        # 故障
         if car.state == CarState.FAULT:
             return 'fault'
+
+        # 位置未知 = 未定位
+        if car.position is None:
+            return 'initializing'
 
         # 定位中
         if car.state == CarState.UNKNOWN:
@@ -833,7 +847,13 @@ class App:
                 self.cars[car_id].target_floor = None
                 self.cars[car_id].last_dispatch_direction = Direction.IDLE  # 到站后清除方向
                 # 外召到站 → 开门(内召不碰门)
-                if origin == 'hall':
+                # ★ 也检查 pickup_active：auto_park 到站但该楼层有外呼等着，也得开门
+                has_hall_pickup = False
+                if self.pm is not None and pos is not None:
+                    has_hall_pickup = any(
+                        self.pm._pickup_active.get(car_id, {}).get((pos, d), False)
+                        for d in ('up', 'down'))
+                if origin == 'hall' or has_hall_pickup:
                     await self.action_queues[car_id].put(
                         Action(ActionKind.OPEN_DOOR))
                     return True
@@ -1195,15 +1215,19 @@ class App:
         station_seek_enabled = self.config['elevator'].get('station_seek', False)
         for cid in self.car_ids:
             self.executors[cid].set_station_seek(station_seek_enabled)
-        # slow_brake reload 同步
-        slow_brake = self.config['elevator'].get('slow_brake', 0)
+        # slow_brake reload 同步（支持 per-car dict 或统一值）
+        slow_brake_cfg = self.config['elevator'].get('slow_brake', 0)
         for cid in self.car_ids:
-            self.executors[cid].motor.slow_brake_level = slow_brake
+            if isinstance(slow_brake_cfg, dict):
+                level = slow_brake_cfg.get(cid, slow_brake_cfg.get(str(cid), 0))
+            else:
+                level = slow_brake_cfg
+            self.executors[cid].motor.slow_brake_level = level
         # ui_config reload 同步（熄灯延时/关门延时等）
         if self.pm is not None:
             self.pm._reload_ui_config()
         print(f'[reload] config reloaded: init_dir={self.config["elevator"]["initialization_direction"]}, '
-              f'station_seek={station_seek_enabled}, slow_brake={slow_brake}')
+              f'station_seek={station_seek_enabled}, slow_brake={slow_brake_cfg}')
 
     def _save_elevator_config(self, key: str, value: Any) -> None:
         """将 elevator.<key> 写回 config.yaml（保留注释和格式）

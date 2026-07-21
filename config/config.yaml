@@ -45,10 +45,11 @@ elevator:
   # 默认关闭——只在需要时启用（/module station_seek on）。开了之后会保持
   # 每部车在完美平层 ✓(↑1↓1),平层丢失立刻反冲。
   station_seek: true
-  # 低速阶段叠加刹车档位（0=不叠加，1-7=部分刹车）
+  # 低速阶段叠加刹车档位（0=不叠加，1-6=部分刹车）
   # 切低速接触器时自动叠加，切高速时自动释放
-  # /settings slow_brake <N> 可运行时修改并落盘
-  slow_brake: 5
+  # /settings slow_brake <car> <N> 可运行时修改并落盘
+  slow_brake:
+    {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
   # 门动作完成超时(秒):/door open/close 派发后,等 door_open_done/close_done 信号
   # 超过此时间视为 PLC 异常,cron 兜底自动释放 _door_busy + 打印警告。
   door_complete_timeout: 8
@@ -80,12 +81,12 @@ elevator:
   # 临界 = max * threshold ≤ weight ≤ max → state=1（不响应外呼）
   # 超重 = weight > max → state=2（立即开门 + 满载灯 + 应急 polling）
   per_car_weight:
-    '1': { max_weight: 900, threshold: 0.95, adc_full_scale_kg: 2000 }
-    '2': { max_weight: 900, threshold: 0.95, adc_full_scale_kg: 2000 }
-    '3': { max_weight: 900, threshold: 0.95, adc_full_scale_kg: 2000 }
-    '4': { max_weight: 900, threshold: 0.95, adc_full_scale_kg: 2000 }
-    '5': { max_weight: 900, threshold: 0.95, adc_full_scale_kg: 2000 }
-    '6': { max_weight: 900, threshold: 0.95, adc_full_scale_kg: 2000 }
+    '1': { max_weight: 700, threshold: 0.95, adc_full_scale_kg: 2000 }
+    '2': { max_weight: 1200, threshold: 0.95, adc_full_scale_kg: 2000 }
+    '3': { max_weight: 700, threshold: 0.95, adc_full_scale_kg: 2000 }
+    '4': { max_weight: 700, threshold: 0.95, adc_full_scale_kg: 2000 }
+    '5': { max_weight: 1600, threshold: 0.95, adc_full_scale_kg: 2000 }
+    '6': { max_weight: 2000, threshold: 0.95, adc_full_scale_kg: 2000 }
   # 超重应急 polling 间隔（毫秒）:状态 2 期间每 200ms 查一次 word,wait_weight ≤ max 退出
   weight_poll_interval_ms: 1000
 

@@ -43,6 +43,15 @@
             background: #008080;
         }
 
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background: url('wallpaper.jpg') center / cover no-repeat;
+            opacity: 0.5;
+            z-index: -1;
+        }
+
         .login-window {
             width: 380px;
             position: relative;
