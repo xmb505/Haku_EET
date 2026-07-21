@@ -4,7 +4,7 @@
 >
 > 用 Python + asyncio 实现的电梯控制程序，模仿 MC 服务端的本地 REPL 风格，把电梯当作"玩家"驱动。
 
-> **文档导航：** 设计哲学与完整规格 → [SPEC.md](./SPEC.md) | 交接入门 → [HANDOVER.md](./HANDOVER.md) | 命令手册 → [COMMAND_MANUAL.md](./COMMAND_MANUAL.md) | 点位对照 → [IO_UI.md](./IO_UI.md) | PLC IO → [PLC_IO.md](./PLC_IO.md)
+> **文档导航：** 设计哲学与完整规格 → [SPEC.md](./docs/SPEC.md) | 交接入门 → [HANDOVER.md](./docs/HANDOVER.md) | 命令手册 → [COMMAND_MANUAL.md](./docs/COMMAND_MANUAL.md) | 点位对照 → [IO_UI.md](./docs/IO_UI.md) | PLC IO → [PLC_IO.md](./docs/PLC_IO.md)
 >
 > 本 README 是快速上手起点；架构 / 设计哲学 / 路线图以 SPEC.md 为真相来源。
 
@@ -17,7 +17,7 @@
 
 ### 8 条不变量
 
-完整阐述见 [SPEC.md §1.3](./SPEC.md)：
+完整阐述见 [SPEC.md §1.3](./docs/SPEC.md)：
 
 1. **三层分离**：大脑（决策层）/ 小脑（物理层：运动+用户交互）/ 脑干（IO 层）严格分离，不允许跳层
 2. **电梯 = 玩家**：`Car` 是游戏实体，有属性有数值有状态，不掺杂 IO 地址
@@ -37,13 +37,13 @@
 - NOOP 不退出保持模式——空动作不破坏长寿命状态
 - 急停同步清场——重置所有长寿命状态，防止 stale 逻辑复活
 
-> 完整 16+ 条代码嵌入式哲学见 [SPEC.md §13](./SPEC.md#13-代码嵌入的设计哲学)。
+> 完整 16+ 条代码嵌入式哲学见 [SPEC.md §13](./docs/SPEC.md#13-代码嵌入的设计哲学)。
 
 ---
 
 ## 三层架构（大脑 / 小脑 / 脑干）
 
-完整架构图见 [SPEC.md §1](./SPEC.md)。
+完整架构图见 [SPEC.md §1](./docs/SPEC.md)。
 
 ```
 大脑（决策层）—— 只看 Car，不碰 IO 地址
@@ -161,13 +161,15 @@ Haku_EET/
 ├── example_web/               # Win95 风格 HMI 前端
 ├── tests/                     # pytest 单测
 ├── tools/                     # 工具脚本
-├── docs/                      # 比赛官方文档
+├── docs/                      # 文档
+│   ├── SPEC.md                # 设计规格（真相来源）
+│   ├── HANDOVER.md            # 交接文档
+│   ├── COMMAND_MANUAL.md      # REPL 命令手册
+│   ├── IO_UI.md / PLC_IO.md   # IO 点位对照
+│   ├── TUTORIAL.md            # 教程
+│   └── 比赛官方文档/           # CIMC 官方 PDF + 点位表
 ├── issues/                    # 已知问题记录
-├── logs/                      # 运行日志
-├── SPEC.md                    # 设计规格（真相来源）
-├── HANDOVER.md                # 交接文档
-├── COMMAND_MANUAL.md          # REPL 命令手册
-├── IO_UI.md / PLC_IO.md       # IO 点位对照
+├── logs/                      # 运行日志（gitignore）
 └── requirements.txt           # Python 依赖
 ```
 
@@ -212,11 +214,11 @@ pytest tests/ -v       # 详细输出
 
 | 文档 | 用途 |
 |------|------|
-| [SPEC.md](./SPEC.md) | 设计规格真相来源 |
-| [HANDOVER.md](./HANDOVER.md) | 交接入门总纲 |
-| [COMMAND_MANUAL.md](./COMMAND_MANUAL.md) | REPL 命令手册 |
-| [IO_UI.md](./IO_UI.md) | 输出 IO 与 UI 信号映射 |
-| [PLC_IO.md](./PLC_IO.md) | PLC IO 点位表 |
+| [docs/SPEC.md](./docs/SPEC.md) | 设计规格真相来源 |
+| [docs/HANDOVER.md](./docs/HANDOVER.md) | 交接入门总纲 |
+| [docs/COMMAND_MANUAL.md](./docs/COMMAND_MANUAL.md) | REPL 命令手册 |
+| [docs/IO_UI.md](./docs/IO_UI.md) | 输出 IO 与 UI 信号映射 |
+| [docs/PLC_IO.md](./docs/PLC_IO.md) | PLC IO 点位表 |
 | [issues/](./issues/) | 已知问题与修复记录 |
 
 ---
